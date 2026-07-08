@@ -337,6 +337,7 @@ final class AppModel: ObservableObject {
     private let defaultsKey = "connections"
     private var isRestoringTab = false
     private var isSuppressingSidebarSelection = false
+    private var isSelectingConnection = false
 
     init() {
         selectedTabID = tabs.first?.id
@@ -397,7 +398,11 @@ final class AppModel: ObservableObject {
     }
 
     func select(_ connection: SavedConnection) {
-        let previousConnectionID = selectedConnectionID
+        guard !isSelectingConnection else { return }
+        isSelectingConnection = true
+        defer { isSelectingConnection = false }
+        
+        let previousConnectionID = connectionDraft.id
         selectedConnectionID = connection.id
         connectionDraft = connection
         if connectionPassword.isEmpty || previousConnectionID != connection.id {
