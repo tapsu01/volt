@@ -1448,14 +1448,32 @@ struct InspectorView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            Text("Inspector")
-                .font(.headline)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding()
+            ZStack {
+                Text("Inspector")
+                    .font(.headline)
+                HStack {
+                    Spacer()
+                    Button(action: {
+                        if let text = model.selectedRemote?.path ?? model.selectedLocal?.path {
+                            NSPasteboard.general.clearContents()
+                            NSPasteboard.general.setString(text, forType: .string)
+                        }
+                    }) {
+                        Image(systemName: "doc.on.clipboard")
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.secondary)
+                    .help("Copy Path")
+                }
+            }
+            .padding(.horizontal)
+            .padding(.vertical, 12)
+            .background(Color(NSColor.windowBackgroundColor))
+            
             Divider()
             
             ScrollView {
-                VStack(spacing: 20) {
+                VStack(spacing: 24) {
                     if let local = model.selectedLocal {
                         InspectorSection(title: "Local Item", item: local)
                     }
@@ -1473,74 +1491,94 @@ struct InspectorView: View {
                 .padding()
             }
         }
-        .frame(minWidth: 220, idealWidth: 260)
+        .frame(minWidth: 260, idealWidth: 280)
     }
 }
 
 struct InspectorSection: View {
-    var title: String
+    var title: String?
     var item: FileItem
+    @State private var isExpanded = true
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Text(title)
-                .font(.subheadline)
-                .foregroundStyle(.secondary)
+        VStack(spacing: 0) {
+            if let title {
+                HStack {
+                    Text(title)
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                }
+                .padding(.bottom, 16)
+            }
             
-            HStack(alignment: .top, spacing: 12) {
-                Image(systemName: item.isDirectory ? "folder.fill" : "doc.fill")
-                    .resizable()
-                    .aspectRatio(contentMode: .fit)
-                    .frame(width: 40, height: 40)
-                    .foregroundStyle(item.isDirectory ? Color.blue : Color.secondary)
-                
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(item.name)
-                        .font(.headline)
-                        .lineLimit(2)
+            icon(for: item)
+                .resizable()
+                .aspectRatio(contentMode: .fit)
+                .frame(width: 140, height: 140)
+                .padding(.bottom, 24)
+            
+            Divider()
+            
+            DisclosureGroup(isExpanded: $isExpanded) {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(item.isDirectory ? "Folder" : "File")
+                        .font(.subheadline)
+                        .foregroundStyle(.primary)
                     
-                    if let size = item.size, !item.isDirectory {
+                    if item.isDirectory {
+                        Button("Calculate Size") {}
+                            .buttonStyle(.link)
+                            .font(.subheadline)
+                    } else if let size = item.size {
                         Text(ByteCountFormatter.string(fromByteCount: size, countStyle: .file))
                             .font(.subheadline)
-                            .foregroundStyle(.secondary)
-                    } else if item.isDirectory {
-                        Text("--")
-                            .font(.subheadline)
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(.primary)
                     }
+                    
+                    Text(item.path)
+                        .font(.subheadline)
+                        .textSelection(.enabled)
+                        .padding(.vertical, 4)
+                        
+                    Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 4) {
+                        GridRow {
+                            Text("Created").foregroundStyle(.secondary)
+                            Text("n/a").foregroundStyle(.secondary)
+                        }
+                        GridRow {
+                            Text("Modified").foregroundStyle(.secondary)
+                            if let modified = item.modified {
+                                Text(modified.formatted(date: .abbreviated, time: .shortened))
+                            } else {
+                                Text("--")
+                            }
+                        }
+                    }
+                    .font(.subheadline)
+                    .padding(.top, 4)
                 }
+                .padding(.vertical, 8)
+            } label: {
+                Text(item.name)
+                    .font(.headline)
+                    .foregroundStyle(.primary)
             }
-            
-            VStack(alignment: .leading, spacing: 6) {
-                InspectorRow(label: "Path", value: item.path)
-                
-                if let modified = item.modified {
-                    InspectorRow(label: "Modified", value: modified.formatted(date: .abbreviated, time: .shortened))
-                }
-                
-                InspectorRow(label: "Type", value: item.isDirectory ? "Folder" : "File")
-            }
-            .padding(.top, 4)
         }
+    }
+    
+    private func icon(for item: FileItem) -> Image {
+        let nsImage: NSImage
+        if item.isDirectory {
+            nsImage = NSWorkspace.shared.icon(forFileType: "public.folder")
+        } else {
+            let ext = (item.name as NSString).pathExtension
+            nsImage = ext.isEmpty ? NSWorkspace.shared.icon(forFileType: "public.data") : NSWorkspace.shared.icon(forFileType: ext)
+        }
+        return Image(nsImage: nsImage)
     }
 }
 
-struct InspectorRow: View {
-    var label: String
-    var value: String
-    
-    var body: some View {
-        VStack(alignment: .leading, spacing: 2) {
-            Text(label)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-            Text(value)
-                .font(.system(.subheadline, design: .monospaced))
-                .lineLimit(3)
-                .textSelection(.enabled)
-        }
-    }
-}
 @main
 struct TransmitLiteApp: App {
     var body: some Scene {
