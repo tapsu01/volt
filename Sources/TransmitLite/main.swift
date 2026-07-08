@@ -260,7 +260,7 @@ final class SFTPClient: @unchecked Sendable {
         return result
     }
 
-    private func makeAskPassScript(password: String) throws -> URL? {
+    func makeAskPassScript(password: String) throws -> URL? {
         guard !password.isEmpty else { return nil }
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("TransmitLite-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -370,6 +370,76 @@ final class AppModel: ObservableObject {
         tab.title = "New Tab"
         tabs.append(tab)
         selectTab(tab.id)
+    }
+
+    func calculateSize(for item: FileItem, isLocal: Bool) async {
+        if isLocal {
+            let runner = CommandRunner()
+            let executable = "/usr/bin/du"
+            let args = ["-sk", item.path]
+            if let result = try? runner.run(executable, arguments: args, stdin: "", environment: [:]),
+               result.status == 0,
+               let sizeStr = result.stdout.split(separator: "\t").first,
+               let sizeKB = Int64(sizeStr) {
+                let sizeBytes = sizeKB * 1024
+                await MainActor.run {
+                    if let index = self.localItems.firstIndex(where: { $0.id == item.id }) {
+                        self.localItems[index].size = sizeBytes
+                        self.syncCurrentTab()
+                    }
+                }
+            }
+        } else {
+            guard let connection = selectedConnection else { return }
+            let password = connectionPassword
+            let runner = CommandRunner()
+            let executable = "/usr/bin/ssh"
+            let trimmedPassword = password.trimmingCharacters(in: .whitespacesAndNewlines)
+            
+            do {
+                let askpass = try sftp.makeAskPassScript(password: trimmedPassword)
+                defer {
+                    if let askpass {
+                        try? FileManager.default.removeItem(at: askpass.deletingLastPathComponent())
+                    }
+                }
+
+                var args = [
+                    "-oBatchMode=\(trimmedPassword.isEmpty ? "yes" : "no")",
+                    "-oStrictHostKeyChecking=accept-new",
+                    "-p", "\(connection.port)"
+                ]
+                if !connection.privateKeyPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    args.append(contentsOf: ["-i", connection.privateKeyPath])
+                }
+                args.append("\(connection.username)@\(connection.host)")
+                
+                let quotedPath = "'" + item.path.replacingOccurrences(of: "'", with: "'\\''") + "'"
+                args.append("du -sk \(quotedPath)")
+
+                var environment: [String: String] = [:]
+                if let askpass {
+                    environment["SSH_ASKPASS"] = askpass.path
+                    environment["SSH_ASKPASS_REQUIRE"] = "force"
+                    environment["DISPLAY"] = "TransmitLite"
+                }
+
+                let result = try runner.run(executable, arguments: args, stdin: "", environment: environment)
+                if result.status == 0,
+                   let sizeStr = result.stdout.split(separator: "\t").first,
+                   let sizeKB = Int64(sizeStr) {
+                    let sizeBytes = sizeKB * 1024
+                    await MainActor.run {
+                        if let index = self.remoteItems.firstIndex(where: { $0.id == item.id }) {
+                            self.remoteItems[index].size = sizeBytes
+                            self.syncCurrentTab()
+                        }
+                    }
+                }
+            } catch {
+                // Ignore failure
+            }
+        }
     }
 
     func closeCurrentTab() {
@@ -1475,11 +1545,15 @@ struct InspectorView: View {
             ScrollView {
                 VStack(spacing: 24) {
                     if let local = model.selectedLocal {
-                        InspectorSection(title: "Local Item", item: local)
+                        InspectorSection(title: "Local Item", item: local, isLocal: true, onCalculateSize: {
+                            await model.calculateSize(for: local, isLocal: true)
+                        })
                     }
                     
                     if let remote = model.selectedRemote {
-                        InspectorSection(title: "Remote Item", item: remote)
+                        InspectorSection(title: "Remote Item", item: remote, isLocal: false, onCalculateSize: {
+                            await model.calculateSize(for: remote, isLocal: false)
+                        })
                     }
                     
                     if model.selectedLocal == nil && model.selectedRemote == nil {
@@ -1498,7 +1572,10 @@ struct InspectorView: View {
 struct InspectorSection: View {
     var title: String?
     var item: FileItem
+    var isLocal: Bool
+    var onCalculateSize: () async -> Void
     @State private var isExpanded = true
+    @State private var isCalculatingSize = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -1519,17 +1596,50 @@ struct InspectorSection: View {
                 .padding(.bottom, 24)
             
             Divider()
+                .padding(.bottom, 12)
             
-            DisclosureGroup(isExpanded: $isExpanded) {
+            Button(action: {
+                withAnimation(.easeInOut(duration: 0.2)) { isExpanded.toggle() }
+            }) {
+                HStack {
+                    Text(item.name)
+                        .font(.headline)
+                        .foregroundStyle(.primary)
+                    Spacer()
+                    Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
+                        .foregroundStyle(.secondary)
+                        .font(.caption.weight(.bold))
+                }
+            }
+            .buttonStyle(.plain)
+            
+            if isExpanded {
                 VStack(alignment: .leading, spacing: 6) {
                     Text(item.isDirectory ? "Folder" : "File")
                         .font(.subheadline)
                         .foregroundStyle(.primary)
                     
                     if item.isDirectory {
-                        Button("Calculate Size") {}
+                        if let size = item.size {
+                            Text(ByteCountFormatter.string(fromByteCount: size, countStyle: .file))
+                                .font(.subheadline)
+                                .foregroundStyle(.primary)
+                        } else if isCalculatingSize {
+                            HStack {
+                                ProgressView().controlSize(.small)
+                                Text("Calculating...").font(.subheadline).foregroundStyle(.secondary)
+                            }
+                        } else {
+                            Button("Calculate Size") {
+                                isCalculatingSize = true
+                                Task {
+                                    await onCalculateSize()
+                                    isCalculatingSize = false
+                                }
+                            }
                             .buttonStyle(.link)
                             .font(.subheadline)
+                        }
                     } else if let size = item.size {
                         Text(ByteCountFormatter.string(fromByteCount: size, countStyle: .file))
                             .font(.subheadline)
@@ -1558,11 +1668,8 @@ struct InspectorSection: View {
                     .font(.subheadline)
                     .padding(.top, 4)
                 }
-                .padding(.vertical, 8)
-            } label: {
-                Text(item.name)
-                    .font(.headline)
-                    .foregroundStyle(.primary)
+                .padding(.top, 8)
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
         }
     }
