@@ -17,6 +17,8 @@ MACOS_DIR="$CONTENTS_DIR/MacOS"
 /bin/mkdir -p "$MACOS_DIR"
 /bin/cp "$BUILD_DIR/TransmitLite" "$MACOS_DIR/TransmitLite"
 /bin/cp "$ROOT_DIR/Support/Info.plist" "$CONTENTS_DIR/Info.plist"
+/bin/mkdir -p "$CONTENTS_DIR/Resources"
+/bin/cp "$ROOT_DIR/Support/AppIcon.icns" "$CONTENTS_DIR/Resources/AppIcon.icns"
 /usr/bin/codesign --force --sign - "$APP_DIR"
 
 printf '%s\n' "$APP_DIR"
