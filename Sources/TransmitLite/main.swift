@@ -1621,9 +1621,12 @@ struct InspectorSection: View {
                     
                     if item.isDirectory {
                         if let size = item.size {
-                            Text(ByteCountFormatter.string(fromByteCount: size, countStyle: .file))
-                                .font(.subheadline)
+                            Text("\(NumberFormatter.localizedString(from: NSNumber(value: size), number: .decimal)) bytes ")
+                                .font(.subheadline).bold()
                                 .foregroundStyle(.primary)
+                            + Text("(\(ByteCountFormatter.string(fromByteCount: size, countStyle: .file)) on disk)")
+                                .font(.subheadline)
+                                .foregroundStyle(.secondary)
                         } else if isCalculatingSize {
                             HStack {
                                 ProgressView().controlSize(.small)
@@ -1641,12 +1644,15 @@ struct InspectorSection: View {
                             .font(.subheadline)
                         }
                     } else if let size = item.size {
-                        Text(ByteCountFormatter.string(fromByteCount: size, countStyle: .file))
-                            .font(.subheadline)
+                        Text("\(NumberFormatter.localizedString(from: NSNumber(value: size), number: .decimal)) bytes ")
+                            .font(.subheadline).bold()
                             .foregroundStyle(.primary)
+                        + Text("(\(ByteCountFormatter.string(fromByteCount: size, countStyle: .file)) on disk)")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
                     }
                     
-                    Text(item.path)
+                    Text((item.path as NSString).deletingLastPathComponent)
                         .font(.subheadline)
                         .textSelection(.enabled)
                         .padding(.vertical, 4)
