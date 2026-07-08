@@ -11,6 +11,7 @@ TransmitLite is a native macOS SwiftUI file-transfer client inspired by the work
 - Upload and download with a transfer queue
 - Upload files/folders with a picker
 - Download remote items to the current local pane or a chosen folder
+- View file/folder information in a right sidebar (Inspector)
 - Edit local files in the default macOS editor
 - Edit remote files by downloading a temporary copy, opening it locally, then uploading the edited copy back
 - Rename local and remote items

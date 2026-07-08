@@ -75,6 +75,7 @@ struct BrowserTab: Identifiable, Equatable {
     var remoteEditSessions: [RemoteEditSession] = []
     var isConnected = false
     var showsConnectionEditor = true
+    var showsInspector = false
 }
 
 enum AppError: LocalizedError {
@@ -330,6 +331,7 @@ final class AppModel: ObservableObject {
     @Published var isBusy = false
     @Published var isConnected = false
     @Published var showsConnectionEditor = true
+    @Published var showsInspector = false
 
     private let sftp = SFTPClient()
     private let defaultsKey = "connections"
@@ -891,6 +893,7 @@ final class AppModel: ObservableObject {
         tabs[index].remoteEditSessions = remoteEditSessions
         tabs[index].isConnected = isConnected
         tabs[index].showsConnectionEditor = showsConnectionEditor
+        tabs[index].showsInspector = showsInspector
         if let connection = selectedConnection {
             tabs[index].title = connection.name
         } else {
@@ -914,6 +917,7 @@ final class AppModel: ObservableObject {
         remoteEditSessions = tab.remoteEditSessions
         isConnected = tab.isConnected
         showsConnectionEditor = tab.showsConnectionEditor
+        showsInspector = tab.showsInspector
         isRestoringTab = false
         Task { @MainActor in
             self.isSuppressingSidebarSelection = false
@@ -959,6 +963,9 @@ struct ContentView: View {
                 StatusBar(model: model)
             }
         }
+        .inspector(isPresented: $model.showsInspector) {
+            InspectorView(model: model)
+        }
         .frame(minWidth: 1120, minHeight: 720)
     }
 }
@@ -999,6 +1006,12 @@ struct SessionTabBar: View {
             .buttonStyle(.plain)
             .help("New tab")
             Spacer()
+            Button(action: { model.showsInspector.toggle() }) {
+                Image(systemName: model.showsInspector ? "info.circle.fill" : "info.circle")
+                    .padding(6)
+            }
+            .buttonStyle(.plain)
+            .help("Toggle Inspector")
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 6)
@@ -1423,6 +1436,106 @@ struct StatusBar: View {
     }
 }
 
+
+
+struct InspectorView: View {
+    @ObservedObject var model: AppModel
+
+    var body: some View {
+        VStack(spacing: 0) {
+            Text("Inspector")
+                .font(.headline)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding()
+            Divider()
+            
+            ScrollView {
+                VStack(spacing: 20) {
+                    if let local = model.selectedLocal {
+                        InspectorSection(title: "Local Item", item: local)
+                    }
+                    
+                    if let remote = model.selectedRemote {
+                        InspectorSection(title: "Remote Item", item: remote)
+                    }
+                    
+                    if model.selectedLocal == nil && model.selectedRemote == nil {
+                        Text("No selection")
+                            .foregroundStyle(.secondary)
+                            .padding(.top, 40)
+                    }
+                }
+                .padding()
+            }
+        }
+        .frame(minWidth: 220, idealWidth: 260)
+    }
+}
+
+struct InspectorSection: View {
+    var title: String
+    var item: FileItem
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text(title)
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+            
+            HStack(alignment: .top, spacing: 12) {
+                Image(systemName: item.isDirectory ? "folder.fill" : "doc.fill")
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+                    .frame(width: 40, height: 40)
+                    .foregroundStyle(item.isDirectory ? Color.blue : Color.secondary)
+                
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(item.name)
+                        .font(.headline)
+                        .lineLimit(2)
+                    
+                    if let size = item.size, !item.isDirectory {
+                        Text(ByteCountFormatter.string(fromByteCount: size, countStyle: .file))
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                    } else if item.isDirectory {
+                        Text("--")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+            
+            VStack(alignment: .leading, spacing: 6) {
+                InspectorRow(label: "Path", value: item.path)
+                
+                if let modified = item.modified {
+                    InspectorRow(label: "Modified", value: modified.formatted(date: .abbreviated, time: .shortened))
+                }
+                
+                InspectorRow(label: "Type", value: item.isDirectory ? "Folder" : "File")
+            }
+            .padding(.top, 4)
+        }
+    }
+}
+
+struct InspectorRow: View {
+    var label: String
+    var value: String
+    
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(label)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Text(value)
+                .font(.system(.subheadline, design: .monospaced))
+                .lineLimit(3)
+                .textSelection(.enabled)
+        }
+    }
+}
 @main
 struct TransmitLiteApp: App {
     var body: some Scene {
@@ -1435,3 +1548,4 @@ struct TransmitLiteApp: App {
         }
     }
 }
+
