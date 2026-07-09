@@ -96,51 +96,7 @@ enum AppError: LocalizedError {
 }
 
 @MainActor
-final class KeychainStore {
-    static let shared = KeychainStore()
-    private let service = "TransmitLite"
-
-    func savePassword(_ password: String, account: String) {
-        let data = Data(password.utf8)
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: account
-        ]
-
-        // Try to update the existing item first (single Keychain prompt).
-        let updateAttributes: [String: Any] = [
-            kSecValueData as String: data,
-            kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlocked
-        ]
-        let updateStatus = SecItemUpdate(query as CFDictionary, updateAttributes as CFDictionary)
-
-        if updateStatus == errSecItemNotFound {
-            // Item does not exist yet – add it.
-            var item = query
-            item[kSecValueData as String] = data
-            item[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlocked
-            SecItemAdd(item as CFDictionary, nil)
-        }
-    }
-
-    func password(account: String) -> String {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: account,
-            kSecReturnData as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne
-        ]
-        var result: AnyObject?
-        guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
-              let data = result as? Data,
-              let password = String(data: data, encoding: .utf8) else {
-            return ""
-        }
-        return password
-    }
-}
+// Password is entered at connection time via a prompt dialog (no Keychain storage).
 
 struct CommandResult {
     var stdout: String
@@ -346,6 +302,7 @@ final class AppModel: ObservableObject {
     @Published var showsConnectionEditor = true
     @Published var showsInspector = false
     @Published var showsTransfers = false
+    @Published var showsPasswordPrompt = false
 
     private let sftp = SFTPClient()
     private let defaultsKey = "connections"
@@ -496,31 +453,41 @@ final class AppModel: ObservableObject {
         guard !isSelectingConnection else { return }
         isSelectingConnection = true
         defer { isSelectingConnection = false }
-        
-        let previousConnectionID = connectionDraft.id
+
         selectedConnectionID = connection.id
         connectionDraft = connection
-        if connectionPassword.isEmpty || previousConnectionID != connection.id {
-            connectionPassword = KeychainStore.shared.password(account: connection.id.uuidString)
-        }
+        connectionPassword = ""
         remotePath = connection.remotePath
         isConnected = false
         showsConnectionEditor = false
+        showsPasswordPrompt = true
         syncCurrentTab()
-        refreshRemote()
     }
 
     func editConnection(_ connection: SavedConnection) {
         isSuppressingSidebarSelection = true
         selectedConnectionID = connection.id
         connectionDraft = connection
-        connectionPassword = KeychainStore.shared.password(account: connection.id.uuidString)
+        connectionPassword = ""
         remotePath = connection.remotePath
         showsConnectionEditor = true
         syncCurrentTab()
         Task { @MainActor in
             self.isSuppressingSidebarSelection = false
         }
+    }
+
+    func connectWithPassword() {
+        showsPasswordPrompt = false
+        remotePath = connectionDraft.remotePath.isEmpty ? "/" : connectionDraft.remotePath
+        showsConnectionEditor = false
+        syncCurrentTab()
+        refreshRemote()
+    }
+
+    func cancelPasswordPrompt() {
+        showsPasswordPrompt = false
+        connectionPassword = ""
     }
 
     func sidebarSelectionChanged(_ id: UUID?) {
@@ -536,7 +503,7 @@ final class AppModel: ObservableObject {
             connections.append(connectionDraft)
         }
         selectedConnectionID = connectionDraft.id
-        KeychainStore.shared.savePassword(connectionPassword, account: connectionDraft.id.uuidString)
+        // Password is not persisted; user enters it at connect time.
         saveConnections()
         status = "Connection saved"
         syncCurrentTab()
@@ -1080,6 +1047,9 @@ struct ContentView: View {
         .inspector(isPresented: $model.showsInspector) {
             InspectorView(model: model)
         }
+        .sheet(isPresented: $model.showsPasswordPrompt) {
+            PasswordPromptView(model: model)
+        }
         .frame(minWidth: 1120, minHeight: 720)
     }
 }
@@ -1130,6 +1100,51 @@ struct SessionTabBar: View {
         .padding(.horizontal, 10)
         .padding(.vertical, 6)
         .background(Color.primary.opacity(0.04))
+    }
+}
+
+struct PasswordPromptView: View {
+    @ObservedObject var model: AppModel
+
+    var body: some View {
+        VStack(spacing: 16) {
+            Image(systemName: "lock.shield")
+                .font(.system(size: 36))
+                .foregroundStyle(.secondary)
+
+            Text("Connect to \(model.connectionDraft.name.isEmpty ? model.connectionDraft.host : model.connectionDraft.name)")
+                .font(.headline)
+
+            Text("\(model.connectionDraft.username)@\(model.connectionDraft.host):\(model.connectionDraft.port)")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            SecureField("Password", text: $model.connectionPassword)
+                .textFieldStyle(.roundedBorder)
+                .frame(width: 280)
+                .onSubmit {
+                    model.connectWithPassword()
+                }
+
+            Text("Leave empty to use SSH key / agent authentication")
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+
+            HStack(spacing: 12) {
+                Button("Cancel") {
+                    model.cancelPasswordPrompt()
+                }
+                .keyboardShortcut(.cancelAction)
+
+                Button("Connect") {
+                    model.connectWithPassword()
+                }
+                .keyboardShortcut(.defaultAction)
+                .buttonStyle(.borderedProminent)
+            }
+        }
+        .padding(24)
+        .frame(width: 360)
     }
 }
 
@@ -1193,7 +1208,7 @@ struct ConnectionEditor: View {
                     .disabled(model.connectionDraft.host.isEmpty)
             }
             GridRow {
-                SecureField("Password saved in Keychain; SSH key/agent auth is used by SFTP", text: $model.connectionPassword)
+                SecureField("Password (leave empty for SSH key/agent auth)", text: $model.connectionPassword)
                     .gridCellColumns(2)
                 TextField("Private key path", text: $model.connectionDraft.privateKeyPath)
                     .gridCellColumns(3)
