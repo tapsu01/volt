@@ -243,6 +243,9 @@ final class SFTPClient: @unchecked Sendable {
         var args = [
             "-oBatchMode=\(trimmedPassword.isEmpty ? "yes" : "no")",
             "-oStrictHostKeyChecking=accept-new",
+            "-oControlMaster=auto",
+            "-oControlPath=/tmp/transmitlite_ssh_%h_%p_%r",
+            "-oControlPersist=5m",
             "-P", "\(connection.port)"
         ]
         if !connection.privateKeyPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -418,6 +421,9 @@ final class AppModel: ObservableObject {
                 var args = [
                     "-oBatchMode=\(trimmedPassword.isEmpty ? "yes" : "no")",
                     "-oStrictHostKeyChecking=accept-new",
+                    "-oControlMaster=auto",
+                    "-oControlPath=/tmp/transmitlite_ssh_%h_%p_%r",
+                    "-oControlPersist=5m",
                     "-p", "\(connection.port)"
                 ]
                 if !connection.privateKeyPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -1393,11 +1399,11 @@ struct FilePane<ToolbarContent: View, ContextMenuContent: View>: View {
 
             ScrollView {
                 LazyVStack(spacing: 2) {
-                    ForEach(items) { item in
+                    ForEach(Array(items.enumerated()), id: \.element.id) { index, item in
                         FileRow(
                             item: item,
                             isSelected: selection == item.id,
-                            isStriped: item.id.hashValue.isMultiple(of: 2),
+                            isStriped: index.isMultiple(of: 2),
                             selection: $selection,
                             open: open,
                             contextMenu: contextMenu
