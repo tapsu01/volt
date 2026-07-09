@@ -548,7 +548,11 @@ final class AppModel: ObservableObject {
         } else {
             connections.append(connectionDraft)
         }
+        isSuppressingSidebarSelection = true
         selectedConnectionID = connectionDraft.id
+        Task { @MainActor in
+            self.isSuppressingSidebarSelection = false
+        }
         // Password is not persisted; user enters it at connect time.
         saveConnections()
         status = "Connection saved"
