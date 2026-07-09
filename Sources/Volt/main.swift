@@ -136,50 +136,23 @@ final class CommandRunner: @unchecked Sendable {
 }
 
 final class SecureStorage {
-    private static let service = "local.volt.app"
-    private static let account = "connections"
+    private static let key = "connections"
 
     static func save(_ connections: [SavedConnection]) {
         guard let data = try? JSONEncoder().encode(connections) else { return }
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: account,
-        ]
-        let update: [String: Any] = [kSecValueData as String: data]
-        let status = SecItemUpdate(query as CFDictionary, update as CFDictionary)
-        if status == errSecItemNotFound {
-            var addQuery = query
-            addQuery[kSecValueData as String] = data
-            _ = SecItemAdd(addQuery as CFDictionary, nil)
-        }
+        UserDefaults.standard.set(data, forKey: key)
     }
 
     static func load() -> [SavedConnection] {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: account,
-            kSecReturnData as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne,
-        ]
-        var result: AnyObject?
-        let status = SecItemCopyMatching(query as CFDictionary, &result)
-        guard status == errSecSuccess,
-              let data = result as? Data,
-              let decoded = try? JSONDecoder().decode([SavedConnection].self, from: data) else {
+        guard let data = UserDefaults.standard.data(forKey: key),
+              let connections = try? JSONDecoder().decode([SavedConnection].self, from: data) else {
             return []
         }
-        return decoded
+        return connections
     }
 
     static func migrateFromUserDefaults() {
-        let key = "connections"
-        guard let data = UserDefaults.standard.data(forKey: key),
-              let connections = try? JSONDecoder().decode([SavedConnection].self, from: data),
-              !connections.isEmpty else { return }
-        save(connections)
-        UserDefaults.standard.removeObject(forKey: key)
+        // No longer needed
     }
 }
 
@@ -367,6 +340,8 @@ final class AppModel: ObservableObject {
     @Published var showsTransfers = false
     @Published var showsPasswordPrompt = false
     @Published var showsHostKeyPrompt = false
+    @Published var showsGetInfo = false
+    @Published var infoItem: FileItem?
     @Published var pendingHostKeyFingerprint = ""
     @Published var pendingHostKeyHost = ""
     private var hostKeyConfirmationContinuation: CheckedContinuation<Bool, Never>?
@@ -837,6 +812,126 @@ final class AppModel: ObservableObject {
         }
     }
 
+    // MARK: - Local Context Menu Actions
+
+    func getInfoLocalSelected() {
+        guard let item = selectedLocal else { return }
+        infoItem = item
+        showsGetInfo = true
+    }
+
+    func openInNewTabLocal() {
+        guard let item = selectedLocal, item.isDirectory else { return }
+        let newTab = BrowserTab(title: item.name, localPath: item.path, remotePath: remotePath)
+        tabs.append(newTab)
+        tabPasswords[newTab.id] = connectionPassword
+        selectTab(newTab.id)
+    }
+
+    func duplicateLocalSelected() {
+        guard let item = selectedLocal else { return }
+        let newPath = item.path + " copy"
+        do {
+            try FileManager.default.copyItem(atPath: item.path, toPath: newPath)
+            refreshLocal()
+        } catch {
+            status = error.localizedDescription
+        }
+    }
+
+    func moveLocalSelected() {
+        guard let item = selectedLocal else { return }
+        let newName = prompt("Move Local Item To:", defaultValue: item.name, actionTitle: "Move")
+        guard !newName.isEmpty, newName != item.name else { return }
+        
+        let newPath = URL(fileURLWithPath: localPath).appendingPathComponent(newName).path
+        do {
+            try FileManager.default.moveItem(atPath: item.path, toPath: newPath)
+            selectedLocalID = nil
+            refreshLocal()
+        } catch {
+            status = error.localizedDescription
+        }
+    }
+
+    func getInfoRemoteSelected() {
+        guard let item = selectedRemote else { return }
+        infoItem = item
+        showsGetInfo = true
+    }
+
+    func openInNewTabRemote() {
+        guard let item = selectedRemote, item.isDirectory else { return }
+        let newTab = BrowserTab(title: item.name, localPath: localPath, remotePath: item.path)
+        tabs.append(newTab)
+        tabPasswords[newTab.id] = connectionPassword
+        selectTab(newTab.id)
+    }
+
+    func duplicateRemoteSelected() {
+        guard let connection = selectedConnection, let item = selectedRemote else { return }
+        let newName = item.name + " copy"
+        let newPath = joinRemote(remotePath, newName)
+        let password = connectionPassword
+        runBusy("Duplicating remote item") {
+            // Using cp -r over SSH
+            let runner = CommandRunner()
+            let executable = "/usr/bin/ssh"
+            let trimmedPassword = password.trimmingCharacters(in: .newlines)
+            let controlDir = try SFTPClient.controlSocketDir()
+            var args = [
+                "-oBatchMode=\(trimmedPassword.isEmpty ? "yes" : "no")",
+                "-oStrictHostKeyChecking=yes",
+                "-oControlMaster=auto",
+                "-oControlPath=\(controlDir)/volt_%h_%p_%r",
+                "-oControlPersist=5m",
+                "-p", "\(connection.port)"
+            ]
+            if !connection.privateKeyPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                args.append(contentsOf: ["-i", connection.privateKeyPath])
+            }
+            args.append("\(connection.username)@\(connection.host)")
+            
+            let quotedSrc = "'" + item.path.replacingOccurrences(of: "'", with: "'\\''") + "'"
+            let quotedDst = "'" + newPath.replacingOccurrences(of: "'", with: "'\\''") + "'"
+            args.append("cp -r \(quotedSrc) \(quotedDst)")
+
+            var environment: [String: String] = [:]
+            let askpass = try self.sftp.makeAskPassScript(password: trimmedPassword)
+            defer {
+                if let askpass {
+                    try? FileManager.default.removeItem(at: askpass.deletingLastPathComponent())
+                }
+            }
+            if let askpass {
+                environment["SSH_ASKPASS"] = askpass.path
+                environment["SSH_ASKPASS_REQUIRE"] = "force"
+                environment["DISPLAY"] = "Volt"
+                environment["VOLT_SSH_PASS"] = trimmedPassword
+            }
+
+            _ = try runner.run(executable, arguments: args, stdin: "", environment: environment)
+            
+            await MainActor.run { self.refreshRemote() }
+        }
+    }
+
+    func moveRemoteSelected() {
+        guard let connection = selectedConnection, let item = selectedRemote else { return }
+        let newName = prompt("Move Remote Item To:", defaultValue: item.name, actionTitle: "Move")
+        guard !newName.isEmpty, newName != item.name else { return }
+        
+        let newPath = joinRemote(remotePath, newName)
+        let password = connectionPassword
+        runBusy("Moving remote item") {
+            try await self.sftp.rename(connection: connection, password: password, from: item.path, to: newPath)
+            await MainActor.run {
+                self.selectedRemoteID = nil
+                self.refreshRemote()
+            }
+        }
+    }
+
     func deleteLocalSelected() {
         guard let item = selectedLocal else { return }
         let alert = NSAlert()
@@ -1212,6 +1307,9 @@ struct ContentView: View {
         .sheet(isPresented: $model.showsPasswordPrompt) {
             PasswordPromptView(model: model)
         }
+        .sheet(isPresented: $model.showsGetInfo) {
+            GetInfoView(item: model.infoItem, isPresented: $model.showsGetInfo)
+        }
         .sheet(isPresented: $model.showsHostKeyPrompt) {
             HostKeyVerificationView(model: model)
         }
@@ -1364,6 +1462,61 @@ struct HostKeyVerificationView: View {
     }
 }
 
+struct GetInfoView: View {
+    let item: FileItem?
+    @Binding var isPresented: Bool
+    
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack {
+                Text(item?.name ?? "Info")
+                    .font(.title2)
+                    .fontWeight(.semibold)
+                Spacer()
+                Button(action: { isPresented = false }) {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+            }
+            
+            if let item = item {
+                Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 12) {
+                    GridRow {
+                        Text("Kind:").foregroundStyle(.secondary)
+                        Text(item.isDirectory ? "Folder" : "File")
+                    }
+                    GridRow {
+                        Text("Size:").foregroundStyle(.secondary)
+                        Text(item.isDirectory ? "--" : ByteCountFormatter.string(fromByteCount: item.size ?? 0, countStyle: .file))
+                    }
+                    GridRow {
+                        Text("Where:").foregroundStyle(.secondary)
+                        Text(item.path)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                    }
+                    GridRow {
+                        Text("Modified:").foregroundStyle(.secondary)
+                        if let mod = item.modified {
+                            Text(mod.formatted(date: .abbreviated, time: .shortened))
+                        } else {
+                            Text("--")
+                        }
+                    }
+                }
+            } else {
+                Text("No item selected.")
+                    .foregroundStyle(.secondary)
+            }
+            
+            Spacer()
+        }
+        .padding(20)
+        .frame(width: 400, height: 250)
+    }
+}
+
 struct SidebarView: View {
     @ObservedObject var model: AppModel
 
@@ -1508,12 +1661,18 @@ struct BrowserSplitView: View {
                 },
                 open: model.openLocal,
                 contextMenu: { item in
-                    Button("Upload") {
+                    let name = item.name
+                    Button("Upload \"\(name)\"") {
                         model.selectedLocalID = item.id
                         model.uploadSelected()
                     }
                     .disabled(model.selectedConnection == nil)
-                    Button("Edit") {
+                    Button("Get Info") {
+                        model.selectedLocalID = item.id
+                        model.getInfoLocalSelected()
+                    }
+                    Divider()
+                    Button("Open") {
                         model.selectedLocalID = item.id
                         model.editLocalSelected()
                     }
@@ -1527,15 +1686,39 @@ struct BrowserSplitView: View {
                         model.selectedLocalID = item.id
                         model.copyLocalPath()
                     }
+                    Divider()
+                    Button("Delete...") {
+                        model.selectedLocalID = item.id
+                        model.deleteLocalSelected()
+                    }
+                    Button("Move...") {
+                        model.selectedLocalID = item.id
+                        model.moveLocalSelected()
+                    }
+                    Button("Duplicate") {
+                        model.selectedLocalID = item.id
+                        model.duplicateLocalSelected()
+                    }
                     Button("Rename") {
                         model.selectedLocalID = item.id
                         model.renameLocalSelected()
                     }
                     Divider()
-                    Button("Delete") {
-                        model.selectedLocalID = item.id
-                        model.deleteLocalSelected()
+                    Button("New Folder") { model.makeLocalFolder() }
+                    Button("New File") { model.makeLocalFile() }
+                    Button("Refresh") { model.refreshLocal() }
+                    if item.isDirectory {
+                        Divider()
+                        Button("Open in New Tab") {
+                            model.selectedLocalID = item.id
+                            model.openInNewTabLocal()
+                        }
                     }
+                },
+                backgroundContextMenu: {
+                    Button("New Folder", action: model.makeLocalFolder)
+                    Button("New File", action: model.makeLocalFile)
+                    Button("Refresh", action: model.refreshLocal)
                 }
             )
             FilePane(
@@ -1571,7 +1754,8 @@ struct BrowserSplitView: View {
                 },
                 open: model.openRemote,
                 contextMenu: { item in
-                    Button("Download") {
+                    let name = item.name
+                    Button("Download \"\(name)\"") {
                         model.selectedRemoteID = item.id
                         model.downloadSelected()
                     }
@@ -1579,7 +1763,12 @@ struct BrowserSplitView: View {
                         model.selectedRemoteID = item.id
                         model.downloadSelectedToFolder()
                     }
-                    Button("Edit") {
+                    Button("Get Info") {
+                        model.selectedRemoteID = item.id
+                        model.getInfoRemoteSelected()
+                    }
+                    Divider()
+                    Button("Open") {
                         model.selectedRemoteID = item.id
                         model.editRemoteSelected()
                     }
@@ -1593,22 +1782,50 @@ struct BrowserSplitView: View {
                         model.selectedRemoteID = item.id
                         model.copyRemotePath()
                     }
+                    Divider()
+                    Button("Delete...") {
+                        model.selectedRemoteID = item.id
+                        model.deleteRemoteSelected()
+                    }
+                    Button("Move...") {
+                        model.selectedRemoteID = item.id
+                        model.moveRemoteSelected()
+                    }
+                    Button("Duplicate") {
+                        model.selectedRemoteID = item.id
+                        model.duplicateRemoteSelected()
+                    }
                     Button("Rename") {
                         model.selectedRemoteID = item.id
                         model.renameRemoteSelected()
                     }
                     Divider()
-                    Button("Delete") {
-                        model.selectedRemoteID = item.id
-                        model.deleteRemoteSelected()
+                    Button("New Folder") { model.makeRemoteFolder() }
+                        .disabled(model.selectedConnection == nil)
+                    Button("New File") { model.makeRemoteFile() }
+                        .disabled(model.selectedConnection == nil)
+                    Button("Refresh") { model.refreshRemote() }
+                    if item.isDirectory {
+                        Divider()
+                        Button("Open in New Tab") {
+                            model.selectedRemoteID = item.id
+                            model.openInNewTabRemote()
+                        }
                     }
+                },
+                backgroundContextMenu: {
+                    Button("New Folder", action: model.makeRemoteFolder)
+                        .disabled(model.selectedConnection == nil)
+                    Button("New File", action: model.makeRemoteFile)
+                        .disabled(model.selectedConnection == nil)
+                    Button("Refresh", action: model.refreshRemote)
                 }
             )
         }
     }
 }
 
-struct FilePane<ToolbarContent: View, ContextMenuContent: View>: View {
+struct FilePane<ToolbarContent: View, ContextMenuContent: View, BackgroundContextMenuContent: View>: View {
     var title: String
     @Binding var path: String
     var items: [FileItem]
@@ -1616,6 +1833,7 @@ struct FilePane<ToolbarContent: View, ContextMenuContent: View>: View {
     @ViewBuilder var toolbar: () -> ToolbarContent
     var open: (FileItem) -> Void
     @ViewBuilder var contextMenu: (FileItem) -> ContextMenuContent
+    @ViewBuilder var backgroundContextMenu: () -> BackgroundContextMenuContent
 
     var body: some View {
         VStack(spacing: 0) {
@@ -1660,8 +1878,14 @@ struct FilePane<ToolbarContent: View, ContextMenuContent: View>: View {
                 .padding(.horizontal, 10)
                 .padding(.vertical, 6)
             }
+            .background(Color.clear)
+            .contentShape(Rectangle())
+            .contextMenu { backgroundContextMenu() }
+            .onTapGesture {
+                selection = nil
+            }
         }
-        .frame(minWidth: 420)
+        .frame(minWidth: 300)
     }
 }
 
