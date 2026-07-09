@@ -1,6 +1,8 @@
-# Volt
+# ⚡ Volt
 
-Volt is a native macOS SwiftUI file-transfer client inspired by the workflow of dual-pane transfer tools. It is not affiliated with Panic and does not copy Transmit assets, branding, or proprietary behavior.
+Fast, native and beautiful file transfer for macOS.
+
+Volt is a modern file transfer client built with SwiftUI, designed for speed, simplicity and a native macOS experience.
 
 ## Features
 
