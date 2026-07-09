@@ -1172,6 +1172,9 @@ struct ConnectionEditor: View {
                     }
                 }
                 .labelsHidden()
+                if model.selectedConnection != nil {
+                    Button(action: model.hideConnectionEditor) { Label("Cancel", systemImage: "xmark.circle") }
+                }
                 Button(action: model.saveDraft) { Label("Save", systemImage: "tray.and.arrow.down") }
                 Button(action: model.connectDraft) { Label("Connect", systemImage: "bolt.horizontal") }
                     .disabled(model.connectionDraft.host.isEmpty)
