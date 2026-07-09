@@ -107,11 +107,21 @@ final class KeychainStore {
             kSecAttrService as String: service,
             kSecAttrAccount as String: account
         ]
-        SecItemDelete(query as CFDictionary)
 
-        var item = query
-        item[kSecValueData as String] = data
-        SecItemAdd(item as CFDictionary, nil)
+        // Try to update the existing item first (single Keychain prompt).
+        let updateAttributes: [String: Any] = [
+            kSecValueData as String: data,
+            kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlocked
+        ]
+        let updateStatus = SecItemUpdate(query as CFDictionary, updateAttributes as CFDictionary)
+
+        if updateStatus == errSecItemNotFound {
+            // Item does not exist yet – add it.
+            var item = query
+            item[kSecValueData as String] = data
+            item[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlocked
+            SecItemAdd(item as CFDictionary, nil)
+        }
     }
 
     func password(account: String) -> String {
@@ -332,6 +342,7 @@ final class AppModel: ObservableObject {
     @Published var isConnected = false
     @Published var showsConnectionEditor = true
     @Published var showsInspector = false
+    @Published var showsTransfers = false
 
     private let sftp = SFTPClient()
     private let defaultsKey = "connections"
@@ -443,11 +454,19 @@ final class AppModel: ObservableObject {
     }
 
     func closeCurrentTab() {
-        guard let selectedTabID, tabs.count > 1 else { return }
-        let index = tabs.firstIndex { $0.id == selectedTabID } ?? 0
-        tabs.removeAll { $0.id == selectedTabID }
-        let nextIndex = min(index, tabs.count - 1)
-        selectTab(tabs[nextIndex].id)
+        if let id = selectedTabID {
+            closeTab(id)
+        }
+    }
+
+    func closeTab(_ id: BrowserTab.ID) {
+        guard tabs.count > 1 else { return }
+        let index = tabs.firstIndex { $0.id == id } ?? 0
+        tabs.removeAll { $0.id == id }
+        if selectedTabID == id {
+            let nextIndex = min(index, tabs.count - 1)
+            selectTab(tabs[nextIndex].id)
+        }
     }
 
     func selectTab(_ id: BrowserTab.ID) {
@@ -919,6 +938,7 @@ final class AppModel: ObservableObject {
 
     private func enqueue(direction: TransferDirection, source: String, destination: String) {
         transfers.insert(TransferJob(direction: direction, source: source, destination: destination, state: .running), at: 0)
+        showsTransfers = true
     }
 
     private func markLatestTransfer(_ state: TransferState, _ message: String) {
@@ -1058,11 +1078,11 @@ struct SessionTabBar: View {
                         Image(systemName: tab.isConnected ? "bolt.horizontal.fill" : "folder")
                         Text(tab.title)
                             .lineLimit(1)
-                        if model.selectedTabID == tab.id && model.tabs.count > 1 {
+                        if model.tabs.count > 1 {
                             Image(systemName: "xmark")
                                 .font(.caption)
                                 .onTapGesture {
-                                    model.closeCurrentTab()
+                                    model.closeTab(tab.id)
                                 }
                         }
                     }
@@ -1441,19 +1461,31 @@ struct TransferQueueView: View {
     @ObservedObject var model: AppModel
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text("Transfers")
-                .font(.headline)
-            Table(model.transfers) {
-                TableColumn("Direction") { Text($0.direction.rawValue) }.width(90)
-                TableColumn("Source") { Text($0.source).lineLimit(1) }
-                TableColumn("Destination") { Text($0.destination).lineLimit(1) }
-                TableColumn("State") { Text($0.state.rawValue) }.width(80)
-                TableColumn("Message") { Text($0.message).lineLimit(1) }
+        if model.showsTransfers {
+            VStack(alignment: .leading, spacing: 6) {
+                HStack {
+                    Text("Transfers")
+                        .font(.headline)
+                    Spacer()
+                    Button {
+                        model.showsTransfers = false
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                }
+                Table(model.transfers) {
+                    TableColumn("Direction") { Text($0.direction.rawValue) }.width(90)
+                    TableColumn("Source") { Text($0.source).lineLimit(1) }
+                    TableColumn("Destination") { Text($0.destination).lineLimit(1) }
+                    TableColumn("State") { Text($0.state.rawValue) }.width(80)
+                    TableColumn("Message") { Text($0.message).lineLimit(1) }
+                }
+                .frame(height: 140)
             }
-            .frame(height: 140)
+            .padding(10)
         }
-        .padding(10)
     }
 }
 
@@ -1502,6 +1534,17 @@ struct StatusBar: View {
             Text(model.status)
                 .lineLimit(1)
             Spacer()
+            Button(action: {
+                model.showsTransfers.toggle()
+            }) {
+                HStack(spacing: 4) {
+                    Image(systemName: "arrow.up.arrow.down")
+                    Text("\(model.transfers.count)")
+                }
+            }
+            .buttonStyle(.plain)
+            .padding(.trailing, 8)
+            .help("Toggle Transfers")
             Text("TransmitLite")
                 .foregroundStyle(.secondary)
         }
