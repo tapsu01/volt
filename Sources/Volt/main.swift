@@ -65,7 +65,6 @@ struct BrowserTab: Identifiable, Equatable {
     var title: String = "New Tab"
     var connectionID: UUID?
     var connectionDraft = SavedConnection()
-    var connectionPassword: String = ""
     var localPath: String = FileManager.default.homeDirectoryForCurrentUser.path
     var remotePath: String = "/"
     var localItems: [FileItem] = []
@@ -82,6 +81,7 @@ enum AppError: LocalizedError {
     case missingConnection
     case commandFailed(String)
     case unsupportedPasswordAuth
+    case hostKeyRejected
 
     var errorDescription: String? {
         switch self {
@@ -91,6 +91,8 @@ enum AppError: LocalizedError {
             text.isEmpty ? "The command failed." : text
         case .unsupportedPasswordAuth:
             "Password login is not supported by the bundled SFTP runner. Use SSH key or agent authentication."
+        case .hostKeyRejected:
+            "Host key verification failed. The connection was rejected."
         }
     }
 }
@@ -130,6 +132,54 @@ final class CommandRunner: @unchecked Sendable {
         let stdout = String(data: output.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
         let stderr = String(data: error.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
         return CommandResult(stdout: stdout, stderr: stderr, status: process.terminationStatus)
+    }
+}
+
+final class SecureStorage {
+    private static let service = "local.volt.app"
+    private static let account = "connections"
+
+    static func save(_ connections: [SavedConnection]) {
+        guard let data = try? JSONEncoder().encode(connections) else { return }
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+        ]
+        let update: [String: Any] = [kSecValueData as String: data]
+        let status = SecItemUpdate(query as CFDictionary, update as CFDictionary)
+        if status == errSecItemNotFound {
+            var addQuery = query
+            addQuery[kSecValueData as String] = data
+            _ = SecItemAdd(addQuery as CFDictionary, nil)
+        }
+    }
+
+    static func load() -> [SavedConnection] {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne,
+        ]
+        var result: AnyObject?
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+        guard status == errSecSuccess,
+              let data = result as? Data,
+              let decoded = try? JSONDecoder().decode([SavedConnection].self, from: data) else {
+            return []
+        }
+        return decoded
+    }
+
+    static func migrateFromUserDefaults() {
+        let key = "connections"
+        guard let data = UserDefaults.standard.data(forKey: key),
+              let connections = try? JSONDecoder().decode([SavedConnection].self, from: data),
+              !connections.isEmpty else { return }
+        save(connections)
+        UserDefaults.standard.removeObject(forKey: key)
     }
 }
 
@@ -190,17 +240,28 @@ final class SFTPClient: @unchecked Sendable {
         }.value
     }
 
+    static func controlSocketDir() throws -> String {
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        let controlDir = home.appendingPathComponent(".ssh/volt_control", isDirectory: true)
+        if !FileManager.default.fileExists(atPath: controlDir.path) {
+            try FileManager.default.createDirectory(at: controlDir, withIntermediateDirectories: true)
+            try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: controlDir.path)
+        }
+        return controlDir.path
+    }
+
     private func batch(connection: SavedConnection, password: String, commands: [String]) throws -> CommandResult {
         guard FileManager.default.isExecutableFile(atPath: executable) else {
             throw AppError.commandFailed("OpenSSH SFTP was not found at \(executable).")
         }
 
         let trimmedPassword = password.trimmingCharacters(in: .newlines)
+        let controlDir = try SFTPClient.controlSocketDir()
         var args = [
             "-oBatchMode=\(trimmedPassword.isEmpty ? "yes" : "no")",
-            "-oStrictHostKeyChecking=accept-new",
+            "-oStrictHostKeyChecking=yes",
             "-oControlMaster=auto",
-            "-oControlPath=/tmp/volt_ssh_%h_%p_%r",
+            "-oControlPath=\(controlDir)/volt_%h_%p_%r",
             "-oControlPersist=5m",
             "-P", "\(connection.port)"
         ]
@@ -213,7 +274,7 @@ final class SFTPClient: @unchecked Sendable {
         let askpass = try makeAskPassScript(password: trimmedPassword)
         defer {
             if let askpass {
-                try? FileManager.default.removeItem(at: askpass)
+                try? FileManager.default.removeItem(at: askpass.deletingLastPathComponent())
             }
         }
 
@@ -222,6 +283,7 @@ final class SFTPClient: @unchecked Sendable {
             environment["SSH_ASKPASS"] = askpass.path
             environment["SSH_ASKPASS_REQUIRE"] = "force"
             environment["DISPLAY"] = "Volt"
+            environment["VOLT_SSH_PASS"] = trimmedPassword
         }
 
         let result = try runner.run(executable, arguments: args, stdin: script, environment: environment)
@@ -234,7 +296,8 @@ final class SFTPClient: @unchecked Sendable {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("Volt-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let scriptURL = directory.appendingPathComponent("askpass.sh")
-        let script = "#!/bin/sh\nprintf '%s\\n' \(shellSingleQuote(password))\n"
+        // Security: Password is passed via VOLT_SSH_PASS env var, never written to disk
+        let script = "#!/bin/sh\nprintf '%s\\n' \"$VOLT_SSH_PASS\"\n"
         try script.write(to: scriptURL, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: scriptURL.path)
         return scriptURL
@@ -303,15 +366,20 @@ final class AppModel: ObservableObject {
     @Published var showsInspector = false
     @Published var showsTransfers = false
     @Published var showsPasswordPrompt = false
+    @Published var showsHostKeyPrompt = false
+    @Published var pendingHostKeyFingerprint = ""
+    @Published var pendingHostKeyHost = ""
+    private var hostKeyConfirmationContinuation: CheckedContinuation<Bool, Never>?
+    private var tabPasswords: [BrowserTab.ID: String] = [:]
 
     private let sftp = SFTPClient()
-    private let defaultsKey = "connections"
     private var isRestoringTab = false
     private var isSuppressingSidebarSelection = false
     private var isSelectingConnection = false
 
     init() {
         selectedTabID = tabs.first?.id
+        SecureStorage.migrateFromUserDefaults()
         loadConnections()
         refreshLocal()
         syncCurrentTab()
@@ -369,6 +437,7 @@ final class AppModel: ObservableObject {
             
             do {
                 let askpass = try sftp.makeAskPassScript(password: trimmedPassword)
+                let controlDir = try SFTPClient.controlSocketDir()
                 defer {
                     if let askpass {
                         try? FileManager.default.removeItem(at: askpass.deletingLastPathComponent())
@@ -377,9 +446,9 @@ final class AppModel: ObservableObject {
 
                 var args = [
                     "-oBatchMode=\(trimmedPassword.isEmpty ? "yes" : "no")",
-                    "-oStrictHostKeyChecking=accept-new",
+                    "-oStrictHostKeyChecking=yes",
                     "-oControlMaster=auto",
-                    "-oControlPath=/tmp/volt_ssh_%h_%p_%r",
+                    "-oControlPath=\(controlDir)/volt_%h_%p_%r",
                     "-oControlPersist=5m",
                     "-p", "\(connection.port)"
                 ]
@@ -396,6 +465,7 @@ final class AppModel: ObservableObject {
                     environment["SSH_ASKPASS"] = askpass.path
                     environment["SSH_ASKPASS_REQUIRE"] = "force"
                     environment["DISPLAY"] = "Volt"
+                    environment["VOLT_SSH_PASS"] = trimmedPassword
                 }
 
                 let result = try runner.run(executable, arguments: args, stdin: "", environment: environment)
@@ -424,6 +494,7 @@ final class AppModel: ObservableObject {
 
     func closeTab(_ id: BrowserTab.ID) {
         guard tabs.count > 1 else { return }
+        tabPasswords.removeValue(forKey: id)
         let index = tabs.firstIndex { $0.id == id } ?? 0
         tabs.removeAll { $0.id == id }
         if selectedTabID == id {
@@ -539,6 +610,9 @@ final class AppModel: ObservableObject {
             selectedConnectionID = nil
             connectionDraft = SavedConnection()
             connectionPassword = ""
+            if let tabID = selectedTabID {
+                tabPasswords.removeValue(forKey: tabID)
+            }
             remoteItems = []
             selectedRemoteID = nil
             remotePath = "/"
@@ -585,6 +659,7 @@ final class AppModel: ObservableObject {
         let path = remotePath
         let password = connectionPassword
         runBusy("Loading remote folder") {
+            try await self.verifyHostKey(for: connection)
             let items = try await self.sftp.list(connection: connection, password: password, path: path)
             await MainActor.run {
                 self.remoteItems = items
@@ -764,6 +839,13 @@ final class AppModel: ObservableObject {
 
     func deleteLocalSelected() {
         guard let item = selectedLocal else { return }
+        let alert = NSAlert()
+        alert.messageText = "Delete \"\(item.name)\"?"
+        alert.informativeText = "This item will be permanently deleted."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Delete")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
         do {
             try FileManager.default.removeItem(atPath: item.path)
             selectedLocalID = nil
@@ -775,6 +857,13 @@ final class AppModel: ObservableObject {
 
     func deleteRemoteSelected() {
         guard let connection = selectedConnection, let item = selectedRemote else { return }
+        let alert = NSAlert()
+        alert.messageText = "Delete \"\(item.name)\"?"
+        alert.informativeText = "This remote item will be permanently deleted."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Delete")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
         let password = connectionPassword
         runBusy("Deleting remote item") {
             try await self.sftp.remove(connection: connection, password: password, path: item.path, isDirectory: item.isDirectory)
@@ -950,21 +1039,18 @@ final class AppModel: ObservableObject {
     }
 
     private func loadConnections() {
-        guard let data = UserDefaults.standard.data(forKey: defaultsKey),
-              let decoded = try? JSONDecoder().decode([SavedConnection].self, from: data) else { return }
-        connections = decoded
+        connections = SecureStorage.load()
     }
 
     private func saveConnections() {
-        guard let data = try? JSONEncoder().encode(connections) else { return }
-        UserDefaults.standard.set(data, forKey: defaultsKey)
+        SecureStorage.save(connections)
     }
 
     private func syncCurrentTab() {
         guard !isRestoringTab, let selectedTabID, let index = tabs.firstIndex(where: { $0.id == selectedTabID }) else { return }
         tabs[index].connectionID = selectedConnectionID
         tabs[index].connectionDraft = connectionDraft
-        tabs[index].connectionPassword = connectionPassword
+        tabPasswords[selectedTabID] = connectionPassword
         tabs[index].localPath = localPath
         tabs[index].remotePath = remotePath
         tabs[index].localItems = localItems
@@ -988,7 +1074,7 @@ final class AppModel: ObservableObject {
         isSuppressingSidebarSelection = true
         selectedConnectionID = tab.connectionID
         connectionDraft = tab.connectionDraft
-        connectionPassword = tab.connectionPassword
+        connectionPassword = tabPasswords[tab.id] ?? ""
         localPath = tab.localPath
         remotePath = tab.remotePath
         localItems = tab.localItems
@@ -1017,6 +1103,82 @@ final class AppModel: ObservableObject {
     private func joinRemote(_ base: String, _ child: String) -> String {
         if base == "/" { return "/" + child }
         return "/" + base.trimmingCharacters(in: CharacterSet(charactersIn: "/")) + "/" + child
+    }
+
+    // MARK: - Host Key Verification
+
+    private func verifyHostKey(for connection: SavedConnection) async throws {
+        let host = connection.host
+        let port = connection.port
+
+        // Check if host is already in known_hosts
+        let isKnown = try await Task.detached {
+            let runner = CommandRunner()
+            let result = try runner.run("/usr/bin/ssh-keygen", arguments: ["-F", host])
+            return result.status == 0 && !result.stdout.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }.value
+
+        if isKnown { return }
+
+        // Scan for host key fingerprint
+        let (hostKeys, fingerprint) = try await Task.detached {
+            let runner = CommandRunner()
+            let scanResult = try runner.run("/usr/bin/ssh-keyscan", arguments: ["-p", "\(port)", host])
+            guard scanResult.status == 0,
+                  !scanResult.stdout.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                throw AppError.commandFailed("Could not retrieve host key from \(host):\(port).")
+            }
+
+            let tempFile = FileManager.default.temporaryDirectory.appendingPathComponent("volt_hostkey_\(UUID().uuidString)")
+            try scanResult.stdout.write(to: tempFile, atomically: true, encoding: .utf8)
+            defer { try? FileManager.default.removeItem(at: tempFile) }
+
+            let fpResult = try runner.run("/usr/bin/ssh-keygen", arguments: ["-lf", tempFile.path])
+            return (scanResult.stdout, fpResult.stdout.trimmingCharacters(in: .whitespacesAndNewlines))
+        }.value
+
+        // Show host key fingerprint dialog and wait for user confirmation
+        let confirmed = await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
+            self.pendingHostKeyFingerprint = fingerprint
+            self.pendingHostKeyHost = "\(host):\(port)"
+            self.hostKeyConfirmationContinuation = continuation
+            self.showsHostKeyPrompt = true
+        }
+
+        guard confirmed else {
+            throw AppError.hostKeyRejected
+        }
+
+        // Add key to known_hosts
+        try await Task.detached {
+            let sshDir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".ssh")
+            if !FileManager.default.fileExists(atPath: sshDir.path) {
+                try FileManager.default.createDirectory(at: sshDir, withIntermediateDirectories: true)
+                try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: sshDir.path)
+            }
+            let knownHostsURL = sshDir.appendingPathComponent("known_hosts")
+            if FileManager.default.fileExists(atPath: knownHostsURL.path) {
+                let handle = try FileHandle(forWritingTo: knownHostsURL)
+                handle.seekToEndOfFile()
+                handle.write(Data(hostKeys.utf8))
+                try handle.close()
+            } else {
+                try hostKeys.write(to: knownHostsURL, atomically: true, encoding: .utf8)
+                try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: knownHostsURL.path)
+            }
+        }.value
+    }
+
+    func confirmHostKey() {
+        showsHostKeyPrompt = false
+        hostKeyConfirmationContinuation?.resume(returning: true)
+        hostKeyConfirmationContinuation = nil
+    }
+
+    func rejectHostKey() {
+        showsHostKeyPrompt = false
+        hostKeyConfirmationContinuation?.resume(returning: false)
+        hostKeyConfirmationContinuation = nil
     }
 }
 
@@ -1049,6 +1211,9 @@ struct ContentView: View {
         }
         .sheet(isPresented: $model.showsPasswordPrompt) {
             PasswordPromptView(model: model)
+        }
+        .sheet(isPresented: $model.showsHostKeyPrompt) {
+            HostKeyVerificationView(model: model)
         }
         .frame(minWidth: 1120, minHeight: 720)
     }
@@ -1145,6 +1310,57 @@ struct PasswordPromptView: View {
         }
         .padding(24)
         .frame(width: 360)
+    }
+}
+
+struct HostKeyVerificationView: View {
+    @ObservedObject var model: AppModel
+
+    var body: some View {
+        VStack(spacing: 16) {
+            Image(systemName: "shield.lefthalf.filled")
+                .font(.system(size: 36))
+                .foregroundStyle(.orange)
+
+            Text("Unknown Host Key")
+                .font(.headline)
+
+            Text("The host \(model.pendingHostKeyHost) presented an unrecognized key fingerprint.")
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+
+            GroupBox {
+                ScrollView {
+                    Text(model.pendingHostKeyFingerprint)
+                        .font(.system(.caption, design: .monospaced))
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .frame(height: 60)
+            }
+            .frame(width: 380)
+
+            Text("Verify this fingerprint matches the server's key before accepting.")
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+                .multilineTextAlignment(.center)
+
+            HStack(spacing: 12) {
+                Button("Reject") {
+                    model.rejectHostKey()
+                }
+                .keyboardShortcut(.cancelAction)
+
+                Button("Accept & Connect") {
+                    model.confirmHostKey()
+                }
+                .keyboardShortcut(.defaultAction)
+                .buttonStyle(.borderedProminent)
+            }
+        }
+        .padding(24)
+        .frame(width: 440)
     }
 }
 

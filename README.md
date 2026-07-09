@@ -1,44 +1,132 @@
-# ⚡ Volt
+<h1 align="center">⚡ Volt</h1>
 
-Fast, native and beautiful file transfer for macOS.
+<p align="center">
+  <strong>Fast, native and beautiful file transfer for macOS.</strong>
+  <br>
+  Modern SFTP client built with SwiftUI.
+</p>
 
-Volt is a modern file transfer client built with SwiftUI, designed for speed, simplicity and a native macOS experience.
+---
 
 ## Features
 
-- **Dual-Pane Interface**: Browse local files on the left and remote files on the right.
-- **SFTP Support**: Connect to servers securely using SFTP.
-- **Transfers**: Upload and download files and directories using drag-and-drop or context menus.
-- **Remote Editing**: Select a file, click the Edit button, and it opens in your default local editor. Save it, and Volt uploads it back to the server.
-- **Keychain Integration**: Passwords are securely stored in the macOS Keychain.
-- **Multi-Tab Support**: Open multiple remote sessions at once.
-- **Quick Look**: Preview local and remote files with the spacebar.
+- ⚡ Native SwiftUI interface
+- 📂 Dual-pane file manager
+- 🔐 Secure SFTP connections
+- 📤 Drag & drop uploads and downloads
+- ✏️ Remote file editing with automatic upload
+- 🔑 Secure password storage using macOS Keychain
+- 🗂️ Multi-tab sessions
+- 👀 Quick Look support for local and remote files
+- 🚀 Optimized for the macOS desktop experience
+
+---
+
+## Why Volt?
+
+Volt is designed to feel like a first-party macOS application.
+
+It focuses on:
+
+- Native performance
+- Clean and modern interface
+- Keyboard-friendly workflow
+- Secure file transfers
+- Simple, distraction-free experience
+
+---
 
 ## Requirements
 
-- macOS 14.0 or later
-- Swift 6.0 or later (for building)
+- macOS 14 Sonoma or later
+- Swift 6+
+- Xcode 16+ (recommended)
 
-## Build Instructions
+---
 
-To build the standalone `.app` bundle, use the provided script:
+## Getting Started
 
-```sh
+Clone the repository:
+
+```bash
+git clone https://github.com/<your-account>/Volt.git
+cd Volt
+```
+
+Build the application:
+
+```bash
 ./Scripts/package-app.sh
 ```
 
-This will create `Volt.app` inside the `build/` directory.
+The generated application will be located in:
 
-Alternatively, you can build and run directly via Swift PM:
-
-```sh
-/usr/bin/swift run Volt
 ```
+build/Volt.app
+```
+
+Or run directly with Swift Package Manager:
+
+```bash
+swift run Volt
+```
+
+---
 
 ## Remote Editing
 
-Select a remote file and click the pencil button. Volt downloads the file to a temporary local copy and opens it in your default editor. Save the file in that editor, then return to Volt and click `Upload Edited` in the Remote Edits panel.
+Edit remote files directly using your preferred editor.
+
+1. Select a remote file.
+2. Click **Edit**.
+3. Volt downloads a temporary local copy.
+4. The file opens in your default editor.
+5. Save your changes.
+6. Return to Volt and click **Upload Edited**.
+
+---
+
+## Roadmap
+
+### Current
+
+- [x] Native SwiftUI interface
+- [x] SFTP support
+- [x] Dual-pane file browser
+- [x] Multi-tab support
+- [x] Remote editing
+- [x] Quick Look
+- [x] Keychain integration
+
+### Planned
+
+- [ ] SSH terminal
+- [ ] Folder synchronization
+- [ ] Bookmark manager
+- [ ] Transfer queue improvements
+- [ ] Background transfers
+- [ ] Amazon S3
+- [ ] WebDAV
+- [ ] FTP / FTPS
+
+---
+
+## Contributing
+
+Contributions are welcome!
+
+If you'd like to improve Volt, feel free to open an issue or submit a pull request.
+
+---
 
 ## License
 
-MIT License. See LICENSE for more information.
+Volt is released under the MIT License.
+
+See the [LICENSE](LICENSE) file for details.
+
+---
+
+<p align="center">
+Built with ❤️ using SwiftUI for macOS.
+</p>

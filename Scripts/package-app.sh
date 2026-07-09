@@ -19,6 +19,6 @@ MACOS_DIR="$CONTENTS_DIR/MacOS"
 /bin/cp "$ROOT_DIR/Support/Info.plist" "$CONTENTS_DIR/Info.plist"
 /bin/mkdir -p "$CONTENTS_DIR/Resources"
 /bin/cp "$ROOT_DIR/Support/AppIcon.icns" "$CONTENTS_DIR/Resources/AppIcon.icns"
-/usr/bin/codesign --force --sign - "$APP_DIR"
+/usr/bin/codesign --force --sign - --options runtime --entitlements "$ROOT_DIR/Support/Volt.entitlements" "$APP_DIR"
 
 printf '%s\n' "$APP_DIR"
