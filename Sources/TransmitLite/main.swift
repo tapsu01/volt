@@ -510,6 +510,19 @@ final class AppModel: ObservableObject {
         refreshRemote()
     }
 
+    func editConnection(_ connection: SavedConnection) {
+        isSuppressingSidebarSelection = true
+        selectedConnectionID = connection.id
+        connectionDraft = connection
+        connectionPassword = KeychainStore.shared.password(account: connection.id.uuidString)
+        remotePath = connection.remotePath
+        showsConnectionEditor = true
+        syncCurrentTab()
+        Task { @MainActor in
+            self.isSuppressingSidebarSelection = false
+        }
+    }
+
     func sidebarSelectionChanged(_ id: UUID?) {
         guard !isSuppressingSidebarSelection else { return }
         guard let id, let connection = connections.first(where: { $0.id == id }) else { return }
@@ -1130,7 +1143,7 @@ struct SidebarView: View {
                     Label(connection.name, systemImage: "externaldrive.connected.to.line.below")
                         .tag(connection.id)
                         .contextMenu {
-                            Button("Edit") { model.select(connection) }
+                            Button("Edit") { model.editConnection(connection) }
                             Button("Disconnect") { model.disconnectConnection(id: connection.id) }
                                 .disabled(model.selectedConnectionID != connection.id)
                             Divider()
