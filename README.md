@@ -1,39 +1,42 @@
-# TransmitLite
+# Volt
 
-TransmitLite is a native macOS SwiftUI file-transfer client inspired by the workflow of dual-pane transfer tools. It is not affiliated with Panic and does not copy Transmit assets, branding, or proprietary behavior.
+Volt is a native macOS SwiftUI file-transfer client inspired by the workflow of dual-pane transfer tools. It is not affiliated with Panic and does not copy Transmit assets, branding, or proprietary behavior.
 
 ## Features
 
-- macOS-only native SwiftUI interface
-- Saved SFTP connections
-- SSH private-key or agent authentication through macOS OpenSSH
-- Local and remote file browsing
-- Upload and download with a transfer queue
-- Upload files/folders with a picker
-- Download remote items to the current local pane or a chosen folder
-- View file/folder information in a right sidebar (Inspector)
-- Edit local files in the default macOS editor
-- Edit remote files by downloading a temporary copy, opening it locally, then uploading the edited copy back
-- Rename local and remote items
-- Create local and remote files
-- Create and delete local folders/files
-- Create and delete remote folders/files
-- Password field is stored in Keychain for future expansion, but SFTP execution currently uses key/agent auth because OpenSSH password prompts require an interactive TTY
+- **Dual-Pane Interface**: Browse local files on the left and remote files on the right.
+- **SFTP Support**: Connect to servers securely using SFTP.
+- **Transfers**: Upload and download files and directories using drag-and-drop or context menus.
+- **Remote Editing**: Select a file, click the Edit button, and it opens in your default local editor. Save it, and Volt uploads it back to the server.
+- **Keychain Integration**: Passwords are securely stored in the macOS Keychain.
+- **Multi-Tab Support**: Open multiple remote sessions at once.
+- **Quick Look**: Preview local and remote files with the spacebar.
 
-## Build
+## Requirements
 
-```sh
-/usr/bin/swift build
-```
+- macOS 14.0 or later
+- Swift 6.0 or later (for building)
 
-## Run
+## Build Instructions
+
+To build the standalone `.app` bundle, use the provided script:
 
 ```sh
-/usr/bin/swift run TransmitLite
+./Scripts/package-app.sh
 ```
 
-For SFTP connections, make sure the server accepts your SSH key or your key is loaded in `ssh-agent`.
+This will create `Volt.app` inside the `build/` directory.
 
-## Remote editing
+Alternatively, you can build and run directly via Swift PM:
 
-Select a remote file and click the pencil button. TransmitLite downloads the file to a temporary local copy and opens it in your default editor. Save the file in that editor, then return to TransmitLite and click `Upload Edited` in the Remote Edits panel.
+```sh
+/usr/bin/swift run Volt
+```
+
+## Remote Editing
+
+Select a remote file and click the pencil button. Volt downloads the file to a temporary local copy and opens it in your default editor. Save the file in that editor, then return to Volt and click `Upload Edited` in the Remote Edits panel.
+
+## License
+
+MIT License. See LICENSE for more information.

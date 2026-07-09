@@ -3,17 +3,17 @@
 import PackageDescription
 
 let package = Package(
-    name: "TransmitLite",
+    name: "Volt",
     platforms: [
         .macOS(.v14)
     ],
     products: [
-        .executable(name: "TransmitLite", targets: ["TransmitLite"])
+        .executable(name: "Volt", targets: ["Volt"])
     ],
     targets: [
         .executableTarget(
-            name: "TransmitLite",
-            path: "Sources/TransmitLite"
+            name: "Volt",
+            path: "Sources/Volt"
         )
     ]
 )

@@ -167,7 +167,7 @@ final class SFTPClient: @unchecked Sendable {
 
     func createFile(connection: SavedConnection, password: String, remotePath: String) async throws {
         try await Task.detached {
-            let tempURL = FileManager.default.temporaryDirectory.appendingPathComponent("TransmitLite-\(UUID().uuidString)")
+            let tempURL = FileManager.default.temporaryDirectory.appendingPathComponent("Volt-\(UUID().uuidString)")
             try Data().write(to: tempURL)
             defer { try? FileManager.default.removeItem(at: tempURL) }
             let output = try self.batch(connection: connection, password: password, commands: ["put \(self.quote(tempURL.path)) \(self.quote(remotePath))"])
@@ -200,7 +200,7 @@ final class SFTPClient: @unchecked Sendable {
             "-oBatchMode=\(trimmedPassword.isEmpty ? "yes" : "no")",
             "-oStrictHostKeyChecking=accept-new",
             "-oControlMaster=auto",
-            "-oControlPath=/tmp/transmitlite_ssh_%h_%p_%r",
+            "-oControlPath=/tmp/volt_ssh_%h_%p_%r",
             "-oControlPersist=5m",
             "-P", "\(connection.port)"
         ]
@@ -221,7 +221,7 @@ final class SFTPClient: @unchecked Sendable {
         if let askpass {
             environment["SSH_ASKPASS"] = askpass.path
             environment["SSH_ASKPASS_REQUIRE"] = "force"
-            environment["DISPLAY"] = "TransmitLite"
+            environment["DISPLAY"] = "Volt"
         }
 
         let result = try runner.run(executable, arguments: args, stdin: script, environment: environment)
@@ -231,7 +231,7 @@ final class SFTPClient: @unchecked Sendable {
 
     func makeAskPassScript(password: String) throws -> URL? {
         guard !password.isEmpty else { return nil }
-        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("TransmitLite-\(UUID().uuidString)", isDirectory: true)
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("Volt-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let scriptURL = directory.appendingPathComponent("askpass.sh")
         let script = "#!/bin/sh\nprintf '%s\\n' \(shellSingleQuote(password))\n"
@@ -379,7 +379,7 @@ final class AppModel: ObservableObject {
                     "-oBatchMode=\(trimmedPassword.isEmpty ? "yes" : "no")",
                     "-oStrictHostKeyChecking=accept-new",
                     "-oControlMaster=auto",
-                    "-oControlPath=/tmp/transmitlite_ssh_%h_%p_%r",
+                    "-oControlPath=/tmp/volt_ssh_%h_%p_%r",
                     "-oControlPersist=5m",
                     "-p", "\(connection.port)"
                 ]
@@ -395,7 +395,7 @@ final class AppModel: ObservableObject {
                 if let askpass {
                     environment["SSH_ASKPASS"] = askpass.path
                     environment["SSH_ASKPASS_REQUIRE"] = "force"
-                    environment["DISPLAY"] = "TransmitLite"
+                    environment["DISPLAY"] = "Volt"
                 }
 
                 let result = try runner.run(executable, arguments: args, stdin: "", environment: environment)
@@ -854,7 +854,7 @@ final class AppModel: ObservableObject {
     private func editRemoteSelected(withApp appURL: URL?) {
         guard let item = selectedRemote, !item.isDirectory else { return }
         let directory = FileManager.default.temporaryDirectory
-            .appendingPathComponent("TransmitLiteEdits", isDirectory: true)
+            .appendingPathComponent("VoltEdits", isDirectory: true)
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
         do {
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -1582,7 +1582,7 @@ struct StatusBar: View {
             .buttonStyle(.plain)
             .padding(.trailing, 8)
             .help("Toggle Transfers")
-            Text("TransmitLite")
+            Text("Volt")
                 .foregroundStyle(.secondary)
         }
         .font(.caption)
@@ -1773,7 +1773,7 @@ struct InspectorSection: View {
 }
 
 @main
-struct TransmitLiteApp: App {
+struct VoltApp: App {
     var body: some Scene {
         WindowGroup {
             ContentView()
@@ -1784,4 +1784,3 @@ struct TransmitLiteApp: App {
         }
     }
 }
-
