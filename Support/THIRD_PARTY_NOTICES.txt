@@ -1,0 +1,11 @@
+Volt includes the following third-party software:
+
+libssh2
+Copyright (c) the libssh2 project and contributors.
+Licensed under the BSD-style license included in Resources/Licenses/libssh2-COPYING.txt.
+Source: https://github.com/libssh2/libssh2
+
+OpenSSL
+Copyright (c) the OpenSSL Project and contributors.
+Licensed under the Apache License 2.0 included in Resources/Licenses/OpenSSL-LICENSE.txt.
+Source: https://github.com/openssl/openssl

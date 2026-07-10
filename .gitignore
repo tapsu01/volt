@@ -1,3 +1,41 @@
+# macOS metadata
 .DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Swift Package Manager and Xcode output
 .build/
-build/
+.swiftpm/
+DerivedData/
+xcuserdata/
+*.xcuserstate
+*.xccheckout
+
+# Packaged applications and release artifacts
+/build/
+
+# Local tools, generated assets, and editor state
+/.venv*/
+/tmp/
+.idea/
+.vscode/
+*.swp
+*~
+*.log
+*.profraw
+*.profdata
+
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.p12
+*.pfx
+*.mobileprovision
+*.provisionprofile
+known_hosts
+known_hosts.lock
+connections.json

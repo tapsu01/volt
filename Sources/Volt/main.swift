@@ -1,13 +1,42 @@
 import AppKit
+import CVoltSSH
+import CryptoKit
 import Foundation
 import Security
 import SwiftUI
 import UniformTypeIdentifiers
 
+private func decodeCError(_ buffer: [CChar]) -> String {
+    let bytes = buffer.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }
+    return String(decoding: bytes, as: UTF8.self)
+}
+
 enum ProtocolKind: String, Codable, CaseIterable, Identifiable {
     case sftp = "SFTP"
 
     var id: String { rawValue }
+}
+
+enum RemotePermissionPreset: String, Codable, CaseIterable, Identifiable {
+    case web = "Web"
+    case privateFiles = "Private"
+    case team = "Team"
+
+    var id: String { rawValue }
+    var fileMode: UInt32 {
+        switch self {
+        case .web: 0o644
+        case .privateFiles: 0o600
+        case .team: 0o660
+        }
+    }
+    var folderMode: UInt32 {
+        switch self {
+        case .web: 0o755
+        case .privateFiles: 0o700
+        case .team: 0o770
+        }
+    }
 }
 
 struct SavedConnection: Identifiable, Codable, Equatable {
@@ -19,6 +48,18 @@ struct SavedConnection: Identifiable, Codable, Equatable {
     var protocolKind: ProtocolKind = .sftp
     var remotePath: String = "/"
     var privateKeyPath: String = ""
+    var privateKeyBookmark: Data?
+    var permissionPreset: RemotePermissionPreset?
+
+    var effectivePermissionPreset: RemotePermissionPreset {
+        permissionPreset ?? .web
+    }
+}
+
+struct HostKeyProbe: Sendable {
+    var key: Data
+    var keyType: Int32
+    var trustStatus: Int32
 }
 
 struct FileItem: Identifiable, Hashable {
@@ -90,7 +131,7 @@ enum AppError: LocalizedError {
         case .commandFailed(let text):
             text.isEmpty ? "The command failed." : text
         case .unsupportedPasswordAuth:
-            "Password login is not supported by the bundled SFTP runner. Use SSH key or agent authentication."
+            "This SSH shell action requires SSH key or ssh-agent authentication. SFTP password operations are supported."
         case .hostKeyRejected:
             "Host key verification failed. The connection was rejected."
         }
@@ -136,15 +177,22 @@ final class CommandRunner: @unchecked Sendable {
 }
 
 final class SecureStorage {
-    private static let key = "connections"
+    private static let legacyKey = "connections"
 
     static func save(_ connections: [SavedConnection]) {
         guard let data = try? JSONEncoder().encode(connections) else { return }
-        UserDefaults.standard.set(data, forKey: key)
+        do {
+            let url = try AppPaths.supportDirectory().appendingPathComponent("connections.json")
+            try data.write(to: url, options: [.atomic, .completeFileProtection])
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+        } catch {
+            return
+        }
     }
 
     static func load() -> [SavedConnection] {
-        guard let data = UserDefaults.standard.data(forKey: key),
+        guard let url = try? AppPaths.supportDirectory().appendingPathComponent("connections.json"),
+              let data = try? Data(contentsOf: url),
               let connections = try? JSONDecoder().decode([SavedConnection].self, from: data) else {
             return []
         }
@@ -152,70 +200,231 @@ final class SecureStorage {
     }
 
     static func migrateFromUserDefaults() {
-        // No longer needed
+        guard let destination = try? AppPaths.supportDirectory().appendingPathComponent("connections.json"),
+              !FileManager.default.fileExists(atPath: destination.path),
+              let data = UserDefaults.standard.data(forKey: legacyKey),
+              let connections = try? JSONDecoder().decode([SavedConnection].self, from: data) else { return }
+        save(connections)
+        UserDefaults.standard.removeObject(forKey: legacyKey)
+    }
+}
+
+enum AppPaths {
+    static var defaultLocalDirectory: URL {
+        FileManager.default.homeDirectoryForCurrentUser
+    }
+
+    static func migrateFromSandboxContainerIfNeeded() {
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        let sandboxDirectory = home
+            .appendingPathComponent("Library/Containers/local.volt.app/Data/Library/Application Support/Volt", isDirectory: true)
+        guard FileManager.default.fileExists(atPath: sandboxDirectory.path),
+              let destination = try? supportDirectory() else { return }
+
+        for name in ["connections.json", "known_hosts"] {
+            let source = sandboxDirectory.appendingPathComponent(name)
+            let target = destination.appendingPathComponent(name)
+            guard FileManager.default.fileExists(atPath: source.path),
+                  !FileManager.default.fileExists(atPath: target.path) else { continue }
+            try? FileManager.default.copyItem(at: source, to: target)
+            try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: target.path)
+        }
+    }
+
+    static func supportDirectory() throws -> URL {
+        let base = try FileManager.default.url(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask,
+            appropriateFor: nil,
+            create: true
+        )
+        let directory = base.appendingPathComponent("Volt", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
+        return directory
+    }
+
+    static func knownHostsURL() throws -> URL {
+        let url = try supportDirectory().appendingPathComponent("known_hosts", isDirectory: false)
+        if !FileManager.default.fileExists(atPath: url.path) {
+            try Data().write(to: url, options: .atomic)
+        }
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+        return url
+    }
+
+    static func editDirectory() throws -> URL {
+        let directory = try supportDirectory().appendingPathComponent("Edits", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
+        return directory
+    }
+
+    static func cleanupEditFiles(olderThan age: TimeInterval = 24 * 60 * 60) {
+        guard let directory = try? editDirectory(),
+              let entries = try? FileManager.default.contentsOfDirectory(
+                at: directory,
+                includingPropertiesForKeys: [.contentModificationDateKey],
+                options: [.skipsHiddenFiles]
+              ) else { return }
+        let cutoff = Date().addingTimeInterval(-age)
+        for entry in entries {
+            let modified = try? entry.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate
+            if age == 0 || (modified ?? .distantPast) < cutoff {
+                try? FileManager.default.removeItem(at: entry)
+            }
+        }
     }
 }
 
 final class SFTPClient: @unchecked Sendable {
-    private let runner = CommandRunner()
-    private let executable = "/usr/bin/sftp"
-
-    func list(connection: SavedConnection, password: String, path: String) async throws -> [FileItem] {
+    func probeHostKey(connection: SavedConnection) async throws -> HostKeyProbe {
         try await Task.detached {
-            let output = try self.batch(connection: connection, password: password, commands: ["cd \(self.quote(path))", "ls -la"])
-            return self.parseListing(output.stdout, basePath: path)
+            var keyPointer: UnsafeMutablePointer<UInt8>?
+            var keyLength = 0
+            var keyType: Int32 = 0
+            var trustStatus: Int32 = 0
+            var error = [CChar](repeating: 0, count: 4096)
+            let knownHostsPath = try AppPaths.knownHostsURL().path
+            let status = connection.host.withCString { host in
+                knownHostsPath.withCString { knownHosts in
+                    error.withUnsafeMutableBufferPointer { errorBuffer in
+                        volt_ssh_probe_host_key(
+                            host,
+                            Int32(connection.port),
+                            knownHosts,
+                            &keyPointer,
+                            &keyLength,
+                            &keyType,
+                            &trustStatus,
+                            errorBuffer.baseAddress!,
+                            errorBuffer.count
+                        )
+                    }
+                }
+            }
+            guard status == 0, let keyPointer else {
+                throw AppError.commandFailed(decodeCError(error))
+            }
+            defer { volt_ssh_free_buffer(keyPointer) }
+            return HostKeyProbe(
+                key: Data(bytes: keyPointer, count: keyLength),
+                keyType: keyType,
+                trustStatus: trustStatus
+            )
         }.value
     }
 
-    func upload(connection: SavedConnection, password: String, localPath: String, remotePath: String) async throws {
+    func commitHostKey(connection: SavedConnection, probe: HostKeyProbe) async throws {
         try await Task.detached {
-            let output = try self.batch(connection: connection, password: password, commands: ["put -r \(self.quote(localPath)) \(self.quote(remotePath))"])
-            guard output.status == 0 else { throw AppError.commandFailed(output.stderr + output.stdout) }
+            var error = [CChar](repeating: 0, count: 4096)
+            let knownHostsPath = try AppPaths.knownHostsURL().path
+            let status = probe.key.withUnsafeBytes { keyBuffer in
+                connection.host.withCString { host in
+                    knownHostsPath.withCString { knownHosts in
+                        error.withUnsafeMutableBufferPointer { errorBuffer in
+                            volt_ssh_commit_host_key(
+                                host,
+                                Int32(connection.port),
+                                knownHosts,
+                                keyBuffer.bindMemory(to: UInt8.self).baseAddress!,
+                                keyBuffer.count,
+                                probe.keyType,
+                                errorBuffer.baseAddress!,
+                                errorBuffer.count
+                            )
+                        }
+                    }
+                }
+            }
+            guard status == 0 else {
+                throw AppError.commandFailed(decodeCError(error))
+            }
+        }.value
+    }
+
+    func list(connection: SavedConnection, password: String, path: String) async throws -> [FileItem] {
+        try await Task.detached {
+            var items: UnsafeMutablePointer<VoltSFTPItem>?
+            var count: Int32 = 0
+            _ = try self.call(connection: connection, password: password) { host, port, username, password, keyPath, knownHostsPath, error, errorLength in
+                volt_sftp_list(host, port, username, password, keyPath, knownHostsPath, path, &items, &count, error, errorLength)
+            }
+            defer {
+                if let items {
+                    volt_sftp_free_items(items)
+                }
+            }
+            guard let items else { return [] }
+            return (0..<Int(count))
+                .map { index in
+                    let rawSize = volt_sftp_item_size(items, Int32(index))
+                    let rawModified = volt_sftp_item_modified(items, Int32(index))
+                    return FileItem(
+                        name: String(cString: volt_sftp_item_name(items, Int32(index))),
+                        path: String(cString: volt_sftp_item_path(items, Int32(index))),
+                        isDirectory: volt_sftp_item_is_directory(items, Int32(index)) != 0,
+                        size: rawSize >= 0 ? rawSize : nil,
+                        modified: rawModified > 0 ? Date(timeIntervalSince1970: TimeInterval(rawModified)) : nil
+                    )
+                }
+                .sorted { lhs, rhs in
+                    if lhs.isDirectory != rhs.isDirectory { return lhs.isDirectory }
+                    return lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
+                }
+        }.value
+    }
+
+    func upload(connection: SavedConnection, password: String, localPath: String, remotePath: String) async throws -> String? {
+        try await Task.detached {
+            try self.call(connection: connection, password: password) { host, port, username, password, keyPath, knownHostsPath, error, errorLength in
+                volt_sftp_upload(host, port, username, password, keyPath, knownHostsPath, localPath, remotePath, connection.effectivePermissionPreset.fileMode, error, errorLength)
+            }
         }.value
     }
 
     func download(connection: SavedConnection, password: String, remotePath: String, localPath: String) async throws {
         try await Task.detached {
-            let output = try self.batch(connection: connection, password: password, commands: ["get -r \(self.quote(remotePath)) \(self.quote(localPath))"])
-            guard output.status == 0 else { throw AppError.commandFailed(output.stderr + output.stdout) }
+            _ = try self.call(connection: connection, password: password) { host, port, username, password, keyPath, knownHostsPath, error, errorLength in
+                volt_sftp_download(host, port, username, password, keyPath, knownHostsPath, remotePath, localPath, error, errorLength)
+            }
         }.value
     }
 
-    func makeDirectory(connection: SavedConnection, password: String, path: String) async throws {
+    func makeDirectory(connection: SavedConnection, password: String, path: String) async throws -> String? {
         try await Task.detached {
-            let output = try self.batch(connection: connection, password: password, commands: ["mkdir \(self.quote(path))"])
-            guard output.status == 0 else { throw AppError.commandFailed(output.stderr + output.stdout) }
+            try self.call(connection: connection, password: password) { host, port, username, password, keyPath, knownHostsPath, error, errorLength in
+                volt_sftp_mkdir(host, port, username, password, keyPath, knownHostsPath, path, connection.effectivePermissionPreset.folderMode, error, errorLength)
+            }
         }.value
     }
 
-    func createFile(connection: SavedConnection, password: String, remotePath: String) async throws {
+    func createFile(connection: SavedConnection, password: String, remotePath: String) async throws -> String? {
         try await Task.detached {
-            let tempURL = FileManager.default.temporaryDirectory.appendingPathComponent("Volt-\(UUID().uuidString)")
-            try Data().write(to: tempURL)
-            defer { try? FileManager.default.removeItem(at: tempURL) }
-            let output = try self.batch(connection: connection, password: password, commands: ["put \(self.quote(tempURL.path)) \(self.quote(remotePath))"])
-            guard output.status == 0 else { throw AppError.commandFailed(output.stderr + output.stdout) }
+            try self.call(connection: connection, password: password) { host, port, username, password, keyPath, knownHostsPath, error, errorLength in
+                volt_sftp_create_empty_file(host, port, username, password, keyPath, knownHostsPath, remotePath, connection.effectivePermissionPreset.fileMode, error, errorLength)
+            }
         }.value
     }
 
     func rename(connection: SavedConnection, password: String, from: String, to: String) async throws {
         try await Task.detached {
-            let output = try self.batch(connection: connection, password: password, commands: ["rename \(self.quote(from)) \(self.quote(to))"])
-            guard output.status == 0 else { throw AppError.commandFailed(output.stderr + output.stdout) }
+            _ = try self.call(connection: connection, password: password) { host, port, username, password, keyPath, knownHostsPath, error, errorLength in
+                volt_sftp_rename(host, port, username, password, keyPath, knownHostsPath, from, to, error, errorLength)
+            }
         }.value
     }
 
     func remove(connection: SavedConnection, password: String, path: String, isDirectory: Bool) async throws {
         try await Task.detached {
-            let command = isDirectory ? "rmdir \(self.quote(path))" : "rm \(self.quote(path))"
-            let output = try self.batch(connection: connection, password: password, commands: [command])
-            guard output.status == 0 else { throw AppError.commandFailed(output.stderr + output.stdout) }
+            _ = try self.call(connection: connection, password: password) { host, port, username, password, keyPath, knownHostsPath, error, errorLength in
+                volt_sftp_remove(host, port, username, password, keyPath, knownHostsPath, path, isDirectory ? 1 : 0, error, errorLength)
+            }
         }.value
     }
 
     static func controlSocketDir() throws -> String {
-        let home = FileManager.default.homeDirectoryForCurrentUser
-        let controlDir = home.appendingPathComponent(".ssh/volt_control", isDirectory: true)
+        let controlDir = try AppPaths.supportDirectory().appendingPathComponent("ControlSockets", isDirectory: true)
         if !FileManager.default.fileExists(atPath: controlDir.path) {
             try FileManager.default.createDirectory(at: controlDir, withIntermediateDirectories: true)
             try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: controlDir.path)
@@ -223,95 +432,63 @@ final class SFTPClient: @unchecked Sendable {
         return controlDir.path
     }
 
-    private func batch(connection: SavedConnection, password: String, commands: [String]) throws -> CommandResult {
-        guard FileManager.default.isExecutableFile(atPath: executable) else {
-            throw AppError.commandFailed("OpenSSH SFTP was not found at \(executable).")
+    private func call(
+        connection: SavedConnection,
+        password: String,
+        _ body: (UnsafePointer<CChar>, Int32, UnsafePointer<CChar>, UnsafePointer<CChar>?, UnsafePointer<CChar>?, UnsafePointer<CChar>, UnsafeMutablePointer<CChar>, Int) -> Int32
+    ) throws -> String? {
+        var error = [CChar](repeating: 0, count: 4096)
+        let errorLength = error.count
+        var bookmarkIsStale = false
+        let bookmarkedKeyURL = connection.privateKeyBookmark.flatMap {
+            try? URL(
+                resolvingBookmarkData: $0,
+                options: [.withSecurityScope, .withoutUI],
+                relativeTo: nil,
+                bookmarkDataIsStale: &bookmarkIsStale
+            )
         }
-
-        let trimmedPassword = password.trimmingCharacters(in: .newlines)
-        let controlDir = try SFTPClient.controlSocketDir()
-        var args = [
-            "-oBatchMode=\(trimmedPassword.isEmpty ? "yes" : "no")",
-            "-oStrictHostKeyChecking=yes",
-            "-oControlMaster=auto",
-            "-oControlPath=\(controlDir)/volt_%h_%p_%r",
-            "-oControlPersist=5m",
-            "-P", "\(connection.port)"
-        ]
-        if !connection.privateKeyPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            args.append(contentsOf: ["-i", connection.privateKeyPath])
-        }
-        args.append("\(connection.username)@\(connection.host)")
-
-        let script = commands.joined(separator: "\n") + "\nbye\n"
-        let askpass = try makeAskPassScript(password: trimmedPassword)
+        let isAccessingKey = bookmarkedKeyURL?.startAccessingSecurityScopedResource() == true
         defer {
-            if let askpass {
-                try? FileManager.default.removeItem(at: askpass.deletingLastPathComponent())
+            if isAccessingKey { bookmarkedKeyURL?.stopAccessingSecurityScopedResource() }
+        }
+        let keyPath = (bookmarkedKeyURL?.path ?? connection.privateKeyPath).trimmingCharacters(in: .whitespacesAndNewlines)
+        let sanitizedPassword = password.trimmingCharacters(in: .newlines)
+        let knownHostsPath = try AppPaths.knownHostsURL().path
+        let status = connection.host.withCString { host in
+            connection.username.withCString { username in
+                knownHostsPath.withCString { knownHostsPointer in
+                    error.withUnsafeMutableBufferPointer { errorBuffer in
+                        let errorPointer = errorBuffer.baseAddress!
+                        if keyPath.isEmpty {
+                            if sanitizedPassword.isEmpty {
+                                return body(host, Int32(connection.port), username, nil, nil, knownHostsPointer, errorPointer, errorLength)
+                            }
+                            return sanitizedPassword.withCString { passwordPointer in
+                                body(host, Int32(connection.port), username, passwordPointer, nil, knownHostsPointer, errorPointer, errorLength)
+                            }
+                        }
+                        return keyPath.withCString { keyPointer in
+                            if sanitizedPassword.isEmpty {
+                                return body(host, Int32(connection.port), username, nil, keyPointer, knownHostsPointer, errorPointer, errorLength)
+                            }
+                            return sanitizedPassword.withCString { passwordPointer in
+                                body(host, Int32(connection.port), username, passwordPointer, keyPointer, knownHostsPointer, errorPointer, errorLength)
+                            }
+                        }
+                    }
+                }
             }
         }
-
-        var environment: [String: String] = [:]
-        if let askpass {
-            environment["SSH_ASKPASS"] = askpass.path
-            environment["SSH_ASKPASS_REQUIRE"] = "force"
-            environment["DISPLAY"] = "Volt"
-            environment["VOLT_SSH_PASS"] = trimmedPassword
+        let message = error.withUnsafeBufferPointer { buffer in
+            String(cString: buffer.baseAddress!)
         }
-
-        let result = try runner.run(executable, arguments: args, stdin: script, environment: environment)
-        guard result.status == 0 else { throw AppError.commandFailed(result.stderr + result.stdout) }
-        return result
-    }
-
-    func makeAskPassScript(password: String) throws -> URL? {
-        guard !password.isEmpty else { return nil }
-        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("Volt-\(UUID().uuidString)", isDirectory: true)
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        let scriptURL = directory.appendingPathComponent("askpass.sh")
-        // Security: Password is passed via VOLT_SSH_PASS env var, never written to disk
-        let script = "#!/bin/sh\nprintf '%s\\n' \"$VOLT_SSH_PASS\"\n"
-        try script.write(to: scriptURL, atomically: true, encoding: .utf8)
-        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: scriptURL.path)
-        return scriptURL
-    }
-
-    private func quote(_ value: String) -> String {
-        "\"\(value.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\""))\""
-    }
-
-    private func shellSingleQuote(_ value: String) -> String {
-        "'\(value.replacingOccurrences(of: "'", with: "'\\''"))'"
-    }
-
-    private func parseListing(_ text: String, basePath: String) -> [FileItem] {
-        text.split(separator: "\n")
-            .map(String.init)
-            .filter { !$0.hasPrefix("sftp>") && !$0.trimmingCharacters(in: .whitespaces).isEmpty }
-            .compactMap { line in
-                guard line.count > 10, line.first == "-" || line.first == "d" || line.first == "l" else { return nil }
-                let parts = line.split(separator: " ", maxSplits: 8, omittingEmptySubsequences: true)
-                guard parts.count >= 9 else { return nil }
-                let name = String(parts[8])
-                guard name != "." && name != ".." else { return nil }
-                let path = joinRemote(basePath, name)
-                return FileItem(
-                    name: name,
-                    path: path,
-                    isDirectory: parts[0].first == "d",
-                    size: Int64(parts[4]),
-                    modified: nil
-                )
-            }
-            .sorted { lhs, rhs in
-                if lhs.isDirectory != rhs.isDirectory { return lhs.isDirectory }
-                return lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
-            }
-    }
-
-    private func joinRemote(_ base: String, _ child: String) -> String {
-        if base == "/" { return "/" + child }
-        return "/" + base.trimmingCharacters(in: CharacterSet(charactersIn: "/")) + "/" + child
+        guard status >= 0 else {
+            throw AppError.commandFailed(error.withUnsafeBufferPointer { buffer in
+                String(cString: buffer.baseAddress!)
+            })
+        }
+        return status == VOLT_SFTP_PERMISSION_WARNING ? message : nil
     }
 }
 
@@ -340,12 +517,12 @@ final class AppModel: ObservableObject {
     @Published var showsTransfers = false
     @Published var showsPasswordPrompt = false
     @Published var showsHostKeyPrompt = false
-    @Published var showsGetInfo = false
-    @Published var infoItem: FileItem?
     @Published var pendingHostKeyFingerprint = ""
     @Published var pendingHostKeyHost = ""
     private var hostKeyConfirmationContinuation: CheckedContinuation<Bool, Never>?
     private var tabPasswords: [BrowserTab.ID: String] = [:]
+    private var verifiedHosts: Set<String> = []
+    private var remoteDirectoryCache: [String: [FileItem]] = [:]
 
     private let sftp = SFTPClient()
     private var isRestoringTab = false
@@ -354,7 +531,9 @@ final class AppModel: ObservableObject {
 
     init() {
         selectedTabID = tabs.first?.id
+        AppPaths.migrateFromSandboxContainerIfNeeded()
         SecureStorage.migrateFromUserDefaults()
+        AppPaths.cleanupEditFiles()
         loadConnections()
         refreshLocal()
         syncCurrentTab()
@@ -409,19 +588,17 @@ final class AppModel: ObservableObject {
             let runner = CommandRunner()
             let executable = "/usr/bin/ssh"
             let trimmedPassword = password.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard trimmedPassword.isEmpty else { return }
             
             do {
-                let askpass = try sftp.makeAskPassScript(password: trimmedPassword)
                 let controlDir = try SFTPClient.controlSocketDir()
-                defer {
-                    if let askpass {
-                        try? FileManager.default.removeItem(at: askpass.deletingLastPathComponent())
-                    }
-                }
+                let knownHostsPath = try AppPaths.knownHostsURL().path
 
                 var args = [
                     "-oBatchMode=\(trimmedPassword.isEmpty ? "yes" : "no")",
                     "-oStrictHostKeyChecking=yes",
+                    "-oUserKnownHostsFile=\(knownHostsPath)",
+                    "-oGlobalKnownHostsFile=/dev/null",
                     "-oControlMaster=auto",
                     "-oControlPath=\(controlDir)/volt_%h_%p_%r",
                     "-oControlPersist=5m",
@@ -435,15 +612,7 @@ final class AppModel: ObservableObject {
                 let quotedPath = "'" + item.path.replacingOccurrences(of: "'", with: "'\\''") + "'"
                 args.append("du -sk \(quotedPath)")
 
-                var environment: [String: String] = [:]
-                if let askpass {
-                    environment["SSH_ASKPASS"] = askpass.path
-                    environment["SSH_ASKPASS_REQUIRE"] = "force"
-                    environment["DISPLAY"] = "Volt"
-                    environment["VOLT_SSH_PASS"] = trimmedPassword
-                }
-
-                let result = try runner.run(executable, arguments: args, stdin: "", environment: environment)
+                let result = try runner.run(executable, arguments: args, stdin: "")
                 if result.status == 0,
                    let sizeStr = result.stdout.split(separator: "\t").first,
                    let sizeKB = Int64(sizeStr) {
@@ -469,6 +638,9 @@ final class AppModel: ObservableObject {
 
     func closeTab(_ id: BrowserTab.ID) {
         guard tabs.count > 1 else { return }
+        if let tab = tabs.first(where: { $0.id == id }) {
+            cleanupEditSessions(tab.remoteEditSessions)
+        }
         tabPasswords.removeValue(forKey: id)
         let index = tabs.firstIndex { $0.id == id } ?? 0
         tabs.removeAll { $0.id == id }
@@ -497,6 +669,14 @@ final class AppModel: ObservableObject {
 
     func select(_ connection: SavedConnection) {
         guard !isSelectingConnection else { return }
+        if let validationError = validate(connection) {
+            status = validationError
+            return
+        }
+        if selectedConnectionID == connection.id, isConnected {
+            showsConnectionEditor = false
+            return
+        }
         isSelectingConnection = true
         defer { isSelectingConnection = false }
 
@@ -506,8 +686,12 @@ final class AppModel: ObservableObject {
         remotePath = connection.remotePath
         isConnected = false
         showsConnectionEditor = false
-        showsPasswordPrompt = true
         syncCurrentTab()
+        if shouldPromptForPassword(connection) {
+            showsPasswordPrompt = true
+        } else {
+            refreshRemote()
+        }
     }
 
     func editConnection(_ connection: SavedConnection) {
@@ -523,22 +707,10 @@ final class AppModel: ObservableObject {
         }
     }
 
-    func connectWithPassword() {
-        showsPasswordPrompt = false
-        remotePath = connectionDraft.remotePath.isEmpty ? "/" : connectionDraft.remotePath
-        showsConnectionEditor = false
-        syncCurrentTab()
-        refreshRemote()
-    }
-
-    func cancelPasswordPrompt() {
-        showsPasswordPrompt = false
-        connectionPassword = ""
-    }
-
     func sidebarSelectionChanged(_ id: UUID?) {
         guard !isSuppressingSidebarSelection else { return }
         guard let id, let connection = connections.first(where: { $0.id == id }) else { return }
+        guard selectedTab?.connectionID != id || !isConnected else { return }
         select(connection)
     }
 
@@ -560,6 +732,10 @@ final class AppModel: ObservableObject {
     }
 
     func connectDraft() {
+        if let validationError = validate(connectionDraft) {
+            status = validationError
+            return
+        }
         remotePath = connectionDraft.remotePath.isEmpty ? "/" : connectionDraft.remotePath
         saveDraft()
         showsConnectionEditor = false
@@ -573,6 +749,7 @@ final class AppModel: ObservableObject {
         selectedConnectionID = nil
         isConnected = false
         showsConnectionEditor = true
+        showsPasswordPrompt = false
         remoteItems = []
         selectedRemoteID = nil
         remotePath = "/"
@@ -586,6 +763,7 @@ final class AppModel: ObservableObject {
 
     func disconnectConnection(id: UUID? = nil) {
         if id == nil || selectedConnectionID == id {
+            cleanupEditSessions(remoteEditSessions)
             selectedConnectionID = nil
             connectionDraft = SavedConnection()
             connectionPassword = ""
@@ -598,9 +776,22 @@ final class AppModel: ObservableObject {
             remoteEditSessions = []
             isConnected = false
             showsConnectionEditor = true
+            showsPasswordPrompt = false
             status = "Disconnected"
             syncCurrentTab()
         }
+    }
+
+    func connectWithPassword() {
+        showsPasswordPrompt = false
+        syncCurrentTab()
+        refreshRemote()
+    }
+
+    func cancelPasswordPrompt() {
+        showsPasswordPrompt = false
+        connectionPassword = ""
+        syncCurrentTab()
     }
 
     func removeConnection(id: UUID) {
@@ -634,17 +825,27 @@ final class AppModel: ObservableObject {
     }
 
     func refreshRemote() {
+        refreshRemote(finalStatus: "Remote folder loaded")
+    }
+
+    private func refreshRemote(finalStatus: String) {
         guard let connection = selectedConnection else { status = "Choose a connection"; return }
+        if let validationError = validate(connection) {
+            status = validationError
+            return
+        }
         let path = remotePath
         let password = connectionPassword
         runBusy("Loading remote folder") {
             try await self.verifyHostKey(for: connection)
             let items = try await self.sftp.list(connection: connection, password: password, path: path)
             await MainActor.run {
+                guard self.selectedConnectionID == connection.id, self.remotePath == path else { return }
                 self.remoteItems = items
+                self.remoteDirectoryCache[self.remoteCacheKey(connectionID: connection.id, path: path)] = items
                 self.isConnected = true
                 self.showsConnectionEditor = false
-                self.status = "Remote folder loaded"
+                self.status = finalStatus
                 self.syncCurrentTab()
             }
         }
@@ -665,6 +866,10 @@ final class AppModel: ObservableObject {
         guard item.isDirectory else { return }
         remotePath = item.path
         selectedRemoteID = nil
+        if let connection = selectedConnection,
+           let cachedItems = remoteDirectoryCache[remoteCacheKey(connectionID: connection.id, path: item.path)] {
+            remoteItems = cachedItems
+        }
         syncCurrentTab()
         refreshRemote()
     }
@@ -696,6 +901,23 @@ final class AppModel: ObservableObject {
         }
     }
 
+    func choosePrivateKey() {
+        let panel = NSOpenPanel()
+        panel.title = "Choose SSH Private Key"
+        panel.prompt = "Choose"
+        panel.canChooseDirectories = false
+        panel.canChooseFiles = true
+        panel.allowsMultipleSelection = false
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        connectionDraft.privateKeyPath = url.path
+        connectionDraft.privateKeyBookmark = try? url.bookmarkData(
+            options: .withSecurityScope,
+            includingResourceValuesForKeys: nil,
+            relativeTo: nil
+        )
+        syncCurrentTab()
+    }
+
     func uploadSelected() {
         guard selectedConnection != nil, let item = selectedLocal else { return }
         let destination = joinRemote(remotePath, item.name)
@@ -716,8 +938,24 @@ final class AppModel: ObservableObject {
     }
 
     func uploadEditedRemoteFile(_ session: RemoteEditSession) {
-        upload(localPath: session.localPath, remotePath: session.remotePath, refreshWhenDone: true)
-        remoteEditSessions.removeAll { $0.id == session.id }
+        guard let connection = selectedConnection else { return }
+        let password = connectionPassword
+        enqueue(direction: .upload, source: session.localPath, destination: session.remotePath)
+        runBusy("Uploading edited file") {
+            let warning = try await self.sftp.upload(
+                connection: connection,
+                password: password,
+                localPath: session.localPath,
+                remotePath: session.remotePath
+            )
+            await MainActor.run {
+                self.markLatestTransfer(.done, warning ?? "Uploaded edited file")
+                self.remoteEditSessions.removeAll { $0.id == session.id }
+                self.cleanupEditSessions([session])
+                self.syncCurrentTab()
+                self.refreshRemote()
+            }
+        }
     }
 
     private func upload(localPath: String, remotePath: String, refreshWhenDone: Bool) {
@@ -725,9 +963,10 @@ final class AppModel: ObservableObject {
         let password = connectionPassword
         enqueue(direction: .upload, source: localPath, destination: remotePath)
         runBusy("Uploading") {
-            try await self.sftp.upload(connection: connection, password: password, localPath: localPath, remotePath: remotePath)
+            let warning = try await self.sftp.upload(connection: connection, password: password, localPath: localPath, remotePath: remotePath)
             await MainActor.run {
-                self.markLatestTransfer(.done, "Uploaded")
+                self.markLatestTransfer(.done, warning ?? "Uploaded")
+                if let warning { self.status = warning }
                 if refreshWhenDone {
                     self.refreshRemote()
                 }
@@ -799,8 +1038,10 @@ final class AppModel: ObservableObject {
         let path = joinRemote(remotePath, name)
         let password = connectionPassword
         runBusy("Creating folder") {
-            try await self.sftp.makeDirectory(connection: connection, password: password, path: path)
-            await MainActor.run { self.refreshRemote() }
+            let warning = try await self.sftp.makeDirectory(connection: connection, password: password, path: path)
+            await MainActor.run {
+                self.refreshRemote(finalStatus: warning ?? "Remote folder loaded")
+            }
         }
     }
 
@@ -811,22 +1052,27 @@ final class AppModel: ObservableObject {
         let path = joinRemote(remotePath, name)
         let password = connectionPassword
         runBusy("Creating file") {
-            try await self.sftp.createFile(connection: connection, password: password, remotePath: path)
-            await MainActor.run { self.refreshRemote() }
+            let warning = try await self.sftp.createFile(connection: connection, password: password, remotePath: path)
+            await MainActor.run {
+                self.refreshRemote(finalStatus: warning ?? "Remote folder loaded")
+            }
         }
     }
 
     // MARK: - Local Context Menu Actions
 
     func getInfoLocalSelected() {
-        guard let item = selectedLocal else { return }
-        infoItem = item
-        showsGetInfo = true
+        guard selectedLocal != nil else { return }
+        showsInspector = true
+        syncCurrentTab()
     }
 
     func openInNewTabLocal() {
         guard let item = selectedLocal, item.isDirectory else { return }
-        let newTab = BrowserTab(title: item.name, localPath: item.path, remotePath: remotePath)
+        var newTab = currentSessionTab(title: item.name)
+        newTab.localPath = item.path
+        newTab.localItems = []
+        newTab.selectedLocalID = nil
         tabs.append(newTab)
         tabPasswords[newTab.id] = connectionPassword
         selectTab(newTab.id)
@@ -859,17 +1105,23 @@ final class AppModel: ObservableObject {
     }
 
     func getInfoRemoteSelected() {
-        guard let item = selectedRemote else { return }
-        infoItem = item
-        showsGetInfo = true
+        guard selectedRemote != nil else { return }
+        showsInspector = true
+        syncCurrentTab()
     }
 
     func openInNewTabRemote() {
         guard let item = selectedRemote, item.isDirectory else { return }
-        let newTab = BrowserTab(title: item.name, localPath: localPath, remotePath: item.path)
+        var newTab = currentSessionTab(title: item.name)
+        newTab.remotePath = item.path
+        newTab.remoteItems = selectedConnection.flatMap {
+            remoteDirectoryCache[remoteCacheKey(connectionID: $0.id, path: item.path)]
+        } ?? []
+        newTab.selectedRemoteID = nil
         tabs.append(newTab)
         tabPasswords[newTab.id] = connectionPassword
         selectTab(newTab.id)
+        refreshRemote()
     }
 
     func duplicateRemoteSelected() {
@@ -882,10 +1134,14 @@ final class AppModel: ObservableObject {
             let runner = CommandRunner()
             let executable = "/usr/bin/ssh"
             let trimmedPassword = password.trimmingCharacters(in: .newlines)
+            guard trimmedPassword.isEmpty else { throw AppError.unsupportedPasswordAuth }
             let controlDir = try SFTPClient.controlSocketDir()
+            let knownHostsPath = try AppPaths.knownHostsURL().path
             var args = [
                 "-oBatchMode=\(trimmedPassword.isEmpty ? "yes" : "no")",
                 "-oStrictHostKeyChecking=yes",
+                "-oUserKnownHostsFile=\(knownHostsPath)",
+                "-oGlobalKnownHostsFile=/dev/null",
                 "-oControlMaster=auto",
                 "-oControlPath=\(controlDir)/volt_%h_%p_%r",
                 "-oControlPersist=5m",
@@ -900,21 +1156,7 @@ final class AppModel: ObservableObject {
             let quotedDst = "'" + newPath.replacingOccurrences(of: "'", with: "'\\''") + "'"
             args.append("cp -r \(quotedSrc) \(quotedDst)")
 
-            var environment: [String: String] = [:]
-            let askpass = try self.sftp.makeAskPassScript(password: trimmedPassword)
-            defer {
-                if let askpass {
-                    try? FileManager.default.removeItem(at: askpass.deletingLastPathComponent())
-                }
-            }
-            if let askpass {
-                environment["SSH_ASKPASS"] = askpass.path
-                environment["SSH_ASKPASS_REQUIRE"] = "force"
-                environment["DISPLAY"] = "Volt"
-                environment["VOLT_SSH_PASS"] = trimmedPassword
-            }
-
-            _ = try runner.run(executable, arguments: args, stdin: "", environment: environment)
+            _ = try runner.run(executable, arguments: args, stdin: "")
             
             await MainActor.run { self.refreshRemote() }
         }
@@ -1041,11 +1283,15 @@ final class AppModel: ObservableObject {
 
     private func editRemoteSelected(withApp appURL: URL?) {
         guard let item = selectedRemote, !item.isDirectory else { return }
-        let directory = FileManager.default.temporaryDirectory
-            .appendingPathComponent("VoltEdits", isDirectory: true)
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let directory: URL
         do {
-            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            directory = try AppPaths.editDirectory().appendingPathComponent(UUID().uuidString, isDirectory: true)
+            try FileManager.default.createDirectory(
+                at: directory,
+                withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700]
+            )
+            try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
         } catch {
             status = error.localizedDescription
             return
@@ -1081,6 +1327,13 @@ final class AppModel: ObservableObject {
             }
         } else {
             NSWorkspace.shared.open(fileURL)
+        }
+    }
+
+    private func cleanupEditSessions(_ sessions: [RemoteEditSession]) {
+        for session in sessions {
+            let fileURL = URL(fileURLWithPath: session.localPath)
+            try? FileManager.default.removeItem(at: fileURL.deletingLastPathComponent())
         }
     }
 
@@ -1145,6 +1398,47 @@ final class AppModel: ObservableObject {
         SecureStorage.save(connections)
     }
 
+    private func shouldPromptForPassword(_ connection: SavedConnection) -> Bool {
+        connection.privateKeyPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    private func validate(_ connection: SavedConnection) -> String? {
+        let host = connection.host.trimmingCharacters(in: .whitespacesAndNewlines)
+        let username = connection.username.trimmingCharacters(in: .whitespacesAndNewlines)
+        if host.isEmpty || host.hasPrefix("-") || host.unicodeScalars.contains(where: { CharacterSet.whitespacesAndNewlines.union(.controlCharacters).contains($0) }) {
+            return "Enter a valid SSH host."
+        }
+        if username.isEmpty || username.hasPrefix("-") || username.contains("@") || username.unicodeScalars.contains(where: { CharacterSet.whitespacesAndNewlines.union(.controlCharacters).contains($0) }) {
+            return "Enter a valid SSH username."
+        }
+        if !(1...65_535).contains(connection.port) {
+            return "SSH port must be between 1 and 65535."
+        }
+        return nil
+    }
+
+    private func currentSessionTab(title: String) -> BrowserTab {
+        BrowserTab(
+            title: title,
+            connectionID: selectedConnectionID,
+            connectionDraft: connectionDraft,
+            localPath: localPath,
+            remotePath: remotePath,
+            localItems: localItems,
+            remoteItems: remoteItems,
+            selectedLocalID: selectedLocalID,
+            selectedRemoteID: selectedRemoteID,
+            remoteEditSessions: remoteEditSessions,
+            isConnected: isConnected,
+            showsConnectionEditor: showsConnectionEditor,
+            showsInspector: showsInspector
+        )
+    }
+
+    private func remoteCacheKey(connectionID: UUID, path: String) -> String {
+        "\(connectionID.uuidString):\(path)"
+    }
+
     private func syncCurrentTab() {
         guard !isRestoringTab, let selectedTabID, let index = tabs.firstIndex(where: { $0.id == selectedTabID }) else { return }
         tabs[index].connectionID = selectedConnectionID
@@ -1184,6 +1478,7 @@ final class AppModel: ObservableObject {
         isConnected = tab.isConnected
         showsConnectionEditor = tab.showsConnectionEditor
         showsInspector = tab.showsInspector
+        showsPasswordPrompt = false
         isRestoringTab = false
         Task { @MainActor in
             self.isSuppressingSidebarSelection = false
@@ -1209,37 +1504,25 @@ final class AppModel: ObservableObject {
     private func verifyHostKey(for connection: SavedConnection) async throws {
         let host = connection.host
         let port = connection.port
+        let lookupHost = port == 22 ? host : "[\(host)]:\(port)"
+        let verificationKey = "\(connection.id.uuidString):\(lookupHost)"
+        if verifiedHosts.contains(verificationKey) { return }
 
-        // Check if host is already in known_hosts
-        let isKnown = try await Task.detached {
-            let runner = CommandRunner()
-            let result = try runner.run("/usr/bin/ssh-keygen", arguments: ["-F", host])
-            return result.status == 0 && !result.stdout.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        }.value
+        let probe = try await sftp.probeHostKey(connection: connection)
+        if probe.trustStatus == VOLT_HOSTKEY_MATCH {
+            verifiedHosts.insert(verificationKey)
+            return
+        }
+        if probe.trustStatus == VOLT_HOSTKEY_MISMATCH {
+            throw AppError.commandFailed("Host key for \(lookupHost) changed. The connection was rejected.")
+        }
 
-        if isKnown { return }
+        let digest = SHA256.hash(data: probe.key)
+        let fingerprint = "SHA256:" + Data(digest).base64EncodedString().replacingOccurrences(of: "=", with: "")
 
-        // Scan for host key fingerprint
-        let (hostKeys, fingerprint) = try await Task.detached {
-            let runner = CommandRunner()
-            let scanResult = try runner.run("/usr/bin/ssh-keyscan", arguments: ["-p", "\(port)", host])
-            guard scanResult.status == 0,
-                  !scanResult.stdout.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-                throw AppError.commandFailed("Could not retrieve host key from \(host):\(port).")
-            }
-
-            let tempFile = FileManager.default.temporaryDirectory.appendingPathComponent("volt_hostkey_\(UUID().uuidString)")
-            try scanResult.stdout.write(to: tempFile, atomically: true, encoding: .utf8)
-            defer { try? FileManager.default.removeItem(at: tempFile) }
-
-            let fpResult = try runner.run("/usr/bin/ssh-keygen", arguments: ["-lf", tempFile.path])
-            return (scanResult.stdout, fpResult.stdout.trimmingCharacters(in: .whitespacesAndNewlines))
-        }.value
-
-        // Show host key fingerprint dialog and wait for user confirmation
         let confirmed = await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
             self.pendingHostKeyFingerprint = fingerprint
-            self.pendingHostKeyHost = "\(host):\(port)"
+            self.pendingHostKeyHost = lookupHost
             self.hostKeyConfirmationContinuation = continuation
             self.showsHostKeyPrompt = true
         }
@@ -1247,25 +1530,8 @@ final class AppModel: ObservableObject {
         guard confirmed else {
             throw AppError.hostKeyRejected
         }
-
-        // Add key to known_hosts
-        try await Task.detached {
-            let sshDir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".ssh")
-            if !FileManager.default.fileExists(atPath: sshDir.path) {
-                try FileManager.default.createDirectory(at: sshDir, withIntermediateDirectories: true)
-                try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: sshDir.path)
-            }
-            let knownHostsURL = sshDir.appendingPathComponent("known_hosts")
-            if FileManager.default.fileExists(atPath: knownHostsURL.path) {
-                let handle = try FileHandle(forWritingTo: knownHostsURL)
-                handle.seekToEndOfFile()
-                handle.write(Data(hostKeys.utf8))
-                try handle.close()
-            } else {
-                try hostKeys.write(to: knownHostsURL, atomically: true, encoding: .utf8)
-                try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: knownHostsURL.path)
-            }
-        }.value
+        try await sftp.commitHostKey(connection: connection, probe: probe)
+        verifiedHosts.insert(verificationKey)
     }
 
     func confirmHostKey() {
@@ -1310,9 +1576,6 @@ struct ContentView: View {
         }
         .sheet(isPresented: $model.showsPasswordPrompt) {
             PasswordPromptView(model: model)
-        }
-        .sheet(isPresented: $model.showsGetInfo) {
-            GetInfoView(item: model.infoItem, isPresented: $model.showsGetInfo)
         }
         .sheet(isPresented: $model.showsHostKeyPrompt) {
             HostKeyVerificationView(model: model)
@@ -1370,51 +1633,6 @@ struct SessionTabBar: View {
     }
 }
 
-struct PasswordPromptView: View {
-    @ObservedObject var model: AppModel
-
-    var body: some View {
-        VStack(spacing: 16) {
-            Image(systemName: "lock.shield")
-                .font(.system(size: 36))
-                .foregroundStyle(.secondary)
-
-            Text("Connect to \(model.connectionDraft.name.isEmpty ? model.connectionDraft.host : model.connectionDraft.name)")
-                .font(.headline)
-
-            Text("\(model.connectionDraft.username)@\(model.connectionDraft.host):\(model.connectionDraft.port)")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-
-            SecureField("Password", text: $model.connectionPassword)
-                .textFieldStyle(.roundedBorder)
-                .frame(width: 280)
-                .onSubmit {
-                    model.connectWithPassword()
-                }
-
-            Text("Leave empty to use SSH key / agent authentication")
-                .font(.caption2)
-                .foregroundStyle(.tertiary)
-
-            HStack(spacing: 12) {
-                Button("Cancel") {
-                    model.cancelPasswordPrompt()
-                }
-                .keyboardShortcut(.cancelAction)
-
-                Button("Connect") {
-                    model.connectWithPassword()
-                }
-                .keyboardShortcut(.defaultAction)
-                .buttonStyle(.borderedProminent)
-            }
-        }
-        .padding(24)
-        .frame(width: 360)
-    }
-}
-
 struct HostKeyVerificationView: View {
     @ObservedObject var model: AppModel
 
@@ -1463,61 +1681,6 @@ struct HostKeyVerificationView: View {
         }
         .padding(24)
         .frame(width: 440)
-    }
-}
-
-struct GetInfoView: View {
-    let item: FileItem?
-    @Binding var isPresented: Bool
-    
-    var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            HStack {
-                Text(item?.name ?? "Info")
-                    .font(.title2)
-                    .fontWeight(.semibold)
-                Spacer()
-                Button(action: { isPresented = false }) {
-                    Image(systemName: "xmark.circle.fill")
-                        .foregroundStyle(.secondary)
-                }
-                .buttonStyle(.plain)
-            }
-            
-            if let item = item {
-                Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 12) {
-                    GridRow {
-                        Text("Kind:").foregroundStyle(.secondary)
-                        Text(item.isDirectory ? "Folder" : "File")
-                    }
-                    GridRow {
-                        Text("Size:").foregroundStyle(.secondary)
-                        Text(item.isDirectory ? "--" : ByteCountFormatter.string(fromByteCount: item.size ?? 0, countStyle: .file))
-                    }
-                    GridRow {
-                        Text("Where:").foregroundStyle(.secondary)
-                        Text(item.path)
-                            .lineLimit(1)
-                            .truncationMode(.middle)
-                    }
-                    GridRow {
-                        Text("Modified:").foregroundStyle(.secondary)
-                        if let mod = item.modified {
-                            Text(mod.formatted(date: .abbreviated, time: .shortened))
-                        } else {
-                            Text("--")
-                        }
-                    }
-                }
-            } else {
-                Text("No item selected.")
-                    .foregroundStyle(.secondary)
-            }
-            
-            Spacer()
-        }
-        .padding(20)
-        .frame(width: 400, height: 250)
     }
 }
 
@@ -1581,15 +1744,74 @@ struct ConnectionEditor: View {
                     .disabled(model.connectionDraft.host.isEmpty)
             }
             GridRow {
-                SecureField("Password (leave empty for SSH key/agent auth)", text: $model.connectionPassword)
+                SecureField("Password or key passphrase (not saved)", text: $model.connectionPassword)
                     .gridCellColumns(2)
-                TextField("Private key path", text: $model.connectionDraft.privateKeyPath)
+                HStack(spacing: 6) {
+                    TextField("Private key", text: $model.connectionDraft.privateKeyPath)
+                        .disabled(true)
+                    Button(action: model.choosePrivateKey) {
+                        Image(systemName: "key.horizontal")
+                    }
+                    .help("Choose SSH private key")
+                }
                     .gridCellColumns(3)
                 TextField("Remote start path", text: $model.connectionDraft.remotePath)
                 EmptyView()
             }
+            GridRow {
+                Text("Remote permissions")
+                    .foregroundStyle(.secondary)
+                Picker(
+                    "Remote permissions",
+                    selection: Binding(
+                        get: { model.connectionDraft.effectivePermissionPreset },
+                        set: { model.connectionDraft.permissionPreset = $0 }
+                    )
+                ) {
+                    ForEach(RemotePermissionPreset.allCases) { preset in
+                        Text("\(preset.rawValue)  \(String(format: "%03o", preset.fileMode))/\(String(format: "%03o", preset.folderMode))")
+                            .tag(preset)
+                    }
+                }
+                .labelsHidden()
+                .pickerStyle(.segmented)
+                .gridCellColumns(4)
+                EmptyView()
+                EmptyView()
+            }
         }
         .padding(12)
+    }
+}
+
+struct PasswordPromptView: View {
+    @ObservedObject var model: AppModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("Connect to \(model.connectionDraft.name)")
+                .font(.headline)
+            Text("Enter the server password. Volt keeps it only in this tab's memory and never saves it to Keychain or UserDefaults.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            SecureField("Password", text: $model.connectionPassword)
+                .textFieldStyle(.roundedBorder)
+            HStack {
+                Spacer()
+                Button("Cancel") {
+                    model.cancelPasswordPrompt()
+                }
+                .keyboardShortcut(.cancelAction)
+                Button("Connect") {
+                    model.connectWithPassword()
+                }
+                .keyboardShortcut(.defaultAction)
+                .buttonStyle(.borderedProminent)
+            }
+        }
+        .padding(20)
+        .frame(width: 420)
     }
 }
 
@@ -1914,6 +2136,11 @@ struct FileRow<ContextMenuContent: View>: View {
             .padding(.horizontal, 10)
             .padding(.vertical, 7)
             .background(selectionBackground)
+            .background {
+                RightClickSelectionView {
+                    selection = item.id
+                }
+            }
             .foregroundStyle(isSelected ? Color.white : Color.primary)
             .clipShape(RoundedRectangle(cornerRadius: 6))
             .contentShape(Rectangle())
@@ -1935,6 +2162,53 @@ struct FileRow<ContextMenuContent: View>: View {
     private var selectionBackground: some View {
         RoundedRectangle(cornerRadius: 6)
             .fill(isSelected ? Color.accentColor : (isStriped ? Color.primary.opacity(0.06) : Color.clear))
+    }
+}
+
+private struct RightClickSelectionView: NSViewRepresentable {
+    var onRightClick: () -> Void
+
+    func makeNSView(context: Context) -> RightClickTrackingView {
+        let view = RightClickTrackingView()
+        view.onRightClick = onRightClick
+        return view
+    }
+
+    func updateNSView(_ nsView: RightClickTrackingView, context: Context) {
+        nsView.onRightClick = onRightClick
+    }
+}
+
+private final class RightClickTrackingView: NSView {
+    var onRightClick: (() -> Void)?
+    private var eventMonitor: Any?
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        removeEventMonitor()
+        guard window != nil else { return }
+
+        eventMonitor = NSEvent.addLocalMonitorForEvents(matching: .rightMouseDown) { [weak self] event in
+            guard let self, event.window === self.window else { return event }
+            let point = self.convert(event.locationInWindow, from: nil)
+            guard self.bounds.contains(point) else { return event }
+            self.onRightClick?()
+            return event
+        }
+    }
+
+    override func viewWillMove(toWindow newWindow: NSWindow?) {
+        if newWindow == nil {
+            removeEventMonitor()
+        }
+        super.viewWillMove(toWindow: newWindow)
+    }
+
+    private func removeEventMonitor() {
+        if let eventMonitor {
+            NSEvent.removeMonitor(eventMonitor)
+            self.eventMonitor = nil
+        }
     }
 }
 
@@ -2207,10 +2481,11 @@ struct InspectorSection: View {
     private func icon(for item: FileItem) -> Image {
         let nsImage: NSImage
         if item.isDirectory {
-            nsImage = NSWorkspace.shared.icon(forFileType: "public.folder")
+            nsImage = NSWorkspace.shared.icon(for: .folder)
         } else {
             let ext = (item.name as NSString).pathExtension
-            nsImage = ext.isEmpty ? NSWorkspace.shared.icon(forFileType: "public.data") : NSWorkspace.shared.icon(forFileType: ext)
+            let contentType = ext.isEmpty ? UTType.data : UTType(filenameExtension: ext) ?? .data
+            nsImage = NSWorkspace.shared.icon(for: contentType)
         }
         return Image(nsImage: nsImage)
     }
@@ -2218,6 +2493,8 @@ struct InspectorSection: View {
 
 @main
 struct VoltApp: App {
+    @NSApplicationDelegateAdaptor(VoltAppDelegate.self) private var appDelegate
+
     var body: some Scene {
         WindowGroup {
             ContentView()
@@ -2226,5 +2503,11 @@ struct VoltApp: App {
         .commands {
             CommandGroup(replacing: .newItem) {}
         }
+    }
+}
+
+final class VoltAppDelegate: NSObject, NSApplicationDelegate {
+    func applicationWillTerminate(_ notification: Notification) {
+        AppPaths.cleanupEditFiles(olderThan: 0)
     }
 }
