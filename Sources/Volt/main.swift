@@ -5,6 +5,7 @@ import Foundation
 import Security
 import SwiftUI
 import UniformTypeIdentifiers
+import QuickLookThumbnailing
 
 private func decodeCError(_ buffer: [CChar]) -> String {
     let bytes = buffer.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }
@@ -63,12 +64,87 @@ struct HostKeyProbe: Sendable {
 }
 
 struct FileItem: Identifiable, Hashable {
-    let id = UUID()
+    var id: String { path }
     var name: String
     var path: String
     var isDirectory: Bool
     var size: Int64?
     var modified: Date?
+    var kind: String = "File"
+    var owner: String?
+    var group: String?
+    var permissions: UInt32?
+    var isHidden: Bool = false
+
+    var permissionText: String {
+        guard let permissions else { return "--" }
+        return String(format: "%03o", permissions & 0o777)
+    }
+}
+
+enum FileBrowserViewMode: String, Codable, CaseIterable, Identifiable {
+    case icons
+    case list
+    case columns
+    case thumbnails
+
+    var id: String { rawValue }
+    var systemImage: String {
+        switch self {
+        case .icons: "square.grid.2x2"
+        case .list: "list.bullet"
+        case .columns: "rectangle.split.3x1"
+        case .thumbnails: "photo.on.rectangle.angled"
+        }
+    }
+}
+
+enum FileBrowserColumn: String, Codable, CaseIterable, Identifiable {
+    case size = "Size"
+    case date = "Date"
+    case kind = "Kind"
+    case owner = "Owner"
+    case group = "Group"
+    case permissions = "Permissions"
+
+    var id: String { rawValue }
+    var width: CGFloat {
+        switch self {
+        case .size: 110
+        case .date: 155
+        case .kind: 135
+        case .owner, .group: 105
+        case .permissions: 115
+        }
+    }
+}
+
+enum FileBrowserSortField: String, Codable {
+    case name, size, date, kind, owner, group, permissions
+}
+
+struct FileBrowserPreferences: Codable, Equatable {
+    var viewMode: FileBrowserViewMode = .list
+    var visibleColumns: [FileBrowserColumn] = [.size, .date]
+    var showHiddenFiles = false
+    var foldersFirst = true
+    var showRowColors = true
+    var useRelativeDates = false
+    var showFileCount = false
+    var textSize: Double = 13
+    var sortField: FileBrowserSortField = .name
+    var sortAscending = true
+
+    static func load(key: String) -> FileBrowserPreferences {
+        guard let data = UserDefaults.standard.data(forKey: key),
+              let value = try? JSONDecoder().decode(Self.self, from: data) else { return Self() }
+        return value
+    }
+
+    func save(key: String) {
+        guard let data = try? JSONEncoder().encode(self) else { return }
+        UserDefaults.standard.set(data, forKey: key)
+    }
 }
 
 enum TransferDirection: String {
@@ -450,12 +526,20 @@ final class SFTPClient: @unchecked Sendable {
                 .map { index in
                     let rawSize = volt_sftp_item_size(items, Int32(index))
                     let rawModified = volt_sftp_item_modified(items, Int32(index))
+                    let isDirectory = volt_sftp_item_is_directory(items, Int32(index)) != 0
+                    let name = String(cString: volt_sftp_item_name(items, Int32(index)))
+                    let permissions = volt_sftp_item_permissions(items, Int32(index))
                     return FileItem(
-                        name: String(cString: volt_sftp_item_name(items, Int32(index))),
+                        name: name,
                         path: String(cString: volt_sftp_item_path(items, Int32(index))),
-                        isDirectory: volt_sftp_item_is_directory(items, Int32(index)) != 0,
+                        isDirectory: isDirectory,
                         size: rawSize >= 0 ? rawSize : nil,
-                        modified: rawModified > 0 ? Date(timeIntervalSince1970: TimeInterval(rawModified)) : nil
+                        modified: rawModified > 0 ? Date(timeIntervalSince1970: TimeInterval(rawModified)) : nil,
+                        kind: isDirectory ? "Folder" : (UTType(filenameExtension: (name as NSString).pathExtension)?.localizedDescription ?? "File"),
+                        owner: String(volt_sftp_item_uid(items, Int32(index))),
+                        group: String(volt_sftp_item_gid(items, Int32(index))),
+                        permissions: permissions == 0 ? nil : permissions,
+                        isHidden: name.hasPrefix(".")
                     )
                 }
                 .sorted { lhs, rhs in
@@ -601,6 +685,12 @@ final class AppModel: ObservableObject {
     @Published var remoteItems: [FileItem] = []
     @Published var selectedLocalID: FileItem.ID?
     @Published var selectedRemoteID: FileItem.ID?
+    @Published var localBrowserPreferences = FileBrowserPreferences.load(key: "Volt.LocalBrowserPreferences") {
+        didSet { localBrowserPreferences.save(key: "Volt.LocalBrowserPreferences") }
+    }
+    @Published var remoteBrowserPreferences = FileBrowserPreferences.load(key: "Volt.RemoteBrowserPreferences") {
+        didSet { remoteBrowserPreferences.save(key: "Volt.RemoteBrowserPreferences") }
+    }
     @Published var transfers: [TransferJob] = []
     @Published var remoteEditSessions: [RemoteEditSession] = []
     @Published var status = "Ready"
@@ -901,16 +991,23 @@ final class AppModel: ObservableObject {
     func refreshLocal() {
         do {
             let url = URL(fileURLWithPath: localPath)
-            let keys: Set<URLResourceKey> = [.isDirectoryKey, .fileSizeKey, .contentModificationDateKey]
-            localItems = try FileManager.default.contentsOfDirectory(at: url, includingPropertiesForKeys: Array(keys), options: [.skipsHiddenFiles])
+            let keys: Set<URLResourceKey> = [.isDirectoryKey, .fileSizeKey, .contentModificationDateKey, .contentTypeKey, .isHiddenKey]
+            localItems = try FileManager.default.contentsOfDirectory(at: url, includingPropertiesForKeys: Array(keys), options: [])
                 .map { fileURL in
                     let values = try fileURL.resourceValues(forKeys: keys)
+                    let attributes = try? FileManager.default.attributesOfItem(atPath: fileURL.path)
+                    let isDirectory = values.isDirectory == true
                     return FileItem(
                         name: fileURL.lastPathComponent,
                         path: fileURL.path,
-                        isDirectory: values.isDirectory == true,
+                        isDirectory: isDirectory,
                         size: values.fileSize.map(Int64.init),
-                        modified: values.contentModificationDate
+                        modified: values.contentModificationDate,
+                        kind: isDirectory ? "Folder" : (values.contentType?.localizedDescription ?? "File"),
+                        owner: attributes?[.ownerAccountName] as? String,
+                        group: attributes?[.groupOwnerAccountName] as? String,
+                        permissions: (attributes?[.posixPermissions] as? NSNumber)?.uint32Value,
+                        isHidden: values.isHidden == true || fileURL.lastPathComponent.hasPrefix(".")
                     )
                 }
                 .sorted(by: itemSort)
@@ -2151,6 +2248,8 @@ struct BrowserSplitView: View {
                 submitPath: model.submitLocalPath,
                 items: model.localItems,
                 selection: $model.selectedLocalID,
+                preferences: $model.localBrowserPreferences,
+                isRemote: false,
                 toolbar: {
                     Button(action: model.chooseLocalFolder) { Image(systemName: "folder") }.help("Choose folder")
                     Button(action: model.localUp) { Image(systemName: "arrow.up") }.help("Parent folder")
@@ -2241,6 +2340,8 @@ struct BrowserSplitView: View {
                 submitPath: model.submitRemotePath,
                 items: model.remoteItems,
                 selection: $model.selectedRemoteID,
+                preferences: $model.remoteBrowserPreferences,
+                isRemote: true,
                 toolbar: {
                     Button(action: model.remoteUp) { Image(systemName: "arrow.up") }.help("Parent folder")
                     Button(action: model.refreshRemote) { Image(systemName: "arrow.clockwise") }.help("Refresh")
@@ -2346,115 +2447,243 @@ struct FilePane<ToolbarContent: View, ContextMenuContent: View, BackgroundContex
     var submitPath: () -> Void
     var items: [FileItem]
     @Binding var selection: FileItem.ID?
+    @Binding var preferences: FileBrowserPreferences
+    var isRemote: Bool
     @ViewBuilder var toolbar: () -> ToolbarContent
     var open: (FileItem) -> Void
     @ViewBuilder var contextMenu: (FileItem) -> ContextMenuContent
     @ViewBuilder var backgroundContextMenu: () -> BackgroundContextMenuContent
 
+    private var displayedItems: [FileItem] {
+        items.filter { preferences.showHiddenFiles || !$0.isHidden }.sorted(by: sortsBefore)
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             HStack(spacing: 8) {
-                Text(title)
-                    .font(.headline)
-                    .frame(width: 70, alignment: .leading)
-                TextField("Path", text: $path)
-                    .textFieldStyle(.roundedBorder)
-                    .submitLabel(.go)
-                    .onSubmit(submitPath)
-                toolbar()
-                    .buttonStyle(.borderless)
-                    .controlSize(.large)
+                Text(title).font(.headline).frame(width: 70, alignment: .leading)
+                TextField("Path", text: $path).textFieldStyle(.roundedBorder).submitLabel(.go).onSubmit(submitPath)
+                toolbar().buttonStyle(.borderless).controlSize(.large)
+                viewOptions
             }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 10)
+            .padding(.horizontal, 12).padding(.vertical, 10)
 
-            HStack {
-                Text("Name")
-                    .font(.headline)
-                Spacer()
-                Text("Size")
-                    .font(.headline)
-                    .frame(width: 140, alignment: .leading)
+            if preferences.viewMode == .list {
+                listHeader
+                Divider()
             }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 8)
-
-            Divider()
-
-            ScrollView {
-                LazyVStack(spacing: 2) {
-                    ForEach(Array(items.enumerated()), id: \.element.id) { index, item in
-                        FileRow(
-                            item: item,
-                            isSelected: selection == item.id,
-                            isStriped: index.isMultiple(of: 2),
-                            selection: $selection,
-                            open: open,
-                            contextMenu: contextMenu
-                        )
-                    }
-                }
-                .padding(.horizontal, 10)
-                .padding(.vertical, 6)
-            }
-            .background(Color.clear)
-            .contentShape(Rectangle())
-            .contextMenu { backgroundContextMenu() }
-            .onTapGesture {
-                selection = nil
+            browserContent
+                .background(Color.clear)
+                .contentShape(Rectangle())
+                .contextMenu { backgroundContextMenu() }
+            if preferences.showFileCount {
+                Divider()
+                Text("\(displayedItems.count) items").font(.caption).foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 12).padding(.vertical, 4)
             }
         }
         .frame(minWidth: 300)
     }
-}
 
-struct FileRow<ContextMenuContent: View>: View {
-    var item: FileItem
-    var isSelected: Bool
-    var isStriped: Bool
-    @Binding var selection: FileItem.ID?
-    var open: (FileItem) -> Void
-    @ViewBuilder var contextMenu: (FileItem) -> ContextMenuContent
-
-    var body: some View {
-        HStack(spacing: 12) {
-            Label(item.name, systemImage: item.isDirectory ? "folder" : "doc")
-                .lineLimit(1)
-            Spacer()
-            Text(item.isDirectory ? "--" : ByteCountFormatter.string(fromByteCount: item.size ?? 0, countStyle: .file))
-                .foregroundStyle(isSelected ? Color.white.opacity(0.9) : Color.secondary)
-                .frame(width: 140, alignment: .leading)
-                .lineLimit(1)
+    @ViewBuilder private var browserContent: some View {
+        switch preferences.viewMode {
+        case .list:
+            ScrollView {
+                LazyVStack(spacing: 2) {
+                    ForEach(Array(displayedItems.enumerated()), id: \.element.id) { index, item in listRow(item, index: index) }
+                }.padding(.horizontal, 10).padding(.vertical, 6)
+            }
+        case .icons, .thumbnails:
+            ScrollView {
+                LazyVGrid(columns: [GridItem(.adaptive(minimum: preferences.viewMode == .thumbnails ? 140 : 105), spacing: 12)], spacing: 12) {
+                    ForEach(displayedItems) { item in iconCell(item) }
+                }.padding(12)
+            }
+        case .columns:
+            columnBrowser
         }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 7)
-            .background(selectionBackground)
-            .background {
-                RightClickSelectionView {
-                    selection = item.id
-                }
-            }
-            .foregroundStyle(isSelected ? Color.white : Color.primary)
-            .clipShape(RoundedRectangle(cornerRadius: 6))
-            .contentShape(Rectangle())
-            .onTapGesture(count: 2) {
-                selection = item.id
-                open(item)
-            }
-            .simultaneousGesture(
-                TapGesture(count: 1)
-                    .onEnded {
-                        selection = item.id
-                    }
-            )
-            .contextMenu {
-                contextMenu(item)
-            }
     }
 
-    private var selectionBackground: some View {
-        RoundedRectangle(cornerRadius: 6)
-            .fill(isSelected ? Color.accentColor : (isStriped ? Color.primary.opacity(0.06) : Color.clear))
+    private var listHeader: some View {
+        HStack(spacing: 12) {
+            headerButton("Name", field: .name).frame(minWidth: 180, maxWidth: .infinity, alignment: .leading)
+            ForEach(preferences.visibleColumns) { column in
+                headerButton(column.rawValue, field: sortField(for: column)).frame(width: column.width, alignment: .leading)
+            }
+        }
+        .font(.headline).padding(.horizontal, 20).padding(.vertical, 8)
+        .contentShape(Rectangle()).contextMenu { columnMenu }
+    }
+
+    private func listRow(_ item: FileItem, index: Int) -> some View {
+        HStack(spacing: 12) {
+            Label(item.name, systemImage: item.isDirectory ? "folder" : "doc")
+                .lineLimit(1).frame(minWidth: 180, maxWidth: .infinity, alignment: .leading)
+            ForEach(preferences.visibleColumns) { column in
+                Text(text(for: column, item: item)).foregroundStyle(selection == item.id ? Color.white.opacity(0.9) : Color.secondary)
+                    .frame(width: column.width, alignment: .leading).lineLimit(1)
+            }
+        }
+        .font(.system(size: preferences.textSize)).padding(.horizontal, 10).padding(.vertical, 7)
+        .background(RoundedRectangle(cornerRadius: 6).fill(selection == item.id ? Color.accentColor : (preferences.showRowColors && index.isMultiple(of: 2) ? Color.primary.opacity(0.06) : Color.clear)))
+        .background { RightClickSelectionView { selection = item.id } }
+        .foregroundStyle(selection == item.id ? Color.white : Color.primary).clipShape(RoundedRectangle(cornerRadius: 6)).contentShape(Rectangle())
+        .onTapGesture(count: 2) { selection = item.id; open(item) }
+        .simultaneousGesture(TapGesture().onEnded { selection = item.id })
+        .contextMenu { contextMenu(item) }
+    }
+
+    private func iconCell(_ item: FileItem) -> some View {
+        VStack(spacing: 7) {
+            if preferences.viewMode == .thumbnails {
+                FileThumbnailView(item: item, isRemote: isRemote).frame(width: 96, height: 72)
+            } else {
+                Image(systemName: item.isDirectory ? "folder.fill" : "doc.fill").resizable().scaledToFit()
+                    .foregroundStyle(item.isDirectory ? Color.accentColor : Color.secondary).frame(width: 48, height: 48)
+            }
+            Text(item.name).font(.system(size: preferences.textSize)).lineLimit(2).multilineTextAlignment(.center)
+        }
+        .frame(maxWidth: .infinity, minHeight: 100).padding(8)
+        .background(selection == item.id ? Color.accentColor.opacity(0.35) : Color.clear).clipShape(RoundedRectangle(cornerRadius: 8)).contentShape(Rectangle())
+        .onTapGesture(count: 2) { selection = item.id; open(item) }
+        .simultaneousGesture(TapGesture().onEnded { selection = item.id }).contextMenu { contextMenu(item) }
+    }
+
+    private var columnBrowser: some View {
+        HStack(spacing: 0) {
+            ScrollView {
+                LazyVStack(spacing: 1) {
+                    ForEach(displayedItems) { item in
+                        HStack {
+                            Image(systemName: item.isDirectory ? "folder" : "doc")
+                            Text(item.name).lineLimit(1); Spacer()
+                            if item.isDirectory { Image(systemName: "chevron.right").foregroundStyle(.secondary) }
+                        }
+                        .font(.system(size: preferences.textSize)).padding(.horizontal, 10).padding(.vertical, 7)
+                        .background(selection == item.id ? Color.accentColor : Color.clear).foregroundStyle(selection == item.id ? Color.white : Color.primary)
+                        .contentShape(Rectangle()).onTapGesture { selection = item.id }
+                        .onTapGesture(count: 2) { selection = item.id; open(item) }.contextMenu { contextMenu(item) }
+                    }
+                }.padding(6)
+            }.frame(minWidth: 220, idealWidth: 280, maxWidth: 340)
+            Divider()
+            VStack(spacing: 12) {
+                if let item = displayedItems.first(where: { $0.id == selection }) {
+                    FileThumbnailView(item: item, isRemote: isRemote).frame(width: 128, height: 100)
+                    Text(item.name).font(.headline).multilineTextAlignment(.center)
+                    Text(item.kind).foregroundStyle(.secondary)
+                    if !item.isDirectory { Text(ByteCountFormatter.string(fromByteCount: item.size ?? 0, countStyle: .file)).foregroundStyle(.secondary) }
+                } else {
+                    Image(systemName: "sidebar.right").font(.largeTitle).foregroundStyle(.tertiary)
+                    Text("Select an item").foregroundStyle(.secondary)
+                }
+            }.frame(maxWidth: .infinity, maxHeight: .infinity).padding()
+        }
+    }
+
+    private var viewOptions: some View {
+        Menu {
+            Picker("View", selection: $preferences.viewMode) {
+                ForEach(FileBrowserViewMode.allCases) { mode in Label(mode.rawValue.capitalized, systemImage: mode.systemImage).tag(mode) }
+            }
+            Divider(); columnMenu; Divider()
+            Toggle("Show row colors", isOn: $preferences.showRowColors)
+            Toggle("Show hidden files", isOn: $preferences.showHiddenFiles)
+            Toggle("Folders above files", isOn: $preferences.foldersFirst)
+            Toggle("Use relative dates", isOn: $preferences.useRelativeDates)
+            Toggle("Show file count", isOn: $preferences.showFileCount)
+            Divider()
+            Stepper("Text size: \(Int(preferences.textSize))", value: $preferences.textSize, in: 10...20, step: 1)
+        } label: { Image(systemName: "square.grid.2x2") }
+        .menuStyle(.borderlessButton).fixedSize().help("View options")
+    }
+
+    @ViewBuilder private var columnMenu: some View {
+        ForEach(FileBrowserColumn.allCases) { column in
+            Toggle(column.rawValue, isOn: columnVisibilityBinding(for: column))
+        }
+    }
+
+    private func headerButton(_ title: String, field: FileBrowserSortField) -> some View {
+        Button {
+            if preferences.sortField == field { preferences.sortAscending.toggle() }
+            else { preferences.sortField = field; preferences.sortAscending = true }
+        } label: {
+            HStack(spacing: 4) {
+                Text(title)
+                if preferences.sortField == field { Image(systemName: preferences.sortAscending ? "chevron.up" : "chevron.down").font(.caption2) }
+            }
+        }.buttonStyle(.plain)
+    }
+
+    private func columnVisibilityBinding(for column: FileBrowserColumn) -> Binding<Bool> {
+        Binding(
+            get: { preferences.visibleColumns.contains(column) },
+            set: { isVisible in
+                if isVisible {
+                    if !preferences.visibleColumns.contains(column) { preferences.visibleColumns.append(column) }
+                } else {
+                    preferences.visibleColumns.removeAll { $0 == column }
+                }
+            }
+        )
+    }
+
+    private func sortField(for column: FileBrowserColumn) -> FileBrowserSortField {
+        switch column { case .size: .size; case .date: .date; case .kind: .kind; case .owner: .owner; case .group: .group; case .permissions: .permissions }
+    }
+
+    private func sortsBefore(_ lhs: FileItem, _ rhs: FileItem) -> Bool {
+        if preferences.foldersFirst && lhs.isDirectory != rhs.isDirectory { return lhs.isDirectory }
+        let order: ComparisonResult = switch preferences.sortField {
+        case .name: lhs.name.localizedStandardCompare(rhs.name)
+        case .size: compare(lhs.size ?? -1, rhs.size ?? -1)
+        case .date: compare(lhs.modified ?? .distantPast, rhs.modified ?? .distantPast)
+        case .kind: lhs.kind.localizedStandardCompare(rhs.kind)
+        case .owner: (lhs.owner ?? "").localizedStandardCompare(rhs.owner ?? "")
+        case .group: (lhs.group ?? "").localizedStandardCompare(rhs.group ?? "")
+        case .permissions: compare(lhs.permissions ?? 0, rhs.permissions ?? 0)
+        }
+        if order == .orderedSame { return lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending }
+        return preferences.sortAscending ? order == .orderedAscending : order == .orderedDescending
+    }
+
+    private func compare<T: Comparable>(_ lhs: T, _ rhs: T) -> ComparisonResult { lhs == rhs ? .orderedSame : (lhs < rhs ? .orderedAscending : .orderedDescending) }
+
+    private func text(for column: FileBrowserColumn, item: FileItem) -> String {
+        switch column {
+        case .size: return item.isDirectory ? "--" : ByteCountFormatter.string(fromByteCount: item.size ?? 0, countStyle: .file)
+        case .date:
+            guard let date = item.modified else { return "--" }
+            return preferences.useRelativeDates ? RelativeDateTimeFormatter().localizedString(for: date, relativeTo: Date()) : date.formatted(date: .abbreviated, time: .shortened)
+        case .kind: return item.kind
+        case .owner: return item.owner ?? "--"
+        case .group: return item.group ?? "--"
+        case .permissions: return item.permissionText
+        }
+    }
+}
+
+private struct FileThumbnailView: View {
+    var item: FileItem
+    var isRemote: Bool
+    @State private var image: NSImage?
+
+    var body: some View {
+        Group {
+            if let image { Image(nsImage: image).resizable().scaledToFit() }
+            else { Image(systemName: item.isDirectory ? "folder.fill" : "doc.fill").resizable().scaledToFit().foregroundStyle(item.isDirectory ? Color.accentColor : Color.secondary).padding(16) }
+        }
+        .task(id: item.id) {
+            guard !isRemote, !item.isDirectory else { return }
+            let request = QLThumbnailGenerator.Request(fileAt: URL(fileURLWithPath: item.path), size: CGSize(width: 256, height: 192), scale: NSScreen.main?.backingScaleFactor ?? 2, representationTypes: .thumbnail)
+            let imageData: Data? = await withCheckedContinuation { continuation in
+                QLThumbnailGenerator.shared.generateBestRepresentation(for: request) { representation, _ in
+                    continuation.resume(returning: representation?.nsImage.tiffRepresentation)
+                }
+            }
+            image = imageData.flatMap(NSImage.init(data:))
+        }
     }
 }
 

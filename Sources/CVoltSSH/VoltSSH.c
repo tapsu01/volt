@@ -570,6 +570,9 @@ int volt_sftp_list(const char *host, int port, const char *username, const char 
             list[used].is_directory = (attrs.flags & LIBSSH2_SFTP_ATTR_PERMISSIONS) && LIBSSH2_SFTP_S_ISDIR(attrs.permissions);
             list[used].size = (attrs.flags & LIBSSH2_SFTP_ATTR_SIZE) ? (int64_t)attrs.filesize : -1;
             list[used].modified = (attrs.flags & LIBSSH2_SFTP_ATTR_ACMODTIME) ? (int64_t)attrs.mtime : 0;
+            list[used].permissions = (attrs.flags & LIBSSH2_SFTP_ATTR_PERMISSIONS) ? attrs.permissions : 0;
+            list[used].uid = (attrs.flags & LIBSSH2_SFTP_ATTR_UIDGID) ? attrs.uid : 0;
+            list[used].gid = (attrs.flags & LIBSSH2_SFTP_ATTR_UIDGID) ? attrs.gid : 0;
             used++;
         } else if (rc == 0) {
             break;
@@ -889,4 +892,16 @@ int64_t volt_sftp_item_size(const VoltSFTPItem *items, int index) {
 
 int64_t volt_sftp_item_modified(const VoltSFTPItem *items, int index) {
     return items[index].modified;
+}
+
+uint32_t volt_sftp_item_permissions(const VoltSFTPItem *items, int index) {
+    return items[index].permissions;
+}
+
+uint32_t volt_sftp_item_uid(const VoltSFTPItem *items, int index) {
+    return items[index].uid;
+}
+
+uint32_t volt_sftp_item_gid(const VoltSFTPItem *items, int index) {
+    return items[index].gid;
 }

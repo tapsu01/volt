@@ -14,6 +14,9 @@ typedef struct VoltSFTPItem {
     int is_directory;
     int64_t size;
     int64_t modified;
+    uint32_t permissions;
+    uint32_t uid;
+    uint32_t gid;
 } VoltSFTPItem;
 
 typedef int (*VoltSFTPProgressCallback)(uint64_t transferred, uint64_t total, void *context);
@@ -40,6 +43,9 @@ const char *volt_sftp_item_path(const VoltSFTPItem *items, int index);
 int volt_sftp_item_is_directory(const VoltSFTPItem *items, int index);
 int64_t volt_sftp_item_size(const VoltSFTPItem *items, int index);
 int64_t volt_sftp_item_modified(const VoltSFTPItem *items, int index);
+uint32_t volt_sftp_item_permissions(const VoltSFTPItem *items, int index);
+uint32_t volt_sftp_item_uid(const VoltSFTPItem *items, int index);
+uint32_t volt_sftp_item_gid(const VoltSFTPItem *items, int index);
 
 #ifdef __cplusplus
 }
