@@ -824,8 +824,29 @@ final class AppModel: ObservableObject {
         }
     }
 
+    func submitLocalPath() {
+        let expandedPath = (localPath as NSString).expandingTildeInPath
+        let url = URL(fileURLWithPath: expandedPath).standardizedFileURL
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory), isDirectory.boolValue else {
+            status = "Local path is not a folder: \(localPath)"
+            return
+        }
+        localPath = url.path
+        selectedLocalID = nil
+        refreshLocal()
+    }
+
     func refreshRemote() {
         refreshRemote(finalStatus: "Remote folder loaded")
+    }
+
+    func submitRemotePath() {
+        let trimmedPath = remotePath.trimmingCharacters(in: .whitespacesAndNewlines)
+        remotePath = trimmedPath.isEmpty ? "/" : "/" + trimmedPath.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        selectedRemoteID = nil
+        syncCurrentTab()
+        refreshRemote()
     }
 
     private func refreshRemote(finalStatus: String) {
@@ -1549,14 +1570,18 @@ final class AppModel: ObservableObject {
 
 struct ContentView: View {
     @StateObject private var model = AppModel()
+    @State private var showsSidebar = true
+    @State private var detailLeadingEdge: CGFloat = 260
+    @State private var toolbarLeadingEdge: CGFloat = 80
 
     var body: some View {
-        NavigationSplitView {
-            SidebarView(model: model)
-                .navigationSplitViewColumnWidth(min: 220, ideal: 260, max: 320)
-        } detail: {
+        HSplitView {
+            if showsSidebar {
+                SidebarView(model: model)
+                    .frame(minWidth: 220, idealWidth: 260, maxWidth: 320, maxHeight: .infinity)
+            }
+
             VStack(spacing: 0) {
-                SessionTabBar(model: model)
                 if model.selectedConnection == nil || model.showsConnectionEditor {
                     ConnectionEditor(model: model)
                     Divider()
@@ -1570,7 +1595,46 @@ struct ContentView: View {
                 TransferQueueView(model: model)
                 StatusBar(model: model)
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(HorizontalPositionReader(leadingEdge: $detailLeadingEdge))
         }
+        .toolbar {
+            ToolbarItem(placement: .navigation) {
+                ZStack(alignment: .leading) {
+                    HorizontalPositionReader(leadingEdge: $toolbarLeadingEdge)
+                        .frame(width: 1, height: 1)
+
+                    Button {
+                        withAnimation(.easeInOut(duration: 0.16)) {
+                            showsSidebar.toggle()
+                        }
+                    } label: {
+                        Image(systemName: "sidebar.left")
+                            .font(.system(size: 16, weight: .medium))
+                            .frame(width: 28, height: 28)
+                    }
+                    .buttonStyle(.plain)
+                    .help(showsSidebar ? "Hide Sidebar" : "Show Sidebar")
+
+                    SessionTabBar(model: model)
+                        .offset(x: max(36, detailLeadingEdge - toolbarLeadingEdge))
+                }
+                .frame(width: 760, height: 32, alignment: .leading)
+            }
+
+            ToolbarItem(placement: .principal) {
+                Color.clear
+                    .frame(minWidth: 1, maxWidth: .infinity)
+            }
+
+            ToolbarItem(placement: .primaryAction) {
+                Button(action: { model.showsInspector.toggle() }) {
+                    Image(systemName: model.showsInspector ? "info.circle.fill" : "info.circle")
+                }
+                .help("Toggle Inspector")
+            }
+        }
+        .background(WindowConfigurator())
         .inspector(isPresented: $model.showsInspector) {
             InspectorView(model: model)
         }
@@ -1581,6 +1645,83 @@ struct ContentView: View {
             HostKeyVerificationView(model: model)
         }
         .frame(minWidth: 1120, minHeight: 720)
+    }
+}
+
+private struct HorizontalPositionReader: NSViewRepresentable {
+    @Binding var leadingEdge: CGFloat
+
+    func makeNSView(context: Context) -> DetailEdgeTrackingView {
+        let view = DetailEdgeTrackingView()
+        view.onPositionChange = updateLeadingEdge
+        return view
+    }
+
+    func updateNSView(_ nsView: DetailEdgeTrackingView, context: Context) {
+        nsView.onPositionChange = updateLeadingEdge
+        nsView.reportPosition()
+    }
+
+    private func updateLeadingEdge(_ value: CGFloat) {
+        guard value >= 0, abs(leadingEdge - value) > 0.5 else { return }
+        leadingEdge = value
+    }
+}
+
+private final class DetailEdgeTrackingView: NSView {
+    var onPositionChange: ((CGFloat) -> Void)?
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        reportPosition()
+    }
+
+    override func setFrameOrigin(_ newOrigin: NSPoint) {
+        super.setFrameOrigin(newOrigin)
+        reportPosition()
+    }
+
+    override func setFrameSize(_ newSize: NSSize) {
+        super.setFrameSize(newSize)
+        reportPosition()
+    }
+
+    override func layout() {
+        super.layout()
+        reportPosition()
+    }
+
+    func reportPosition() {
+        guard let contentView = window?.contentView else { return }
+        let leadingEdge = convert(bounds.origin, to: contentView).x
+        DispatchQueue.main.async { [weak self] in
+            self?.onPositionChange?(leadingEdge)
+        }
+    }
+}
+
+private struct WindowConfigurator: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSView {
+        let view = NSView()
+        DispatchQueue.main.async {
+            configure(view.window)
+        }
+        return view
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {
+        DispatchQueue.main.async {
+            configure(nsView.window)
+        }
+    }
+
+    private func configure(_ window: NSWindow?) {
+        guard let window else { return }
+        window.styleMask.insert(.fullSizeContentView)
+        window.titleVisibility = .hidden
+        window.titlebarAppearsTransparent = true
+        window.titlebarSeparatorStyle = .none
+        window.isMovableByWindowBackground = true
     }
 }
 
@@ -1619,17 +1760,9 @@ struct SessionTabBar: View {
             }
             .buttonStyle(.plain)
             .help("New tab")
-            Spacer()
-            Button(action: { model.showsInspector.toggle() }) {
-                Image(systemName: model.showsInspector ? "info.circle.fill" : "info.circle")
-                    .padding(6)
-            }
-            .buttonStyle(.plain)
-            .help("Toggle Inspector")
         }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 6)
-        .background(Color.primary.opacity(0.04))
+        .padding(.horizontal, 12)
+        .padding(.vertical, 3)
     }
 }
 
@@ -1761,6 +1894,7 @@ struct ConnectionEditor: View {
             GridRow {
                 Text("Remote permissions")
                     .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
                 Picker(
                     "Remote permissions",
                     selection: Binding(
@@ -1861,6 +1995,7 @@ struct BrowserSplitView: View {
             FilePane(
                 title: "Local",
                 path: $model.localPath,
+                submitPath: model.submitLocalPath,
                 items: model.localItems,
                 selection: $model.selectedLocalID,
                 toolbar: {
@@ -1950,6 +2085,7 @@ struct BrowserSplitView: View {
             FilePane(
                 title: "Remote",
                 path: $model.remotePath,
+                submitPath: model.submitRemotePath,
                 items: model.remoteItems,
                 selection: $model.selectedRemoteID,
                 toolbar: {
@@ -2054,6 +2190,7 @@ struct BrowserSplitView: View {
 struct FilePane<ToolbarContent: View, ContextMenuContent: View, BackgroundContextMenuContent: View>: View {
     var title: String
     @Binding var path: String
+    var submitPath: () -> Void
     var items: [FileItem]
     @Binding var selection: FileItem.ID?
     @ViewBuilder var toolbar: () -> ToolbarContent
@@ -2069,11 +2206,14 @@ struct FilePane<ToolbarContent: View, ContextMenuContent: View, BackgroundContex
                     .frame(width: 70, alignment: .leading)
                 TextField("Path", text: $path)
                     .textFieldStyle(.roundedBorder)
+                    .submitLabel(.go)
+                    .onSubmit(submitPath)
                 toolbar()
                     .buttonStyle(.borderless)
                     .controlSize(.large)
             }
-            .padding(10)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 10)
 
             HStack {
                 Text("Name")
@@ -2083,7 +2223,7 @@ struct FilePane<ToolbarContent: View, ContextMenuContent: View, BackgroundContex
                     .font(.headline)
                     .frame(width: 140, alignment: .leading)
             }
-            .padding(.horizontal, 16)
+            .padding(.horizontal, 12)
             .padding(.vertical, 8)
 
             Divider()
@@ -2499,7 +2639,7 @@ struct VoltApp: App {
         WindowGroup {
             ContentView()
         }
-        .windowStyle(.titleBar)
+        .windowStyle(.hiddenTitleBar)
         .commands {
             CommandGroup(replacing: .newItem) {}
         }

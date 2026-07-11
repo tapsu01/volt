@@ -91,7 +91,7 @@ SSL_CRYPTO_PATH="$(/usr/bin/otool -L "$FRAMEWORKS_DIR/libssl.3.dylib" | /usr/bin
 sign_code() {
   target="$1"
   if [ "$SIGN_IDENTITY" = "-" ]; then
-    /usr/bin/codesign --force --sign - --options=runtime "$target"
+    /usr/bin/codesign --force --sign - "$target"
   else
     /usr/bin/codesign --force --sign "$SIGN_IDENTITY" --options=runtime --timestamp "$target"
   fi
@@ -121,7 +121,7 @@ MANIFEST_PATH="$RESOURCES_DIR/DependencyManifest.json"
   '}' > "$MANIFEST_PATH"
 
 if [ "$SIGN_IDENTITY" = "-" ]; then
-  /usr/bin/codesign --force --sign - --options=runtime --entitlements "$ROOT_DIR/Support/Volt.entitlements" "$APP_DIR"
+  /usr/bin/codesign --force --sign - --entitlements "$ROOT_DIR/Support/Volt.entitlements" "$APP_DIR"
 else
   /usr/bin/codesign --force --sign "$SIGN_IDENTITY" --options=runtime --timestamp --entitlements "$ROOT_DIR/Support/Volt.entitlements" "$APP_DIR"
 fi
