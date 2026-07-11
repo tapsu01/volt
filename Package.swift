@@ -26,10 +26,19 @@ let package = Package(
                 .unsafeFlags(["-L\(libssh2Prefix)/lib"])
             ]
         ),
+        .target(
+            name: "VoltCore",
+            path: "Sources/VoltCore"
+        ),
         .executableTarget(
             name: "Volt",
-            dependencies: ["CVoltSSH"],
+            dependencies: ["CVoltSSH", "VoltCore"],
             path: "Sources/Volt"
+        ),
+        .testTarget(
+            name: "VoltTests",
+            dependencies: ["VoltCore"],
+            path: "Tests/VoltTests"
         )
     ]
 )

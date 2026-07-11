@@ -6,6 +6,7 @@ import Security
 import SwiftUI
 import UniformTypeIdentifiers
 import QuickLookThumbnailing
+import VoltCore
 
 private func decodeCError(_ buffer: [CChar]) -> String {
     let bytes = buffer.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }
@@ -80,6 +81,13 @@ struct FileItem: Identifiable, Hashable {
         guard let permissions else { return "--" }
         return String(format: "%03o", permissions & 0o777)
     }
+}
+
+/// Kết quả của một lần liệt kê thư mục remote: danh sách entry hợp lệ và số entry bị bỏ vì không an
+/// toàn (tên chứa byte nguy hiểm ở tầng C, hoặc không phải UTF-8 hợp lệ ở tầng Swift).
+struct RemoteListingResult {
+    let items: [FileItem]
+    let skippedUnsafeCount: Int
 }
 
 enum FileBrowserViewMode: String, Codable, CaseIterable, Identifiable {
@@ -570,43 +578,56 @@ final class SFTPClient: @unchecked Sendable {
         }.value
     }
 
-    func list(connection: SavedConnection, credential: SensitiveCredential, path: String) async throws -> [FileItem] {
+    func list(connection: SavedConnection, credential: SensitiveCredential, path: String) async throws -> RemoteListingResult {
         try await Task.detached {
             var items: UnsafeMutablePointer<VoltSFTPItem>?
             var count: Int32 = 0
+            var skippedUnsafe: Int32 = 0
             _ = try self.call(connection: connection, credential: credential) { host, port, username, password, keyPath, knownHostsPath, error, errorLength in
-                volt_sftp_list(host, port, username, password, keyPath, knownHostsPath, path, &items, &count, error, errorLength)
+                volt_sftp_list(host, port, username, password, keyPath, knownHostsPath, path, &items, &count, &skippedUnsafe, error, errorLength)
             }
             defer {
                 if let items {
                     volt_sftp_free_items(items)
                 }
             }
-            guard let items else { return [] }
-            return (0..<Int(count))
-                .map { index in
-                    let rawSize = volt_sftp_item_size(items, Int32(index))
-                    let rawModified = volt_sftp_item_modified(items, Int32(index))
-                    let isDirectory = volt_sftp_item_is_directory(items, Int32(index)) != 0
-                    let name = String(cString: volt_sftp_item_name(items, Int32(index)))
-                    let permissions = volt_sftp_item_permissions(items, Int32(index))
-                    return FileItem(
-                        name: name,
-                        path: String(cString: volt_sftp_item_path(items, Int32(index))),
-                        isDirectory: isDirectory,
-                        size: rawSize >= 0 ? rawSize : nil,
-                        modified: rawModified > 0 ? Date(timeIntervalSince1970: TimeInterval(rawModified)) : nil,
-                        kind: isDirectory ? "Folder" : (UTType(filenameExtension: (name as NSString).pathExtension)?.localizedDescription ?? "File"),
-                        owner: String(volt_sftp_item_uid(items, Int32(index))),
-                        group: String(volt_sftp_item_gid(items, Int32(index))),
-                        permissions: permissions == 0 ? nil : permissions,
-                        isHidden: name.hasPrefix(".")
-                    )
+            guard let items else {
+                return RemoteListingResult(items: [], skippedUnsafeCount: Int(skippedUnsafe))
+            }
+            var parsed: [FileItem] = []
+            var swiftSkipped = 0
+            for index in 0..<Int(count) {
+                // Một guard chung cho cả name và path: chỉ đếm MỘT lần mỗi entry, và loại bỏ triệt để
+                // bytes không phải UTF-8 hợp lệ (String(cString:) sẽ thay thế lossy bằng U+FFFD, khiến
+                // path re-encode không còn trỏ đúng entry gốc).
+                guard let name = String(validatingCString: volt_sftp_item_name(items, Int32(index))),
+                      let itemPath = String(validatingCString: volt_sftp_item_path(items, Int32(index)))
+                else {
+                    swiftSkipped += 1
+                    continue
                 }
-                .sorted { lhs, rhs in
-                    if lhs.isDirectory != rhs.isDirectory { return lhs.isDirectory }
-                    return lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
-                }
+                let rawSize = volt_sftp_item_size(items, Int32(index))
+                let rawModified = volt_sftp_item_modified(items, Int32(index))
+                let isDirectory = volt_sftp_item_is_directory(items, Int32(index)) != 0
+                let permissions = volt_sftp_item_permissions(items, Int32(index))
+                parsed.append(FileItem(
+                    name: name,
+                    path: itemPath,
+                    isDirectory: isDirectory,
+                    size: rawSize >= 0 ? rawSize : nil,
+                    modified: rawModified > 0 ? Date(timeIntervalSince1970: TimeInterval(rawModified)) : nil,
+                    kind: isDirectory ? "Folder" : (UTType(filenameExtension: (name as NSString).pathExtension)?.localizedDescription ?? "File"),
+                    owner: String(volt_sftp_item_uid(items, Int32(index))),
+                    group: String(volt_sftp_item_gid(items, Int32(index))),
+                    permissions: permissions == 0 ? nil : permissions,
+                    isHidden: name.hasPrefix(".")
+                ))
+            }
+            parsed.sort { lhs, rhs in
+                if lhs.isDirectory != rhs.isDirectory { return lhs.isDirectory }
+                return lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
+            }
+            return RemoteListingResult(items: parsed, skippedUnsafeCount: Int(skippedUnsafe) + swiftSkipped)
         }.value
     }
 
@@ -1132,10 +1153,10 @@ final class AppModel: ObservableObject {
         let credential = credentialForCurrentTab().clone()
         let operationTabID = selectedTabID
         runBusy("Loading remote folder") {
-            let items: [FileItem]
+            let result: RemoteListingResult
             do {
                 try await self.verifyHostKey(for: connection)
-                items = try await self.sftp.list(connection: connection, credential: credential, path: path)
+                result = try await self.sftp.list(connection: connection, credential: credential, path: path)
             } catch {
                 if self.isAuthenticationFailure(error) {
                     await MainActor.run {
@@ -1148,11 +1169,15 @@ final class AppModel: ObservableObject {
             }
             await MainActor.run {
                 guard self.selectedConnectionID == connection.id, self.remotePath == path else { return }
-                self.remoteItems = items
-                self.remoteDirectoryCache[self.remoteCacheKey(connectionID: connection.id, path: path)] = items
+                self.remoteItems = result.items
+                // Cache chỉ items — warning count là trạng thái nhất thời của lần list này.
+                self.remoteDirectoryCache[self.remoteCacheKey(connectionID: connection.id, path: path)] = result.items
                 self.isConnected = true
                 self.showsConnectionEditor = false
-                self.status = finalStatus
+                // Ưu tiên warning; không hiển thị/log chính filename bị chặn (chỉ số đếm).
+                self.status = result.skippedUnsafeCount > 0
+                    ? "\(result.skippedUnsafeCount) unsafe remote entries were hidden."
+                    : finalStatus
                 self.syncCurrentTab()
             }
         }
@@ -1307,8 +1332,11 @@ final class AppModel: ObservableObject {
 
     func downloadSelected() {
         guard selectedConnection != nil, let item = selectedRemote else { return }
-        let destination = URL(fileURLWithPath: localPath).appendingPathComponent(item.name).path
-        download(remotePath: item.path, localPath: destination, refreshWhenDone: true)
+        guard let destination = safeLocalDestination(base: URL(fileURLWithPath: localPath), name: item.name) else {
+            status = "Refused unsafe remote filename."
+            return
+        }
+        download(remotePath: item.path, localPath: destination.path, refreshWhenDone: true)
     }
 
     func downloadSelectedToFolder() {
@@ -1318,8 +1346,11 @@ final class AppModel: ObservableObject {
         panel.canChooseFiles = false
         panel.allowsMultipleSelection = false
         if panel.runModal() == .OK, let folder = panel.url {
-            let destination = folder.appendingPathComponent(item.name).path
-            download(remotePath: item.path, localPath: destination, refreshWhenDone: false)
+            guard let destination = safeLocalDestination(base: folder, name: item.name) else {
+                status = "Refused unsafe remote filename."
+                return
+            }
+            download(remotePath: item.path, localPath: destination.path, refreshWhenDone: false)
         }
     }
 
@@ -1669,7 +1700,11 @@ final class AppModel: ObservableObject {
             status = error.localizedDescription
             return
         }
-        let localURL = directory.appendingPathComponent(item.name)
+        guard let localURL = safeLocalDestination(base: directory, name: item.name) else {
+            try? FileManager.default.removeItem(at: directory)
+            status = "Refused unsafe remote filename."
+            return
+        }
         let transferID = enqueue(direction: .edit, source: item.path, destination: localURL.path)
         downloadForEdit(remoteItem: item, localURL: localURL, appURL: appURL, transferID: transferID)
     }

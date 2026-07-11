@@ -528,9 +528,23 @@ static int join_path(const char *base, const char *name, char *out, size_t out_l
     return length >= 0 && (size_t)length < out_len ? 0 : -1;
 }
 
-int volt_sftp_list(const char *host, int port, const char *username, const char *password, const char *private_key_path, const char *known_hosts_path, const char *remote_path, VoltSFTPItem **items, int *count, char *error, size_t error_len) {
+// Từ chối tên entry của directory listing không an toàn để dùng như một path component cục bộ.
+// Quét từng byte trong [0, len) dưới dạng unsigned (tránh signed char làm byte >= 0x80 thành âm và
+// vô tình thỏa `< 0x20`). Định nghĩa byte nguy hiểm tường minh, không dùng iscntrl() (tùy locale,
+// UB với byte >= 0x80). Byte >= 0x80 được giữ nguyên để tên UTF-8 multibyte đi qua.
+int volt_is_safe_entry_name(const char *name, size_t len) {
+    if (name == NULL || len == 0) return 0;
+    const unsigned char *bytes = (const unsigned char *)name;
+    for (size_t i = 0; i < len; i++) {
+        if (bytes[i] == 0 || bytes[i] == '/' || bytes[i] < 0x20 || bytes[i] == 0x7f) return 0;
+    }
+    return 1;
+}
+
+int volt_sftp_list(const char *host, int port, const char *username, const char *password, const char *private_key_path, const char *known_hosts_path, const char *remote_path, VoltSFTPItem **items, int *count, int *skipped_unsafe_count, char *error, size_t error_len) {
     *items = NULL;
     *count = 0;
+    *skipped_unsafe_count = 0;
     VoltSession session;
     if (open_session(host, port, username, password, private_key_path, known_hosts_path, &session, error, error_len) != 0) return -1;
 
@@ -557,8 +571,14 @@ int volt_sftp_list(const char *host, int port, const char *username, const char 
         memset(&attrs, 0, sizeof(attrs));
         int rc = libssh2_sftp_readdir_ex(dir, name, sizeof(name) - 1, NULL, 0, &attrs);
         if (rc > 0) {
-            name[rc] = '\0';
-            if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) continue;
+            // Thứ tự bắt buộc: validator quét theo `rc` (không cần NUL) chạy TRƯỚC khi NUL-terminate;
+            // strcmp `.`/`..` cần NUL nên chạy SAU. Embedded NUL bị chính validator bắt ở đây.
+            if (!volt_is_safe_entry_name(name, (size_t)rc)) {
+                (*skipped_unsafe_count)++;
+                continue; // Bỏ RIÊNG entry độc hại, vẫn tiếp tục listing → chống DoS.
+            }
+            name[rc] = '\0'; // An toàn: readdir_ex gọi với sizeof(name) - 1 nên rc < sizeof(name).
+            if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) continue; // Silent-skip, KHÔNG đếm.
             if (used == capacity) {
                 capacity *= 2;
                 VoltSFTPItem *grown = realloc(list, (size_t)capacity * sizeof(VoltSFTPItem));

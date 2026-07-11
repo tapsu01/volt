@@ -27,3 +27,17 @@ OUTPUT="${TMPDIR:-/tmp}/volt-host-key-store-test"
 
 DYLD_LIBRARY_PATH="$LIBSSH2_PREFIX/lib:$OPENSSL_PREFIX/lib" "$OUTPUT"
 /bin/rm -f "$OUTPUT"
+
+NAME_OUTPUT="${TMPDIR:-/tmp}/volt-entry-name-validation-test"
+
+/usr/bin/clang \
+  -I"$LIBSSH2_PREFIX/include" \
+  -I"$ROOT_DIR/Sources/CVoltSSH/include" \
+  "$ROOT_DIR/Tests/entry_name_validation_test.c" \
+  "$ROOT_DIR/Sources/CVoltSSH/VoltSSH.c" \
+  -L"$LIBSSH2_PREFIX/lib" \
+  -lssh2 \
+  -o "$NAME_OUTPUT"
+
+DYLD_LIBRARY_PATH="$LIBSSH2_PREFIX/lib:$OPENSSL_PREFIX/lib" "$NAME_OUTPUT"
+/bin/rm -f "$NAME_OUTPUT"
