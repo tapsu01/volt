@@ -2106,19 +2106,27 @@ struct ConnectionEditor: View {
     @ObservedObject var model: AppModel
 
     var body: some View {
-        Grid(horizontalSpacing: 10, verticalSpacing: 8) {
-            GridRow {
+        VStack(spacing: 10) {
+            HStack(spacing: 12) {
                 TextField("Name", text: $model.connectionDraft.name)
+                    .textFieldStyle(.roundedBorder)
+                    .frame(minWidth: 140, idealWidth: 190)
                 TextField("Host", text: $model.connectionDraft.host)
+                    .textFieldStyle(.roundedBorder)
+                    .frame(minWidth: 140, idealWidth: 190)
                 TextField("User", text: $model.connectionDraft.username)
+                    .textFieldStyle(.roundedBorder)
+                    .frame(minWidth: 140, idealWidth: 190)
                 TextField("Port", value: $model.connectionDraft.port, format: .number)
-                    .frame(width: 70)
+                    .textFieldStyle(.roundedBorder)
+                    .frame(width: 72)
                 Picker("Protocol", selection: $model.connectionDraft.protocolKind) {
                     ForEach(ProtocolKind.allCases) { item in
                         Text(item.rawValue).tag(item)
                     }
                 }
                 .labelsHidden()
+                .frame(minWidth: 130, idealWidth: 160, maxWidth: 180)
                 if model.selectedConnection != nil {
                     Button(action: model.hideConnectionEditor) { Label("Cancel", systemImage: "xmark.circle") }
                 }
@@ -2126,25 +2134,30 @@ struct ConnectionEditor: View {
                 Button(action: model.connectDraft) { Label("Connect", systemImage: "bolt.horizontal") }
                     .disabled(model.connectionDraft.host.isEmpty)
             }
-            GridRow {
+
+            HStack(spacing: 12) {
                 SecureField("Password or key passphrase (not saved)", text: $model.connectionPassword)
-                    .gridCellColumns(2)
+                    .textFieldStyle(.roundedBorder)
+                    .frame(minWidth: 280, maxWidth: .infinity)
                 HStack(spacing: 6) {
                     TextField("Private key", text: $model.connectionDraft.privateKeyPath)
+                        .textFieldStyle(.roundedBorder)
                         .disabled(true)
                     Button(action: model.choosePrivateKey) {
                         Image(systemName: "key.horizontal")
                     }
                     .help("Choose SSH private key")
                 }
-                    .gridCellColumns(3)
+                .frame(minWidth: 360, maxWidth: .infinity)
                 TextField("Remote start path", text: $model.connectionDraft.remotePath)
-                EmptyView()
+                    .textFieldStyle(.roundedBorder)
+                    .frame(minWidth: 180, idealWidth: 260, maxWidth: 320)
             }
-            GridRow {
+
+            HStack(spacing: 12) {
                 Text("Remote permissions")
                     .foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .frame(width: 250, alignment: .leading)
                 Picker(
                     "Remote permissions",
                     selection: Binding(
@@ -2159,9 +2172,8 @@ struct ConnectionEditor: View {
                 }
                 .labelsHidden()
                 .pickerStyle(.segmented)
-                .gridCellColumns(4)
-                EmptyView()
-                EmptyView()
+                .frame(maxWidth: .infinity)
+                Spacer(minLength: 226)
             }
         }
         .padding(12)
