@@ -33,7 +33,29 @@ static int commit(const char *host, const char *path, unsigned char seed) {
     return volt_ssh_commit_host_key(host, 2222, path, key, sizeof(key), 6, error, sizeof(error));
 }
 
+static int write_text(const char *path, const char *text) {
+    FILE *file = fopen(path, "w");
+    if (!file) return -1;
+    int result = fputs(text, file) >= 0 ? 0 : -1;
+    fclose(file);
+    return result;
+}
+
+static int file_contains(const char *path, const char *expected) {
+    char buffer[64] = {0};
+    FILE *file = fopen(path, "r");
+    if (!file) return 0;
+    fgets(buffer, sizeof(buffer), file);
+    fclose(file);
+    return strcmp(buffer, expected) == 0;
+}
+
 int main(void) {
+    unsigned char secret[32];
+    memset(secret, 0xA5, sizeof(secret));
+    volt_secure_zero(secret, sizeof(secret));
+    for (size_t index = 0; index < sizeof(secret); index++) if (secret[index] != 0) return 13;
+
     char directory[] = "/tmp/VoltHostKeyTests.XXXXXX";
     if (!mkdtemp(directory)) return 1;
 
@@ -42,6 +64,21 @@ int main(void) {
     FILE *empty = fopen(known_hosts, "w");
     if (!empty) return 2;
     fclose(empty);
+
+    char destination[1024];
+    char first_temp[1024];
+    char second_temp[1024];
+    snprintf(destination, sizeof(destination), "%s/download.txt", directory);
+    snprintf(first_temp, sizeof(first_temp), "%s/first.part", directory);
+    snprintf(second_temp, sizeof(second_temp), "%s/second.part", directory);
+    if (write_text(destination, "original") != 0 || write_text(first_temp, "blocked") != 0) return 14;
+    if (volt_publish_download(first_temp, destination, 0) == 0) return 15;
+    if (!file_contains(destination, "original") || !file_contains(first_temp, "blocked")) return 16;
+    if (write_text(second_temp, "replacement") != 0) return 17;
+    if (volt_publish_download(second_temp, destination, 1) != 0) return 18;
+    if (!file_contains(destination, "replacement")) return 19;
+    unlink(first_temp);
+    unlink(destination);
 
     unsigned char first_key[51];
     unsigned char different_key[51];

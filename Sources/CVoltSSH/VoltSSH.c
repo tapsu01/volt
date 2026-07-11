@@ -430,6 +430,19 @@ void volt_ssh_free_buffer(void *buffer) {
     free(buffer);
 }
 
+void volt_secure_zero(void *buffer, size_t length) {
+    volatile unsigned char *bytes = (volatile unsigned char *)buffer;
+    while (length-- > 0) *bytes++ = 0;
+}
+
+int volt_publish_download(const char *temporary_path, const char *destination_path, int overwrite) {
+    if (!temporary_path || !destination_path) {
+        errno = EINVAL;
+        return -1;
+    }
+    return overwrite ? rename(temporary_path, destination_path) : renamex_np(temporary_path, destination_path, RENAME_EXCL);
+}
+
 static int open_session(const char *host, int port, const char *username, const char *password, const char *private_key_path, const char *known_hosts_path, VoltSession *out, char *error, size_t error_len) {
     memset(out, 0, sizeof(*out));
     out->sock = -1;
@@ -710,7 +723,7 @@ int volt_sftp_upload(const char *host, int port, const char *username, const cha
     return 0;
 }
 
-int volt_sftp_download(const char *host, int port, const char *username, const char *password, const char *private_key_path, const char *known_hosts_path, const char *remote_path, const char *local_path, VoltSFTPProgressCallback progress, void *progress_context, char *error, size_t error_len) {
+int volt_sftp_download(const char *host, int port, const char *username, const char *password, const char *private_key_path, const char *known_hosts_path, const char *remote_path, const char *local_path, int overwrite, VoltSFTPProgressCallback progress, void *progress_context, char *error, size_t error_len) {
     VoltSession session;
     if (open_session(host, port, username, password, private_key_path, known_hosts_path, &session, error, error_len) != 0) return -1;
     LIBSSH2_SFTP_HANDLE *file = libssh2_sftp_open(session.sftp, remote_path, LIBSSH2_FXF_READ, 0);
@@ -793,7 +806,8 @@ int volt_sftp_download(const char *host, int port, const char *username, const c
         close_session(&session);
         return -1;
     }
-    if (rename(temp_path, local_path) != 0) {
+    int publish_result = volt_publish_download(temp_path, local_path, overwrite);
+    if (publish_result != 0) {
         unlink(temp_path);
         libssh2_sftp_close(file);
         set_error(error, error_len, strerror(errno));

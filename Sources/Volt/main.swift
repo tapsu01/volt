@@ -294,6 +294,67 @@ final class CommandRunner: @unchecked Sendable {
     }
 }
 
+final class SensitiveCredential: @unchecked Sendable {
+    private let lock = NSLock()
+    private var bytes: [UInt8] = [0]
+
+    var isEmpty: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return bytes.count <= 1
+    }
+
+    func replace(with value: String) {
+        lock.lock()
+        defer { lock.unlock() }
+        zeroizeLocked()
+        bytes.removeAll(keepingCapacity: true)
+        bytes.reserveCapacity(value.utf8.count + 1)
+        bytes.append(contentsOf: value.utf8)
+        bytes.append(0)
+    }
+
+    func clone() -> SensitiveCredential {
+        let copy = SensitiveCredential()
+        lock.lock()
+        copy.bytes = bytes
+        lock.unlock()
+        return copy
+    }
+
+    func clear() {
+        lock.lock()
+        zeroizeLocked()
+        bytes = [0]
+        lock.unlock()
+    }
+
+    func withCString<T>(_ body: (UnsafePointer<CChar>?) throws -> T) rethrows -> T {
+        lock.lock()
+        defer { lock.unlock() }
+        guard bytes.count > 1 else { return try body(nil) }
+        return try bytes.withUnsafeBufferPointer { buffer in
+            try body(UnsafeRawPointer(buffer.baseAddress!).assumingMemoryBound(to: CChar.self))
+        }
+    }
+
+    private func zeroizeLocked() {
+        bytes.withUnsafeMutableBytes { rawBuffer in
+            guard let address = rawBuffer.baseAddress else { return }
+            volt_secure_zero(address, rawBuffer.count)
+        }
+    }
+
+    deinit {
+        clear()
+    }
+}
+
+enum DownloadPublishPolicy: Sendable {
+    case replace
+    case createNew
+}
+
 final class SecureStorage {
     private static let legacyKey = "connections"
 
@@ -509,11 +570,11 @@ final class SFTPClient: @unchecked Sendable {
         }.value
     }
 
-    func list(connection: SavedConnection, password: String, path: String) async throws -> [FileItem] {
+    func list(connection: SavedConnection, credential: SensitiveCredential, path: String) async throws -> [FileItem] {
         try await Task.detached {
             var items: UnsafeMutablePointer<VoltSFTPItem>?
             var count: Int32 = 0
-            _ = try self.call(connection: connection, password: password) { host, port, username, password, keyPath, knownHostsPath, error, errorLength in
+            _ = try self.call(connection: connection, credential: credential) { host, port, username, password, keyPath, knownHostsPath, error, errorLength in
                 volt_sftp_list(host, port, username, password, keyPath, knownHostsPath, path, &items, &count, error, errorLength)
             }
             defer {
@@ -549,53 +610,53 @@ final class SFTPClient: @unchecked Sendable {
         }.value
     }
 
-    func upload(connection: SavedConnection, password: String, localPath: String, remotePath: String, control: TransferControl) async throws -> String? {
+    func upload(connection: SavedConnection, credential: SensitiveCredential, localPath: String, remotePath: String, control: TransferControl) async throws -> String? {
         try await Task.detached {
             let context = Unmanaged.passRetained(control).toOpaque()
             defer { Unmanaged<TransferControl>.fromOpaque(context).release() }
-            return try self.call(connection: connection, password: password) { host, port, username, password, keyPath, knownHostsPath, error, errorLength in
+            return try self.call(connection: connection, credential: credential) { host, port, username, password, keyPath, knownHostsPath, error, errorLength in
                 volt_sftp_upload(host, port, username, password, keyPath, knownHostsPath, localPath, remotePath, connection.effectivePermissionPreset.fileMode, transferProgressCallback, context, error, errorLength)
             }
         }.value
     }
 
-    func download(connection: SavedConnection, password: String, remotePath: String, localPath: String, control: TransferControl) async throws {
+    func download(connection: SavedConnection, credential: SensitiveCredential, remotePath: String, localPath: String, policy: DownloadPublishPolicy, control: TransferControl) async throws {
         try await Task.detached {
             let context = Unmanaged.passRetained(control).toOpaque()
             defer { Unmanaged<TransferControl>.fromOpaque(context).release() }
-            _ = try self.call(connection: connection, password: password) { host, port, username, password, keyPath, knownHostsPath, error, errorLength in
-                volt_sftp_download(host, port, username, password, keyPath, knownHostsPath, remotePath, localPath, transferProgressCallback, context, error, errorLength)
+            _ = try self.call(connection: connection, credential: credential) { host, port, username, password, keyPath, knownHostsPath, error, errorLength in
+                volt_sftp_download(host, port, username, password, keyPath, knownHostsPath, remotePath, localPath, policy == .replace ? 1 : 0, transferProgressCallback, context, error, errorLength)
             }
         }.value
     }
 
-    func makeDirectory(connection: SavedConnection, password: String, path: String) async throws -> String? {
+    func makeDirectory(connection: SavedConnection, credential: SensitiveCredential, path: String) async throws -> String? {
         try await Task.detached {
-            try self.call(connection: connection, password: password) { host, port, username, password, keyPath, knownHostsPath, error, errorLength in
+            try self.call(connection: connection, credential: credential) { host, port, username, password, keyPath, knownHostsPath, error, errorLength in
                 volt_sftp_mkdir(host, port, username, password, keyPath, knownHostsPath, path, connection.effectivePermissionPreset.folderMode, error, errorLength)
             }
         }.value
     }
 
-    func createFile(connection: SavedConnection, password: String, remotePath: String) async throws -> String? {
+    func createFile(connection: SavedConnection, credential: SensitiveCredential, remotePath: String) async throws -> String? {
         try await Task.detached {
-            try self.call(connection: connection, password: password) { host, port, username, password, keyPath, knownHostsPath, error, errorLength in
+            try self.call(connection: connection, credential: credential) { host, port, username, password, keyPath, knownHostsPath, error, errorLength in
                 volt_sftp_create_empty_file(host, port, username, password, keyPath, knownHostsPath, remotePath, connection.effectivePermissionPreset.fileMode, error, errorLength)
             }
         }.value
     }
 
-    func rename(connection: SavedConnection, password: String, from: String, to: String) async throws {
+    func rename(connection: SavedConnection, credential: SensitiveCredential, from: String, to: String) async throws {
         try await Task.detached {
-            _ = try self.call(connection: connection, password: password) { host, port, username, password, keyPath, knownHostsPath, error, errorLength in
+            _ = try self.call(connection: connection, credential: credential) { host, port, username, password, keyPath, knownHostsPath, error, errorLength in
                 volt_sftp_rename(host, port, username, password, keyPath, knownHostsPath, from, to, error, errorLength)
             }
         }.value
     }
 
-    func remove(connection: SavedConnection, password: String, path: String, isDirectory: Bool) async throws {
+    func remove(connection: SavedConnection, credential: SensitiveCredential, path: String, isDirectory: Bool) async throws {
         try await Task.detached {
-            _ = try self.call(connection: connection, password: password) { host, port, username, password, keyPath, knownHostsPath, error, errorLength in
+            _ = try self.call(connection: connection, credential: credential) { host, port, username, password, keyPath, knownHostsPath, error, errorLength in
                 volt_sftp_remove(host, port, username, password, keyPath, knownHostsPath, path, isDirectory ? 1 : 0, error, errorLength)
             }
         }.value
@@ -612,7 +673,7 @@ final class SFTPClient: @unchecked Sendable {
 
     private func call(
         connection: SavedConnection,
-        password: String,
+        credential: SensitiveCredential,
         _ body: (UnsafePointer<CChar>, Int32, UnsafePointer<CChar>, UnsafePointer<CChar>?, UnsafePointer<CChar>?, UnsafePointer<CChar>, UnsafeMutablePointer<CChar>, Int) -> Int32
     ) throws -> String? {
         var error = [CChar](repeating: 0, count: 4096)
@@ -631,26 +692,17 @@ final class SFTPClient: @unchecked Sendable {
             if isAccessingKey { bookmarkedKeyURL?.stopAccessingSecurityScopedResource() }
         }
         let keyPath = (bookmarkedKeyURL?.path ?? connection.privateKeyPath).trimmingCharacters(in: .whitespacesAndNewlines)
-        let sanitizedPassword = password.trimmingCharacters(in: .newlines)
         let knownHostsPath = try AppPaths.knownHostsURL().path
-        let status = connection.host.withCString { host in
-            connection.username.withCString { username in
-                knownHostsPath.withCString { knownHostsPointer in
-                    error.withUnsafeMutableBufferPointer { errorBuffer in
-                        let errorPointer = errorBuffer.baseAddress!
-                        if keyPath.isEmpty {
-                            if sanitizedPassword.isEmpty {
-                                return body(host, Int32(connection.port), username, nil, nil, knownHostsPointer, errorPointer, errorLength)
+        let status = credential.withCString { passwordPointer in
+            connection.host.withCString { host in
+                connection.username.withCString { username in
+                    knownHostsPath.withCString { knownHostsPointer in
+                        error.withUnsafeMutableBufferPointer { errorBuffer in
+                            let errorPointer = errorBuffer.baseAddress!
+                            if keyPath.isEmpty {
+                                return body(host, Int32(connection.port), username, passwordPointer, nil, knownHostsPointer, errorPointer, errorLength)
                             }
-                            return sanitizedPassword.withCString { passwordPointer in
-                                body(host, Int32(connection.port), username, passwordPointer, nil, knownHostsPointer, errorPointer, errorLength)
-                            }
-                        }
-                        return keyPath.withCString { keyPointer in
-                            if sanitizedPassword.isEmpty {
-                                return body(host, Int32(connection.port), username, nil, keyPointer, knownHostsPointer, errorPointer, errorLength)
-                            }
-                            return sanitizedPassword.withCString { passwordPointer in
+                            return keyPath.withCString { keyPointer in
                                 body(host, Int32(connection.port), username, passwordPointer, keyPointer, knownHostsPointer, errorPointer, errorLength)
                             }
                         }
@@ -704,7 +756,7 @@ final class AppModel: ObservableObject {
     @Published var pendingHostKeyFingerprint = ""
     @Published var pendingHostKeyHost = ""
     private var hostKeyConfirmationContinuation: CheckedContinuation<Bool, Never>?
-    private var tabPasswords: [BrowserTab.ID: String] = [:]
+    private var tabCredentials: [BrowserTab.ID: SensitiveCredential] = [:]
     private var verifiedHosts: Set<String> = []
     private var remoteDirectoryCache: [String: [FileItem]] = [:]
 
@@ -720,7 +772,7 @@ final class AppModel: ObservableObject {
         selectedTabID = tabs.first?.id
         AppPaths.migrateFromSandboxContainerIfNeeded()
         SecureStorage.migrateFromUserDefaults()
-        AppPaths.cleanupEditFiles()
+        AppPaths.cleanupEditFiles(olderThan: 0)
         loadConnections()
         refreshLocal()
         syncCurrentTab()
@@ -744,11 +796,13 @@ final class AppModel: ObservableObject {
 
     func newTab() {
         syncCurrentTab()
+        let clonedCredential = credentialForCurrentTab().clone()
         var tab = BrowserTab()
         tab.localPath = localPath
         tab.localItems = localItems
         tab.title = "New Tab"
         tabs.append(tab)
+        tabCredentials[tab.id] = clonedCredential
         selectTab(tab.id)
     }
 
@@ -771,18 +825,17 @@ final class AppModel: ObservableObject {
             }
         } else {
             guard let connection = selectedConnection else { return }
-            let password = connectionPassword
+            let credential = credentialForCurrentTab().clone()
             let runner = CommandRunner()
             let executable = "/usr/bin/ssh"
-            let trimmedPassword = password.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard trimmedPassword.isEmpty else { return }
+            guard credential.isEmpty else { return }
             
             do {
                 let controlDir = try SFTPClient.controlSocketDir()
                 let knownHostsPath = try AppPaths.knownHostsURL().path
 
                 var args = [
-                    "-oBatchMode=\(trimmedPassword.isEmpty ? "yes" : "no")",
+                    "-oBatchMode=yes",
                     "-oStrictHostKeyChecking=yes",
                     "-oUserKnownHostsFile=\(knownHostsPath)",
                     "-oGlobalKnownHostsFile=/dev/null",
@@ -826,9 +879,10 @@ final class AppModel: ObservableObject {
     func closeTab(_ id: BrowserTab.ID) {
         guard tabs.count > 1 else { return }
         if let tab = tabs.first(where: { $0.id == id }) {
+            guard confirmDiscardEditSessions(tab.remoteEditSessions, action: "close this tab") else { return }
             cleanupEditSessions(tab.remoteEditSessions)
         }
-        tabPasswords.removeValue(forKey: id)
+        tabCredentials.removeValue(forKey: id)?.clear()
         let index = tabs.firstIndex { $0.id == id } ?? 0
         tabs.removeAll { $0.id == id }
         if selectedTabID == id {
@@ -864,12 +918,18 @@ final class AppModel: ObservableObject {
             showsConnectionEditor = false
             return
         }
+        if selectedConnectionID != connection.id {
+            guard confirmDiscardEditSessions(remoteEditSessions, action: "switch connections") else { return }
+            cleanupEditSessions(remoteEditSessions)
+            remoteEditSessions = []
+        }
         isSelectingConnection = true
         defer { isSelectingConnection = false }
 
         selectedConnectionID = connection.id
         connectionDraft = connection
         connectionPassword = ""
+        credentialForCurrentTab().clear()
         remotePath = connection.remotePath
         isConnected = false
         showsConnectionEditor = false
@@ -882,10 +942,16 @@ final class AppModel: ObservableObject {
     }
 
     func editConnection(_ connection: SavedConnection) {
+        if selectedConnectionID != connection.id {
+            guard confirmDiscardEditSessions(remoteEditSessions, action: "edit another connection") else { return }
+            cleanupEditSessions(remoteEditSessions)
+            remoteEditSessions = []
+        }
         isSuppressingSidebarSelection = true
         selectedConnectionID = connection.id
         connectionDraft = connection
         connectionPassword = ""
+        credentialForCurrentTab().clear()
         remotePath = connection.remotePath
         showsConnectionEditor = true
         syncCurrentTab()
@@ -924,6 +990,7 @@ final class AppModel: ObservableObject {
             return
         }
         remotePath = connectionDraft.remotePath.isEmpty ? "/" : connectionDraft.remotePath
+        capturePasswordInput()
         saveDraft()
         showsConnectionEditor = false
         syncCurrentTab()
@@ -931,13 +998,17 @@ final class AppModel: ObservableObject {
     }
 
     func newConnection() {
+        guard confirmDiscardEditSessions(remoteEditSessions, action: "create a new connection") else { return }
+        cleanupEditSessions(remoteEditSessions)
         connectionDraft = SavedConnection()
         connectionPassword = ""
+        credentialForCurrentTab().clear()
         selectedConnectionID = nil
         isConnected = false
         showsConnectionEditor = true
         showsPasswordPrompt = false
         remoteItems = []
+        remoteEditSessions = []
         selectedRemoteID = nil
         remotePath = "/"
         syncCurrentTab()
@@ -950,12 +1021,13 @@ final class AppModel: ObservableObject {
 
     func disconnectConnection(id: UUID? = nil) {
         if id == nil || selectedConnectionID == id {
+            guard confirmDiscardEditSessions(remoteEditSessions, action: "disconnect") else { return }
             cleanupEditSessions(remoteEditSessions)
             selectedConnectionID = nil
             connectionDraft = SavedConnection()
             connectionPassword = ""
             if let tabID = selectedTabID {
-                tabPasswords.removeValue(forKey: tabID)
+                tabCredentials.removeValue(forKey: tabID)?.clear()
             }
             remoteItems = []
             selectedRemoteID = nil
@@ -970,6 +1042,7 @@ final class AppModel: ObservableObject {
     }
 
     func connectWithPassword() {
+        capturePasswordInput()
         showsPasswordPrompt = false
         syncCurrentTab()
         refreshRemote()
@@ -978,10 +1051,16 @@ final class AppModel: ObservableObject {
     func cancelPasswordPrompt() {
         showsPasswordPrompt = false
         connectionPassword = ""
+        credentialForCurrentTab().clear()
         syncCurrentTab()
     }
 
     func removeConnection(id: UUID) {
+        if selectedConnectionID == id {
+            guard confirmDiscardEditSessions(remoteEditSessions, action: "remove this connection") else { return }
+            cleanupEditSessions(remoteEditSessions)
+            remoteEditSessions = []
+        }
         connections.removeAll { $0.id == id }
         disconnectConnection(id: id)
         saveConnections()
@@ -1050,10 +1129,23 @@ final class AppModel: ObservableObject {
             return
         }
         let path = remotePath
-        let password = connectionPassword
+        let credential = credentialForCurrentTab().clone()
+        let operationTabID = selectedTabID
         runBusy("Loading remote folder") {
-            try await self.verifyHostKey(for: connection)
-            let items = try await self.sftp.list(connection: connection, password: password, path: path)
+            let items: [FileItem]
+            do {
+                try await self.verifyHostKey(for: connection)
+                items = try await self.sftp.list(connection: connection, credential: credential, path: path)
+            } catch {
+                if self.isAuthenticationFailure(error) {
+                    await MainActor.run {
+                        if let operationTabID {
+                            self.tabCredentials.removeValue(forKey: operationTabID)?.clear()
+                        }
+                    }
+                }
+                throw error
+            }
             await MainActor.run {
                 guard self.selectedConnectionID == connection.id, self.remotePath == path else { return }
                 self.remoteItems = items
@@ -1154,7 +1246,7 @@ final class AppModel: ObservableObject {
 
     func uploadEditedRemoteFile(_ session: RemoteEditSession) {
         guard let connection = selectedConnection else { return }
-        let password = connectionPassword
+        let credential = credentialForCurrentTab().clone()
         let transferID = enqueue(direction: .upload, source: session.localPath, destination: session.remotePath)
         guard let control = transferControls[transferID] else { return }
         runBusy("Uploading edited file", transferID: transferID) {
@@ -1163,7 +1255,7 @@ final class AppModel: ObservableObject {
                 await MainActor.run { self.markTransfer(transferID, .running, "") }
                 return try await self.sftp.upload(
                     connection: connection,
-                    password: password,
+                    credential: credential,
                     localPath: session.localPath,
                     remotePath: session.remotePath,
                     control: control
@@ -1179,16 +1271,29 @@ final class AppModel: ObservableObject {
         }
     }
 
+    func discardRemoteEditSession(_ session: RemoteEditSession) {
+        let alert = NSAlert()
+        alert.messageText = "Discard changes to \"\(session.fileName)\"?"
+        alert.informativeText = "The local temporary copy will be permanently deleted."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Discard")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        remoteEditSessions.removeAll { $0.id == session.id }
+        cleanupEditSessions([session])
+        syncCurrentTab()
+    }
+
     private func upload(localPath: String, remotePath: String, refreshWhenDone: Bool) {
         guard let connection = selectedConnection else { return }
-        let password = connectionPassword
+        let credential = credentialForCurrentTab().clone()
         let transferID = enqueue(direction: .upload, source: localPath, destination: remotePath)
         guard let control = transferControls[transferID] else { return }
         runBusy("Uploading", transferID: transferID) {
             let warning = try await self.transferLimiter.withPermit {
                 guard !control.isCancelled else { throw AppError.commandFailed("Transfer cancelled.") }
                 await MainActor.run { self.markTransfer(transferID, .running, "") }
-                return try await self.sftp.upload(connection: connection, password: password, localPath: localPath, remotePath: remotePath, control: control)
+                return try await self.sftp.upload(connection: connection, credential: credential, localPath: localPath, remotePath: remotePath, control: control)
             }
             await MainActor.run {
                 self.markTransfer(transferID, .done, warning ?? "Uploaded")
@@ -1220,14 +1325,19 @@ final class AppModel: ObservableObject {
 
     private func download(remotePath: String, localPath: String, refreshWhenDone: Bool) {
         guard let connection = selectedConnection else { return }
-        let password = connectionPassword
-        let transferID = enqueue(direction: .download, source: remotePath, destination: localPath)
+        guard let resolution = resolveDownloadConflict(at: localPath) else {
+            status = "Download cancelled"
+            return
+        }
+        let credential = credentialForCurrentTab().clone()
+        let destination = resolution.path
+        let transferID = enqueue(direction: .download, source: remotePath, destination: destination)
         guard let control = transferControls[transferID] else { return }
         runBusy("Downloading", transferID: transferID) {
             try await self.transferLimiter.withPermit {
                 guard !control.isCancelled else { throw AppError.commandFailed("Transfer cancelled.") }
                 await MainActor.run { self.markTransfer(transferID, .running, "") }
-                try await self.sftp.download(connection: connection, password: password, remotePath: remotePath, localPath: localPath, control: control)
+                try await self.sftp.download(connection: connection, credential: credential, remotePath: remotePath, localPath: destination, policy: resolution.policy, control: control)
             }
             await MainActor.run {
                 self.markTransfer(transferID, .done, "Downloaded")
@@ -1235,6 +1345,39 @@ final class AppModel: ObservableObject {
                     self.refreshLocal()
                 }
             }
+        }
+    }
+
+    private func resolveDownloadConflict(at path: String) -> (path: String, policy: DownloadPublishPolicy)? {
+        guard FileManager.default.fileExists(atPath: path) else { return (path, .createNew) }
+        let alert = NSAlert()
+        alert.messageText = "A file named \"\(URL(fileURLWithPath: path).lastPathComponent)\" already exists."
+        alert.informativeText = "Choose whether to replace it or keep both files."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Replace")
+        alert.addButton(withTitle: "Keep Both")
+        alert.addButton(withTitle: "Cancel")
+        switch alert.runModal() {
+        case .alertFirstButtonReturn:
+            return (path, .replace)
+        case .alertSecondButtonReturn:
+            return (availableDownloadPath(for: path), .createNew)
+        default:
+            return nil
+        }
+    }
+
+    private func availableDownloadPath(for path: String) -> String {
+        let url = URL(fileURLWithPath: path)
+        let directory = url.deletingLastPathComponent()
+        let fileExtension = url.pathExtension
+        let baseName = fileExtension.isEmpty ? url.lastPathComponent : url.deletingPathExtension().lastPathComponent
+        var index = 2
+        while true {
+            let candidateName = fileExtension.isEmpty ? "\(baseName) \(index)" : "\(baseName) \(index).\(fileExtension)"
+            let candidate = directory.appendingPathComponent(candidateName).path
+            if !FileManager.default.fileExists(atPath: candidate) { return candidate }
+            index += 1
         }
     }
 
@@ -1267,9 +1410,9 @@ final class AppModel: ObservableObject {
         let name = prompt("New Remote Folder", defaultValue: "Untitled Folder", actionTitle: "Create")
         guard !name.isEmpty else { return }
         let path = joinRemote(remotePath, name)
-        let password = connectionPassword
+        let credential = credentialForCurrentTab().clone()
         runBusy("Creating folder") {
-            let warning = try await self.sftp.makeDirectory(connection: connection, password: password, path: path)
+            let warning = try await self.sftp.makeDirectory(connection: connection, credential: credential, path: path)
             await MainActor.run {
                 self.refreshRemote(finalStatus: warning ?? "Remote folder loaded")
             }
@@ -1281,9 +1424,9 @@ final class AppModel: ObservableObject {
         let name = prompt("New Remote File", defaultValue: "untitled.txt", actionTitle: "Create")
         guard !name.isEmpty else { return }
         let path = joinRemote(remotePath, name)
-        let password = connectionPassword
+        let credential = credentialForCurrentTab().clone()
         runBusy("Creating file") {
-            let warning = try await self.sftp.createFile(connection: connection, password: password, remotePath: path)
+            let warning = try await self.sftp.createFile(connection: connection, credential: credential, remotePath: path)
             await MainActor.run {
                 self.refreshRemote(finalStatus: warning ?? "Remote folder loaded")
             }
@@ -1305,7 +1448,7 @@ final class AppModel: ObservableObject {
         newTab.localItems = []
         newTab.selectedLocalID = nil
         tabs.append(newTab)
-        tabPasswords[newTab.id] = connectionPassword
+        tabCredentials[newTab.id] = credentialForCurrentTab().clone()
         selectTab(newTab.id)
     }
 
@@ -1350,7 +1493,7 @@ final class AppModel: ObservableObject {
         } ?? []
         newTab.selectedRemoteID = nil
         tabs.append(newTab)
-        tabPasswords[newTab.id] = connectionPassword
+        tabCredentials[newTab.id] = credentialForCurrentTab().clone()
         selectTab(newTab.id)
         refreshRemote()
     }
@@ -1359,17 +1502,16 @@ final class AppModel: ObservableObject {
         guard let connection = selectedConnection, let item = selectedRemote else { return }
         let newName = item.name + " copy"
         let newPath = joinRemote(remotePath, newName)
-        let password = connectionPassword
+        let credential = credentialForCurrentTab().clone()
         runBusy("Duplicating remote item") {
             // Using cp -r over SSH
             let runner = CommandRunner()
             let executable = "/usr/bin/ssh"
-            let trimmedPassword = password.trimmingCharacters(in: .newlines)
-            guard trimmedPassword.isEmpty else { throw AppError.unsupportedPasswordAuth }
+            guard credential.isEmpty else { throw AppError.unsupportedPasswordAuth }
             let controlDir = try SFTPClient.controlSocketDir()
             let knownHostsPath = try AppPaths.knownHostsURL().path
             var args = [
-                "-oBatchMode=\(trimmedPassword.isEmpty ? "yes" : "no")",
+                "-oBatchMode=yes",
                 "-oStrictHostKeyChecking=yes",
                 "-oUserKnownHostsFile=\(knownHostsPath)",
                 "-oGlobalKnownHostsFile=/dev/null",
@@ -1399,9 +1541,9 @@ final class AppModel: ObservableObject {
         guard !newName.isEmpty, newName != item.name else { return }
         
         let newPath = joinRemote(remotePath, newName)
-        let password = connectionPassword
+        let credential = credentialForCurrentTab().clone()
         runBusy("Moving remote item") {
-            try await self.sftp.rename(connection: connection, password: password, from: item.path, to: newPath)
+            try await self.sftp.rename(connection: connection, credential: credential, from: item.path, to: newPath)
             await MainActor.run {
                 self.selectedRemoteID = nil
                 self.refreshRemote()
@@ -1436,9 +1578,9 @@ final class AppModel: ObservableObject {
         alert.addButton(withTitle: "Delete")
         alert.addButton(withTitle: "Cancel")
         guard alert.runModal() == .alertFirstButtonReturn else { return }
-        let password = connectionPassword
+        let credential = credentialForCurrentTab().clone()
         runBusy("Deleting remote item") {
-            try await self.sftp.remove(connection: connection, password: password, path: item.path, isDirectory: item.isDirectory)
+            try await self.sftp.remove(connection: connection, credential: credential, path: item.path, isDirectory: item.isDirectory)
             await MainActor.run {
                 self.selectedRemoteID = nil
                 self.refreshRemote()
@@ -1479,9 +1621,9 @@ final class AppModel: ObservableObject {
         let newName = prompt("Rename Remote Item", defaultValue: item.name, actionTitle: "Rename")
         guard !newName.isEmpty, newName != item.name else { return }
         let destination = remoteParentPath(item.path).map { joinRemote($0, newName) } ?? joinRemote(remotePath, newName)
-        let password = connectionPassword
+        let credential = credentialForCurrentTab().clone()
         runBusy("Renaming remote item") {
-            try await self.sftp.rename(connection: connection, password: password, from: item.path, to: destination)
+            try await self.sftp.rename(connection: connection, credential: credential, from: item.path, to: destination)
             await MainActor.run {
                 self.selectedRemoteID = nil
                 self.refreshRemote()
@@ -1533,14 +1675,25 @@ final class AppModel: ObservableObject {
     }
 
     private func downloadForEdit(remoteItem: FileItem, localURL: URL, appURL: URL?, transferID: UUID) {
-        guard let connection = selectedConnection else { return }
-        let password = connectionPassword
-        guard let control = transferControls[transferID] else { return }
+        guard let connection = selectedConnection else {
+            try? FileManager.default.removeItem(at: localURL.deletingLastPathComponent())
+            return
+        }
+        let credential = credentialForCurrentTab().clone()
+        guard let control = transferControls[transferID] else {
+            try? FileManager.default.removeItem(at: localURL.deletingLastPathComponent())
+            return
+        }
         runBusy("Downloading file for edit", transferID: transferID) {
-            try await self.transferLimiter.withPermit {
-                guard !control.isCancelled else { throw AppError.commandFailed("Transfer cancelled.") }
-                await MainActor.run { self.markTransfer(transferID, .running, "") }
-                try await self.sftp.download(connection: connection, password: password, remotePath: remoteItem.path, localPath: localURL.path, control: control)
+            do {
+                try await self.transferLimiter.withPermit {
+                    guard !control.isCancelled else { throw AppError.commandFailed("Transfer cancelled.") }
+                    await MainActor.run { self.markTransfer(transferID, .running, "") }
+                    try await self.sftp.download(connection: connection, credential: credential, remotePath: remoteItem.path, localPath: localURL.path, policy: .createNew, control: control)
+                }
+            } catch {
+                try? FileManager.default.removeItem(at: localURL.deletingLastPathComponent())
+                throw error
             }
             await MainActor.run {
                 self.remoteEditSessions.insert(RemoteEditSession(remotePath: remoteItem.path, localPath: localURL.path, fileName: remoteItem.name), at: 0)
@@ -1571,6 +1724,17 @@ final class AppModel: ObservableObject {
             let fileURL = URL(fileURLWithPath: session.localPath)
             try? FileManager.default.removeItem(at: fileURL.deletingLastPathComponent())
         }
+    }
+
+    private func confirmDiscardEditSessions(_ sessions: [RemoteEditSession], action: String) -> Bool {
+        guard !sessions.isEmpty else { return true }
+        let alert = NSAlert()
+        alert.messageText = sessions.count == 1 ? "Discard the open remote edit?" : "Discard \(sessions.count) open remote edits?"
+        alert.informativeText = "To \(action), Volt must delete the local temporary copies. Upload any changes you want to keep first."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Discard & Continue")
+        alert.addButton(withTitle: "Cancel")
+        return alert.runModal() == .alertFirstButtonReturn
     }
 
     private func chooseApplication(for fileURL: URL) -> URL? {
@@ -1645,6 +1809,15 @@ final class AppModel: ObservableObject {
         transfers[index].message = "Cancelling…"
     }
 
+    func prepareForTermination() {
+        for control in transferControls.values { control.cancel() }
+        for credential in tabCredentials.values { credential.clear() }
+        tabCredentials.removeAll()
+        connectionPassword = ""
+        cleanupEditSessions(tabs.flatMap(\.remoteEditSessions) + remoteEditSessions)
+        AppPaths.cleanupEditFiles(olderThan: 0)
+    }
+
     private func prompt(_ title: String, defaultValue: String, actionTitle: String) -> String {
         let alert = NSAlert()
         alert.messageText = title
@@ -1688,6 +1861,25 @@ final class AppModel: ObservableObject {
         return nil
     }
 
+    private func credentialForCurrentTab() -> SensitiveCredential {
+        guard let selectedTabID else { return SensitiveCredential() }
+        if let credential = tabCredentials[selectedTabID] { return credential }
+        let credential = SensitiveCredential()
+        tabCredentials[selectedTabID] = credential
+        return credential
+    }
+
+    private func capturePasswordInput() {
+        let sanitized = connectionPassword.trimmingCharacters(in: .newlines)
+        credentialForCurrentTab().replace(with: sanitized)
+        connectionPassword = ""
+    }
+
+    nonisolated private func isAuthenticationFailure(_ error: Error) -> Bool {
+        let message = error.localizedDescription.lowercased()
+        return message.contains("authentication failed") || message.contains("password authentication") || message.contains("private key authentication")
+    }
+
     private func currentSessionTab(title: String) -> BrowserTab {
         BrowserTab(
             title: title,
@@ -1714,7 +1906,6 @@ final class AppModel: ObservableObject {
         guard !isRestoringTab, let selectedTabID, let index = tabs.firstIndex(where: { $0.id == selectedTabID }) else { return }
         tabs[index].connectionID = selectedConnectionID
         tabs[index].connectionDraft = connectionDraft
-        tabPasswords[selectedTabID] = connectionPassword
         tabs[index].localPath = localPath
         tabs[index].remotePath = remotePath
         tabs[index].localItems = localItems
@@ -1738,7 +1929,7 @@ final class AppModel: ObservableObject {
         isSuppressingSidebarSelection = true
         selectedConnectionID = tab.connectionID
         connectionDraft = tab.connectionDraft
-        connectionPassword = tabPasswords[tab.id] ?? ""
+        connectionPassword = ""
         localPath = tab.localPath
         remotePath = tab.remotePath
         localItems = tab.localItems
@@ -1893,6 +2084,9 @@ struct ContentView: View {
         }
         .sheet(isPresented: $model.showsHostKeyPrompt) {
             HostKeyVerificationView(model: model)
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)) { _ in
+            model.prepareForTermination()
         }
         .frame(minWidth: 1120, minHeight: 720)
     }
@@ -2819,11 +3013,16 @@ struct RemoteEditSessionsView: View {
                             .foregroundStyle(.secondary)
                     }
                     TableColumn("Action") { session in
-                        Button("Upload Edited") {
-                            model.uploadEditedRemoteFile(session)
+                        HStack(spacing: 8) {
+                            Button("Upload Edited") {
+                                model.uploadEditedRemoteFile(session)
+                            }
+                            Button("Discard") {
+                                model.discardRemoteEditSession(session)
+                            }
                         }
                     }
-                    .width(130)
+                    .width(210)
                 }
                 .frame(height: 90)
             }
