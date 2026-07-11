@@ -82,6 +82,7 @@ enum TransferState: String {
     case running = "Running"
     case done = "Done"
     case failed = "Failed"
+    case cancelled = "Cancelled"
 }
 
 struct TransferJob: Identifiable {
@@ -91,6 +92,47 @@ struct TransferJob: Identifiable {
     var destination: String
     var state: TransferState = .queued
     var message: String = ""
+    var transferredBytes: UInt64 = 0
+    var totalBytes: UInt64 = 0
+}
+
+actor TransferLimiter {
+    private var availablePermits: Int
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    init(limit: Int) {
+        availablePermits = max(1, limit)
+    }
+
+    func withPermit<T: Sendable>(_ operation: @Sendable () async throws -> T) async throws -> T {
+        await acquire()
+        do {
+            let value = try await operation()
+            release()
+            return value
+        } catch {
+            release()
+            throw error
+        }
+    }
+
+    private func acquire() async {
+        if availablePermits > 0 {
+            availablePermits -= 1
+            return
+        }
+        await withCheckedContinuation { continuation in
+            waiters.append(continuation)
+        }
+    }
+
+    private func release() {
+        if waiters.isEmpty {
+            availablePermits += 1
+        } else {
+            waiters.removeFirst().resume()
+        }
+    }
 }
 
 struct RemoteEditSession: Identifiable, Equatable {
@@ -207,6 +249,54 @@ final class SecureStorage {
         save(connections)
         UserDefaults.standard.removeObject(forKey: legacyKey)
     }
+}
+
+final class TransferControl: @unchecked Sendable {
+    private let lock = NSLock()
+    private var cancelled = false
+    private var lastProgressUpdate: TimeInterval = 0
+    private let progressHandler: @Sendable (UInt64, UInt64) -> Void
+
+    init(progressHandler: @escaping @Sendable (UInt64, UInt64) -> Void) {
+        self.progressHandler = progressHandler
+    }
+
+    func cancel() {
+        lock.lock()
+        cancelled = true
+        lock.unlock()
+    }
+
+    var isCancelled: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return cancelled
+    }
+
+    func report(transferred: UInt64, total: UInt64) -> Bool {
+        let now = Date.timeIntervalSinceReferenceDate
+        lock.lock()
+        let shouldReport = now - lastProgressUpdate >= 0.1 || (total > 0 && transferred >= total)
+        if shouldReport {
+            lastProgressUpdate = now
+        }
+        let shouldCancel = cancelled
+        lock.unlock()
+        if shouldReport {
+            progressHandler(transferred, total)
+        }
+        return shouldCancel
+    }
+}
+
+private func transferProgressCallback(
+    _ transferred: UInt64,
+    _ total: UInt64,
+    _ context: UnsafeMutableRawPointer?
+) -> Int32 {
+    guard let context else { return 0 }
+    let control = Unmanaged<TransferControl>.fromOpaque(context).takeUnretainedValue()
+    return control.report(transferred: transferred, total: total) ? 1 : 0
 }
 
 enum AppPaths {
@@ -375,18 +465,22 @@ final class SFTPClient: @unchecked Sendable {
         }.value
     }
 
-    func upload(connection: SavedConnection, password: String, localPath: String, remotePath: String) async throws -> String? {
+    func upload(connection: SavedConnection, password: String, localPath: String, remotePath: String, control: TransferControl) async throws -> String? {
         try await Task.detached {
-            try self.call(connection: connection, password: password) { host, port, username, password, keyPath, knownHostsPath, error, errorLength in
-                volt_sftp_upload(host, port, username, password, keyPath, knownHostsPath, localPath, remotePath, connection.effectivePermissionPreset.fileMode, error, errorLength)
+            let context = Unmanaged.passRetained(control).toOpaque()
+            defer { Unmanaged<TransferControl>.fromOpaque(context).release() }
+            return try self.call(connection: connection, password: password) { host, port, username, password, keyPath, knownHostsPath, error, errorLength in
+                volt_sftp_upload(host, port, username, password, keyPath, knownHostsPath, localPath, remotePath, connection.effectivePermissionPreset.fileMode, transferProgressCallback, context, error, errorLength)
             }
         }.value
     }
 
-    func download(connection: SavedConnection, password: String, remotePath: String, localPath: String) async throws {
+    func download(connection: SavedConnection, password: String, remotePath: String, localPath: String, control: TransferControl) async throws {
         try await Task.detached {
+            let context = Unmanaged.passRetained(control).toOpaque()
+            defer { Unmanaged<TransferControl>.fromOpaque(context).release() }
             _ = try self.call(connection: connection, password: password) { host, port, username, password, keyPath, knownHostsPath, error, errorLength in
-                volt_sftp_download(host, port, username, password, keyPath, knownHostsPath, remotePath, localPath, error, errorLength)
+                volt_sftp_download(host, port, username, password, keyPath, knownHostsPath, remotePath, localPath, transferProgressCallback, context, error, errorLength)
             }
         }.value
     }
@@ -525,6 +619,9 @@ final class AppModel: ObservableObject {
     private var remoteDirectoryCache: [String: [FileItem]] = [:]
 
     private let sftp = SFTPClient()
+    private let transferLimiter = TransferLimiter(limit: 3)
+    private var transferControls: [UUID: TransferControl] = [:]
+    private var activeOperationCount = 0
     private var isRestoringTab = false
     private var isSuppressingSidebarSelection = false
     private var isSelectingConnection = false
@@ -961,16 +1058,22 @@ final class AppModel: ObservableObject {
     func uploadEditedRemoteFile(_ session: RemoteEditSession) {
         guard let connection = selectedConnection else { return }
         let password = connectionPassword
-        enqueue(direction: .upload, source: session.localPath, destination: session.remotePath)
-        runBusy("Uploading edited file") {
-            let warning = try await self.sftp.upload(
-                connection: connection,
-                password: password,
-                localPath: session.localPath,
-                remotePath: session.remotePath
-            )
+        let transferID = enqueue(direction: .upload, source: session.localPath, destination: session.remotePath)
+        guard let control = transferControls[transferID] else { return }
+        runBusy("Uploading edited file", transferID: transferID) {
+            let warning = try await self.transferLimiter.withPermit {
+                guard !control.isCancelled else { throw AppError.commandFailed("Transfer cancelled.") }
+                await MainActor.run { self.markTransfer(transferID, .running, "") }
+                return try await self.sftp.upload(
+                    connection: connection,
+                    password: password,
+                    localPath: session.localPath,
+                    remotePath: session.remotePath,
+                    control: control
+                )
+            }
             await MainActor.run {
-                self.markLatestTransfer(.done, warning ?? "Uploaded edited file")
+                self.markTransfer(transferID, .done, warning ?? "Uploaded edited file")
                 self.remoteEditSessions.removeAll { $0.id == session.id }
                 self.cleanupEditSessions([session])
                 self.syncCurrentTab()
@@ -982,11 +1085,16 @@ final class AppModel: ObservableObject {
     private func upload(localPath: String, remotePath: String, refreshWhenDone: Bool) {
         guard let connection = selectedConnection else { return }
         let password = connectionPassword
-        enqueue(direction: .upload, source: localPath, destination: remotePath)
-        runBusy("Uploading") {
-            let warning = try await self.sftp.upload(connection: connection, password: password, localPath: localPath, remotePath: remotePath)
+        let transferID = enqueue(direction: .upload, source: localPath, destination: remotePath)
+        guard let control = transferControls[transferID] else { return }
+        runBusy("Uploading", transferID: transferID) {
+            let warning = try await self.transferLimiter.withPermit {
+                guard !control.isCancelled else { throw AppError.commandFailed("Transfer cancelled.") }
+                await MainActor.run { self.markTransfer(transferID, .running, "") }
+                return try await self.sftp.upload(connection: connection, password: password, localPath: localPath, remotePath: remotePath, control: control)
+            }
             await MainActor.run {
-                self.markLatestTransfer(.done, warning ?? "Uploaded")
+                self.markTransfer(transferID, .done, warning ?? "Uploaded")
                 if let warning { self.status = warning }
                 if refreshWhenDone {
                     self.refreshRemote()
@@ -1016,11 +1124,16 @@ final class AppModel: ObservableObject {
     private func download(remotePath: String, localPath: String, refreshWhenDone: Bool) {
         guard let connection = selectedConnection else { return }
         let password = connectionPassword
-        enqueue(direction: .download, source: remotePath, destination: localPath)
-        runBusy("Downloading") {
-            try await self.sftp.download(connection: connection, password: password, remotePath: remotePath, localPath: localPath)
+        let transferID = enqueue(direction: .download, source: remotePath, destination: localPath)
+        guard let control = transferControls[transferID] else { return }
+        runBusy("Downloading", transferID: transferID) {
+            try await self.transferLimiter.withPermit {
+                guard !control.isCancelled else { throw AppError.commandFailed("Transfer cancelled.") }
+                await MainActor.run { self.markTransfer(transferID, .running, "") }
+                try await self.sftp.download(connection: connection, password: password, remotePath: remotePath, localPath: localPath, control: control)
+            }
             await MainActor.run {
-                self.markLatestTransfer(.done, "Downloaded")
+                self.markTransfer(transferID, .done, "Downloaded")
                 if refreshWhenDone {
                     self.refreshLocal()
                 }
@@ -1318,18 +1431,23 @@ final class AppModel: ObservableObject {
             return
         }
         let localURL = directory.appendingPathComponent(item.name)
-        enqueue(direction: .edit, source: item.path, destination: localURL.path)
-        downloadForEdit(remoteItem: item, localURL: localURL, appURL: appURL)
+        let transferID = enqueue(direction: .edit, source: item.path, destination: localURL.path)
+        downloadForEdit(remoteItem: item, localURL: localURL, appURL: appURL, transferID: transferID)
     }
 
-    private func downloadForEdit(remoteItem: FileItem, localURL: URL, appURL: URL?) {
+    private func downloadForEdit(remoteItem: FileItem, localURL: URL, appURL: URL?, transferID: UUID) {
         guard let connection = selectedConnection else { return }
         let password = connectionPassword
-        runBusy("Downloading file for edit") {
-            try await self.sftp.download(connection: connection, password: password, remotePath: remoteItem.path, localPath: localURL.path)
+        guard let control = transferControls[transferID] else { return }
+        runBusy("Downloading file for edit", transferID: transferID) {
+            try await self.transferLimiter.withPermit {
+                guard !control.isCancelled else { throw AppError.commandFailed("Transfer cancelled.") }
+                await MainActor.run { self.markTransfer(transferID, .running, "") }
+                try await self.sftp.download(connection: connection, password: password, remotePath: remoteItem.path, localPath: localURL.path, control: control)
+            }
             await MainActor.run {
                 self.remoteEditSessions.insert(RemoteEditSession(remotePath: remoteItem.path, localPath: localURL.path, fileName: remoteItem.name), at: 0)
-                self.markLatestTransfer(.done, "Opened for edit")
+                self.markTransfer(transferID, .done, "Opened for edit")
                 self.status = "Editing \(remoteItem.name). Save in editor, then click Upload Edited."
                 self.openFile(localURL, with: appURL)
             }
@@ -1370,29 +1488,64 @@ final class AppModel: ObservableObject {
         return panel.runModal() == .OK ? panel.url : nil
     }
 
-    private func runBusy(_ label: String, operation: @escaping @Sendable () async throws -> Void) {
+    private func runBusy(_ label: String, transferID: UUID? = nil, operation: @escaping @Sendable () async throws -> Void) {
+        activeOperationCount += 1
         isBusy = true
         status = label
         Task {
             do {
                 try await operation()
             } catch {
-                markLatestTransfer(.failed, error.localizedDescription)
+                if let transferID {
+                    let wasCancelled = transferControls[transferID]?.isCancelled == true
+                    markTransfer(
+                        transferID,
+                        wasCancelled ? .cancelled : .failed,
+                        wasCancelled ? "Cancelled" : error.localizedDescription
+                    )
+                }
                 status = error.localizedDescription
             }
-            isBusy = false
+            activeOperationCount = max(0, activeOperationCount - 1)
+            isBusy = activeOperationCount > 0
         }
     }
 
-    private func enqueue(direction: TransferDirection, source: String, destination: String) {
-        transfers.insert(TransferJob(direction: direction, source: source, destination: destination, state: .running), at: 0)
+    @discardableResult
+    private func enqueue(direction: TransferDirection, source: String, destination: String) -> UUID {
+        let job = TransferJob(direction: direction, source: source, destination: destination, state: .queued)
+        let control = TransferControl { [weak self] transferred, total in
+            Task { @MainActor [weak self] in
+                self?.updateTransferProgress(job.id, transferred: transferred, total: total)
+            }
+        }
+        transferControls[job.id] = control
+        transfers.insert(job, at: 0)
         showsTransfers = true
+        return job.id
     }
 
-    private func markLatestTransfer(_ state: TransferState, _ message: String) {
-        guard !transfers.isEmpty else { return }
-        transfers[0].state = state
-        transfers[0].message = message
+    private func markTransfer(_ id: UUID, _ state: TransferState, _ message: String) {
+        guard let index = transfers.firstIndex(where: { $0.id == id }) else { return }
+        transfers[index].state = state
+        transfers[index].message = message
+        if state == .done || state == .failed || state == .cancelled {
+            transferControls.removeValue(forKey: id)
+        }
+    }
+
+    private func updateTransferProgress(_ id: UUID, transferred: UInt64, total: UInt64) {
+        guard let index = transfers.firstIndex(where: { $0.id == id }) else { return }
+        transfers[index].transferredBytes = transferred
+        transfers[index].totalBytes = total
+    }
+
+    func cancelTransfer(_ id: UUID) {
+        guard let control = transferControls[id],
+              let index = transfers.firstIndex(where: { $0.id == id }),
+              transfers[index].state == .queued || transfers[index].state == .running else { return }
+        control.cancel()
+        transfers[index].message = "Cancelling…"
     }
 
     private func prompt(_ title: String, defaultValue: String, actionTitle: String) -> String {
@@ -2375,7 +2528,29 @@ struct TransferQueueView: View {
                     TableColumn("Source") { Text($0.source).lineLimit(1) }
                     TableColumn("Destination") { Text($0.destination).lineLimit(1) }
                     TableColumn("State") { Text($0.state.rawValue) }.width(80)
+                    TableColumn("Progress") { job in
+                        if job.totalBytes > 0 {
+                            let fraction = min(1, Double(job.transferredBytes) / Double(job.totalBytes))
+                            VStack(alignment: .leading, spacing: 2) {
+                                ProgressView(value: fraction)
+                                Text("\(Int(fraction * 100))% · \(ByteCountFormatter.string(fromByteCount: Int64(job.transferredBytes), countStyle: .file)) / \(ByteCountFormatter.string(fromByteCount: Int64(job.totalBytes), countStyle: .file))")
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(1)
+                            }
+                        } else if job.transferredBytes > 0 {
+                            Text(ByteCountFormatter.string(fromByteCount: Int64(job.transferredBytes), countStyle: .file))
+                        } else {
+                            Text("—").foregroundStyle(.secondary)
+                        }
+                    }.width(min: 150, ideal: 210)
                     TableColumn("Message") { Text($0.message).lineLimit(1) }
+                    TableColumn("") { job in
+                        Button("Cancel") {
+                            model.cancelTransfer(job.id)
+                        }
+                        .disabled(job.state != .queued && job.state != .running)
+                    }.width(70)
                 }
                 .frame(height: 140)
             }
