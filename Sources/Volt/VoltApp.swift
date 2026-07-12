@@ -2273,9 +2273,14 @@ struct SessionTabBar: View {
         HStack(spacing: 0) {
             ScrollViewReader { proxy in
             ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 8) {
-                    ForEach(Array(model.tabs.enumerated()), id: \.element.id) { _, tab in
+                HStack(spacing: 0) {
+                    ForEach(Array(model.tabs.enumerated()), id: \.element.id) { index, tab in
                         let isActive = tab.id == model.selectedTabID
+                        if index > 0 {
+                            Rectangle()
+                                .fill(VoltTheme.hairline)
+                                .frame(width: 1, height: barHeight)
+                        }
                         Button {
                             model.selectTab(tab.id)
                         } label: {
@@ -2292,17 +2297,10 @@ struct SessionTabBar: View {
                                     }
                                 }
                             }
-                            .padding(.horizontal, 11)
+                            .padding(.horizontal, 12)
                             .frame(width: tabWidth)
-                            .frame(height: 26)
-                            .background(
-                                RoundedRectangle(cornerRadius: 7)
-                                    .fill(isActive ? VoltTheme.selectedFill : Color.clear)
-                            )
-                            .overlay(
-                                RoundedRectangle(cornerRadius: 7)
-                                    .stroke(isActive ? Color.accentColor.opacity(0.18) : Color.clear)
-                            )
+                            .frame(height: barHeight)
+                            .background(isActive ? VoltTheme.selectedFill : Color.clear)
                             .contentShape(Rectangle())
                         }
                         .buttonStyle(.plain)
@@ -2325,8 +2323,6 @@ struct SessionTabBar: View {
                         }
                     }
                 }
-                .padding(.horizontal, 12)
-                .padding(.vertical, 4)
                 .frame(height: barHeight)
             }
             .frame(height: barHeight)
@@ -2338,6 +2334,9 @@ struct SessionTabBar: View {
                 }
             }
             }
+            Rectangle()
+                .fill(VoltTheme.hairline)
+                .frame(width: 1, height: barHeight)
             Button(action: model.newTab) {
                 Image(systemName: "plus")
                     .frame(width: 30, height: 30)
