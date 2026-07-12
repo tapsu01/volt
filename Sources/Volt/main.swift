@@ -2130,6 +2130,13 @@ struct ContentView: View {
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)) { _ in
             model.prepareForTermination()
         }
+        .onChange(of: model.isConnected) { _, connected in
+            // Ket noi xong thi thu sidebar de nhuong cho cho vung file; ngat ket noi thi hien lai.
+            // Nut sidebar.left tren topBar van cho phep bung lai giua chung de doi server.
+            withAnimation(.easeInOut(duration: 0.16)) {
+                showsSidebar = !connected
+            }
+        }
         .frame(minWidth: 1120, minHeight: 720)
     }
 
@@ -2198,6 +2205,7 @@ struct SessionTabBar: View {
 
     var body: some View {
         HStack(spacing: 0) {
+            ScrollViewReader { proxy in
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 0) {
                     ForEach(Array(model.tabs.enumerated()), id: \.element.id) { _, tab in
@@ -2233,9 +2241,25 @@ struct SessionTabBar: View {
                             Divider()
                             Button("Duplicate Tab") { model.duplicateTab(tab.id) }
                         }
+                        .id(tab.id)
+                        .onAppear {
+                            // Tab vua tao chi cuon khi that su tran khoi vung nhin. onAppear chay SAU
+                            // layout nen contentSize da du -> scrollTo dat dung, khong bi hut.
+                            if tab.id == model.selectedTabID {
+                                proxy.scrollTo(tab.id, anchor: .trailing)
+                            }
+                        }
                     }
                 }
                 .frame(height: barHeight)
+            }
+            // Chon mot tab dang khuat -> cuon tab do vao tam nhin.
+            .onChange(of: model.selectedTabID) { _, id in
+                guard let id else { return }
+                withAnimation(.easeInOut(duration: 0.16)) {
+                    proxy.scrollTo(id, anchor: .trailing)
+                }
+            }
             }
             Divider()
             Button(action: model.newTab) {
@@ -2506,7 +2530,44 @@ struct BrowserSplitView: View {
     @ObservedObject var model: AppModel
 
     var body: some View {
-        HSplitView {
+        // Chua ket noi: chi hien Local full-width + CTA connect. Ket noi xong moi tach doi Local | Remote.
+        if model.isConnected {
+            HSplitView {
+                localPane
+                remotePane
+            }
+        } else {
+            VStack(spacing: 0) {
+                localPane
+                Divider()
+                connectCallToAction
+            }
+        }
+    }
+
+    private var connectCallToAction: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "bolt.horizontal.circle")
+                .font(.system(size: 18))
+                .foregroundStyle(.secondary)
+            Text("Chưa kết nối server — điền thông tin phía trên rồi bấm Connect để xem file remote.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .lineLimit(2)
+            Spacer(minLength: 8)
+            Button {
+                model.showConnectionEditor()
+            } label: {
+                Label("Connect", systemImage: "bolt.horizontal")
+            }
+            .buttonStyle(.borderedProminent)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 12)
+        .frame(maxWidth: .infinity)
+    }
+
+    private var localPane: some View {
             FilePane(
                 title: "Local",
                 path: $model.localPath,
@@ -2599,6 +2660,9 @@ struct BrowserSplitView: View {
                     Button("Refresh", action: model.refreshLocal)
                 }
             )
+    }
+
+    private var remotePane: some View {
             FilePane(
                 title: "Remote",
                 path: $model.remotePath,
@@ -2702,7 +2766,6 @@ struct BrowserSplitView: View {
                     Button("Refresh", action: model.refreshRemote)
                 }
             )
-        }
     }
 }
 
