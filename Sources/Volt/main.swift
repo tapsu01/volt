@@ -912,6 +912,44 @@ final class AppModel: ObservableObject {
         }
     }
 
+    func duplicateTab(_ id: BrowserTab.ID) {
+        syncCurrentTab()
+        guard let tab = tabs.first(where: { $0.id == id }) else { return }
+        // Ban sao khong mang theo remoteEditSessions (tro toi file tam khong the dung chung).
+        let copy = BrowserTab(
+            title: tab.title,
+            connectionID: tab.connectionID,
+            connectionDraft: tab.connectionDraft,
+            localPath: tab.localPath,
+            remotePath: tab.remotePath,
+            localItems: tab.localItems,
+            remoteItems: tab.remoteItems,
+            selectedLocalID: tab.selectedLocalID,
+            selectedRemoteID: tab.selectedRemoteID,
+            remoteEditSessions: [],
+            isConnected: tab.isConnected,
+            showsConnectionEditor: tab.showsConnectionEditor,
+            showsInspector: tab.showsInspector
+        )
+        tabs.append(copy)
+        tabCredentials[copy.id] = tabCredentials[id]?.clone() ?? SensitiveCredential()
+        selectTab(copy.id)
+    }
+
+    func closeOtherTabs(keeping id: BrowserTab.ID) {
+        syncCurrentTab()
+        guard tabs.contains(where: { $0.id == id }) else { return }
+        let others = tabs.filter { $0.id != id }
+        guard !others.isEmpty else { return }
+        guard confirmDiscardEditSessions(others.flatMap(\.remoteEditSessions), action: "close other tabs") else { return }
+        if selectedTabID != id { selectTab(id) }
+        for tab in others {
+            cleanupEditSessions(tab.remoteEditSessions)
+            tabCredentials.removeValue(forKey: tab.id)?.clear()
+        }
+        tabs.removeAll { $0.id != id }
+    }
+
     func selectTab(_ id: BrowserTab.ID) {
         guard tabs.contains(where: { $0.id == id }) else { return }
         syncCurrentTab()
@@ -2047,69 +2085,38 @@ final class AppModel: ObservableObject {
 struct ContentView: View {
     @StateObject private var model = AppModel()
     @State private var showsSidebar = true
-    @State private var detailLeadingEdge: CGFloat = 260
-    @State private var toolbarLeadingEdge: CGFloat = 80
 
     var body: some View {
-        HSplitView {
-            if showsSidebar {
-                SidebarView(model: model)
-                    .frame(minWidth: 220, idealWidth: 260, maxWidth: 320, maxHeight: .infinity)
-            }
-
-            VStack(spacing: 0) {
-                if model.selectedConnection == nil || model.showsConnectionEditor {
-                    ConnectionEditor(model: model)
-                    Divider()
-                } else {
-                    ConnectionSummaryView(model: model)
-                    Divider()
+        VStack(spacing: 0) {
+            topBar
+            Divider()
+            HSplitView {
+                if showsSidebar {
+                    SidebarView(model: model)
+                        .frame(minWidth: 220, idealWidth: 260, maxWidth: 320, maxHeight: .infinity)
                 }
-                BrowserSplitView(model: model)
-                Divider()
-                RemoteEditSessionsView(model: model)
-                TransferQueueView(model: model)
-                StatusBar(model: model)
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .background(HorizontalPositionReader(leadingEdge: $detailLeadingEdge))
-        }
-        .toolbar {
-            ToolbarItem(placement: .navigation) {
-                ZStack(alignment: .leading) {
-                    HorizontalPositionReader(leadingEdge: $toolbarLeadingEdge)
-                        .frame(width: 1, height: 1)
 
-                    Button {
-                        withAnimation(.easeInOut(duration: 0.16)) {
-                            showsSidebar.toggle()
-                        }
-                    } label: {
-                        Image(systemName: "sidebar.left")
-                            .font(.system(size: 16, weight: .medium))
-                            .frame(width: 28, height: 28)
+                VStack(spacing: 0) {
+                    if model.selectedConnection == nil || model.showsConnectionEditor {
+                        ConnectionEditor(model: model)
+                        Divider()
+                    } else {
+                        ConnectionSummaryView(model: model)
+                        Divider()
                     }
-                    .buttonStyle(.plain)
-                    .help(showsSidebar ? "Hide Sidebar" : "Show Sidebar")
-
-                    SessionTabBar(model: model)
-                        .offset(x: max(36, detailLeadingEdge - toolbarLeadingEdge))
+                    BrowserSplitView(model: model)
+                    Divider()
+                    RemoteEditSessionsView(model: model)
+                    TransferQueueView(model: model)
+                    StatusBar(model: model)
                 }
-                .frame(width: 760, height: 32, alignment: .leading)
-            }
-
-            ToolbarItem(placement: .principal) {
-                Color.clear
-                    .frame(minWidth: 1, maxWidth: .infinity)
-            }
-
-            ToolbarItem(placement: .primaryAction) {
-                Button(action: { model.showsInspector.toggle() }) {
-                    Image(systemName: model.showsInspector ? "info.circle.fill" : "info.circle")
-                }
-                .help("Toggle Inspector")
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .clipped()
             }
         }
+        // Cho noi dung tran len vung titlebar de topBar va traffic lights chung mot hang
+        // (khong bi day xuong thanh 2 dong).
+        .ignoresSafeArea(.container, edges: .top)
         .background(WindowConfigurator())
         .inspector(isPresented: $model.showsInspector) {
             InspectorView(model: model)
@@ -2125,57 +2132,37 @@ struct ContentView: View {
         }
         .frame(minWidth: 1120, minHeight: 720)
     }
-}
 
-private struct HorizontalPositionReader: NSViewRepresentable {
-    @Binding var leadingEdge: CGFloat
+    // Thanh chrome tu dung thay cho .toolbar he thong: dat tren HSplitView nen tab
+    // (SessionTabBar) khong the de len sidebar (sidebar nam o hang duoi). Khong can do toa do.
+    private var topBar: some View {
+        HStack(spacing: 8) {
+            Button {
+                withAnimation(.easeInOut(duration: 0.16)) {
+                    showsSidebar.toggle()
+                }
+            } label: {
+                Image(systemName: "sidebar.left")
+                    .font(.system(size: 16, weight: .medium))
+                    .frame(width: 28, height: 28)
+            }
+            .buttonStyle(.plain)
+            .help(showsSidebar ? "Hide Sidebar" : "Show Sidebar")
 
-    func makeNSView(context: Context) -> DetailEdgeTrackingView {
-        let view = DetailEdgeTrackingView()
-        view.onPositionChange = updateLeadingEdge
-        return view
-    }
+            SessionTabBar(model: model)
 
-    func updateNSView(_ nsView: DetailEdgeTrackingView, context: Context) {
-        nsView.onPositionChange = updateLeadingEdge
-        nsView.reportPosition()
-    }
-
-    private func updateLeadingEdge(_ value: CGFloat) {
-        guard value >= 0, abs(leadingEdge - value) > 0.5 else { return }
-        leadingEdge = value
-    }
-}
-
-private final class DetailEdgeTrackingView: NSView {
-    var onPositionChange: ((CGFloat) -> Void)?
-
-    override func viewDidMoveToWindow() {
-        super.viewDidMoveToWindow()
-        reportPosition()
-    }
-
-    override func setFrameOrigin(_ newOrigin: NSPoint) {
-        super.setFrameOrigin(newOrigin)
-        reportPosition()
-    }
-
-    override func setFrameSize(_ newSize: NSSize) {
-        super.setFrameSize(newSize)
-        reportPosition()
-    }
-
-    override func layout() {
-        super.layout()
-        reportPosition()
-    }
-
-    func reportPosition() {
-        guard let contentView = window?.contentView else { return }
-        let leadingEdge = convert(bounds.origin, to: contentView).x
-        DispatchQueue.main.async { [weak self] in
-            self?.onPositionChange?(leadingEdge)
+            Button(action: { model.showsInspector.toggle() }) {
+                Image(systemName: model.showsInspector ? "info.circle.fill" : "info.circle")
+                    .font(.system(size: 15, weight: .medium))
+                    .frame(width: 28, height: 28)
+            }
+            .buttonStyle(.plain)
+            .help("Toggle Inspector")
         }
+        .padding(.leading, 80)   // chua cho cho den giao thong (traffic lights)
+        .padding(.trailing, 12)
+        .frame(height: 28)       // khop chieu cao titlebar he thong de can giua trung tam voi traffic lights
+        .frame(maxWidth: .infinity)
     }
 }
 
@@ -2206,42 +2193,79 @@ private struct WindowConfigurator: NSViewRepresentable {
 
 struct SessionTabBar: View {
     @ObservedObject var model: AppModel
+    private let tabWidth: CGFloat = 180
+    private let barHeight: CGFloat = 28
 
     var body: some View {
-        HStack(spacing: 6) {
-            ForEach(model.tabs) { tab in
-                Button {
-                    model.selectTab(tab.id)
-                } label: {
-                    HStack(spacing: 6) {
-                        Image(systemName: tab.isConnected ? "bolt.horizontal.fill" : "folder")
-                        Text(tab.title)
-                            .lineLimit(1)
-                        if model.tabs.count > 1 {
-                            Image(systemName: "xmark")
-                                .font(.caption)
-                                .onTapGesture {
-                                    model.closeTab(tab.id)
+        HStack(spacing: 0) {
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 0) {
+                    ForEach(Array(model.tabs.enumerated()), id: \.element.id) { _, tab in
+                        let isActive = tab.id == model.selectedTabID
+                        Divider()
+                        Button {
+                            model.selectTab(tab.id)
+                        } label: {
+                            HStack(spacing: 6) {
+                                Image(systemName: tab.isConnected ? "bolt.horizontal.fill" : "folder")
+                                Text(tab.title)
+                                    .lineLimit(1)
+                                Spacer(minLength: 6)
+                                if model.tabs.count > 1 {
+                                    TabCloseButton {
+                                        model.closeTab(tab.id)
+                                    }
                                 }
+                            }
+                            .padding(.horizontal, 10)
+                            .frame(width: tabWidth)
+                            .frame(maxHeight: .infinity)
+                            .background(isActive ? Color.primary.opacity(0.1) : Color.clear)
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .contextMenu {
+                            Button("New Tab") { model.newTab() }
+                            Button("Close Tab") { model.closeTab(tab.id) }
+                                .disabled(model.tabs.count <= 1)
+                            Button("Close Other Tabs") { model.closeOtherTabs(keeping: tab.id) }
+                                .disabled(model.tabs.count <= 1)
+                            Divider()
+                            Button("Duplicate Tab") { model.duplicateTab(tab.id) }
                         }
                     }
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 6)
-                    .frame(maxWidth: 180)
-                    .background(model.selectedTabID == tab.id ? Color.accentColor.opacity(0.25) : Color.clear)
-                    .clipShape(RoundedRectangle(cornerRadius: 6))
                 }
-                .buttonStyle(.plain)
+                .frame(height: barHeight)
             }
+            Divider()
             Button(action: model.newTab) {
                 Image(systemName: "plus")
-                    .padding(6)
+                    .frame(width: 28, height: 28)
             }
             .buttonStyle(.plain)
             .help("New tab")
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 3)
+        .frame(maxHeight: .infinity)
+        .padding(.leading, 8)
+    }
+}
+
+/// Nut dong tab: hien nen bo tron khi ro chuot vao de user biet dang tro dung nut close.
+private struct TabCloseButton: View {
+    var action: () -> Void
+    @State private var isHovering = false
+
+    var body: some View {
+        Image(systemName: "xmark")
+            .font(.caption)
+            .frame(width: 18, height: 18)
+            .background(
+                RoundedRectangle(cornerRadius: 4)
+                    .fill(isHovering ? Color.primary.opacity(0.18) : Color.clear)
+            )
+            .contentShape(Rectangle())
+            .onHover { isHovering = $0 }
+            .onTapGesture(perform: action)
     }
 }
 
@@ -2339,13 +2363,13 @@ struct ConnectionEditor: View {
             HStack(spacing: 12) {
                 TextField("Name", text: $model.connectionDraft.name)
                     .textFieldStyle(.roundedBorder)
-                    .frame(minWidth: 140, idealWidth: 190)
+                    .frame(minWidth: 90, idealWidth: 190)
                 TextField("Host", text: $model.connectionDraft.host)
                     .textFieldStyle(.roundedBorder)
-                    .frame(minWidth: 140, idealWidth: 190)
+                    .frame(minWidth: 90, idealWidth: 190)
                 TextField("User", text: $model.connectionDraft.username)
                     .textFieldStyle(.roundedBorder)
-                    .frame(minWidth: 140, idealWidth: 190)
+                    .frame(minWidth: 90, idealWidth: 190)
                 TextField("Port", value: $model.connectionDraft.port, format: .number)
                     .textFieldStyle(.roundedBorder)
                     .frame(width: 72)
@@ -2355,7 +2379,7 @@ struct ConnectionEditor: View {
                     }
                 }
                 .labelsHidden()
-                .frame(minWidth: 130, idealWidth: 160, maxWidth: 180)
+                .frame(minWidth: 100, idealWidth: 160, maxWidth: 180)
                 if model.selectedConnection != nil {
                     Button(action: model.hideConnectionEditor) { Label("Cancel", systemImage: "xmark.circle") }
                 }
@@ -2367,7 +2391,7 @@ struct ConnectionEditor: View {
             HStack(spacing: 12) {
                 SecureField("Password or key passphrase (not saved)", text: $model.connectionPassword)
                     .textFieldStyle(.roundedBorder)
-                    .frame(minWidth: 280, maxWidth: .infinity)
+                    .frame(minWidth: 150, maxWidth: .infinity)
                 HStack(spacing: 6) {
                     TextField("Private key", text: $model.connectionDraft.privateKeyPath)
                         .textFieldStyle(.roundedBorder)
@@ -2377,16 +2401,16 @@ struct ConnectionEditor: View {
                     }
                     .help("Choose SSH private key")
                 }
-                .frame(minWidth: 360, maxWidth: .infinity)
+                .frame(minWidth: 200, maxWidth: .infinity)
                 TextField("Remote start path", text: $model.connectionDraft.remotePath)
                     .textFieldStyle(.roundedBorder)
-                    .frame(minWidth: 180, idealWidth: 260, maxWidth: 320)
+                    .frame(minWidth: 120, idealWidth: 260, maxWidth: 320)
             }
 
             HStack(spacing: 12) {
                 Text("Remote permissions")
                     .foregroundStyle(.secondary)
-                    .frame(width: 250, alignment: .leading)
+                    .frame(minWidth: 120, alignment: .leading)
                 Picker(
                     "Remote permissions",
                     selection: Binding(
@@ -2402,7 +2426,7 @@ struct ConnectionEditor: View {
                 .labelsHidden()
                 .pickerStyle(.segmented)
                 .frame(maxWidth: .infinity)
-                Spacer(minLength: 226)
+                Spacer(minLength: 0)
             }
         }
         .padding(12)
@@ -2747,7 +2771,7 @@ struct FilePane<ToolbarContent: View, ContextMenuContent: View, BackgroundContex
 
     private var listHeader: some View {
         HStack(spacing: 12) {
-            headerButton("Name", field: .name).frame(minWidth: 180, maxWidth: .infinity, alignment: .leading)
+            headerButton("Name", field: .name).frame(minWidth: 120, maxWidth: .infinity, alignment: .leading)
             ForEach(preferences.visibleColumns) { column in
                 headerButton(column.rawValue, field: sortField(for: column)).frame(width: column.width, alignment: .leading)
             }
@@ -2759,7 +2783,7 @@ struct FilePane<ToolbarContent: View, ContextMenuContent: View, BackgroundContex
     private func listRow(_ item: FileItem, index: Int) -> some View {
         HStack(spacing: 12) {
             Label(item.name, systemImage: item.isDirectory ? "folder" : "doc")
-                .lineLimit(1).frame(minWidth: 180, maxWidth: .infinity, alignment: .leading)
+                .lineLimit(1).frame(minWidth: 120, maxWidth: .infinity, alignment: .leading)
             ForEach(preferences.visibleColumns) { column in
                 Text(text(for: column, item: item)).foregroundStyle(selection == item.id ? Color.white.opacity(0.9) : Color.secondary)
                     .frame(width: column.width, alignment: .leading).lineLimit(1)
