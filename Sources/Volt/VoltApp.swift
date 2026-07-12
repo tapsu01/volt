@@ -178,6 +178,8 @@ struct TransferJob: Identifiable {
     var message: String = ""
     var transferredBytes: UInt64 = 0
     var totalBytes: UInt64 = 0
+    var startedAt: Date?
+    var updatedAt: Date?
 }
 
 actor TransferLimiter {
@@ -240,8 +242,31 @@ struct BrowserTab: Identifiable, Equatable {
     var selectedRemoteID: FileItem.ID?
     var remoteEditSessions: [RemoteEditSession] = []
     var isConnected = false
-    var showsConnectionEditor = true
+    var showsConnectionEditor = false
     var showsInspector = false
+}
+
+enum AppAppearance: String {
+    case light
+    case dark
+
+    var colorScheme: ColorScheme {
+        switch self {
+        case .light: .light
+        case .dark: .dark
+        }
+    }
+
+    var nsAppearanceName: NSAppearance.Name {
+        switch self {
+        case .light: .aqua
+        case .dark: .darkAqua
+        }
+    }
+
+    mutating func toggle() {
+        self = self == .light ? .dark : .light
+    }
 }
 
 enum AppError: LocalizedError {
@@ -769,7 +794,7 @@ final class AppModel: ObservableObject {
     @Published var status = "Ready"
     @Published var isBusy = false
     @Published var isConnected = false
-    @Published var showsConnectionEditor = true
+    @Published var showsConnectionEditor = false
     @Published var showsInspector = false
     @Published var showsTransfers = false
     @Published var showsPasswordPrompt = false
@@ -1863,6 +1888,12 @@ final class AppModel: ObservableObject {
         guard let index = transfers.firstIndex(where: { $0.id == id }) else { return }
         transfers[index].state = state
         transfers[index].message = message
+        if state == .running && transfers[index].startedAt == nil {
+            transfers[index].startedAt = Date()
+        }
+        if state == .done || state == .failed || state == .cancelled {
+            transfers[index].updatedAt = Date()
+        }
         if state == .done || state == .failed || state == .cancelled {
             transferControls.removeValue(forKey: id)
         }
@@ -1872,6 +1903,10 @@ final class AppModel: ObservableObject {
         guard let index = transfers.firstIndex(where: { $0.id == id }) else { return }
         transfers[index].transferredBytes = transferred
         transfers[index].totalBytes = total
+        transfers[index].updatedAt = Date()
+        if transferred > 0 && transfers[index].startedAt == nil {
+            transfers[index].startedAt = Date()
+        }
     }
 
     func cancelTransfer(_ id: UUID) {
@@ -2085,39 +2120,60 @@ final class AppModel: ObservableObject {
 struct ContentView: View {
     @StateObject private var model = AppModel()
     @State private var showsSidebar = true
+    @State private var searchText = ""
+    @AppStorage("Volt.AppAppearance") private var appAppearanceRawValue = AppAppearance.light.rawValue
+    private let sidebarWidth: CGFloat = 240
+
+    private var appAppearance: Binding<AppAppearance> {
+        Binding(
+            get: { AppAppearance(rawValue: appAppearanceRawValue) ?? .light },
+            set: { appAppearanceRawValue = $0.rawValue }
+        )
+    }
 
     var body: some View {
         VStack(spacing: 0) {
-            topBar
-            Divider()
-            HSplitView {
+            HStack(spacing: 0) {
+                if showsSidebar {
+                    SidebarBrandHeader()
+                        .frame(width: sidebarWidth)
+                }
+                VoltTopToolbar(
+                    model: model,
+                    showsSidebar: $showsSidebar,
+                    searchText: $searchText,
+                    appAppearance: appAppearance
+                )
+            }
+
+            HStack(spacing: 0) {
                 if showsSidebar {
                     SidebarView(model: model)
-                        .frame(minWidth: 220, idealWidth: 260, maxWidth: 320, maxHeight: .infinity)
+                        .frame(width: sidebarWidth)
                 }
 
                 VStack(spacing: 0) {
-                    if model.selectedConnection == nil || model.showsConnectionEditor {
-                        ConnectionEditor(model: model)
-                        Divider()
-                    } else {
-                        ConnectionSummaryView(model: model)
-                        Divider()
-                    }
-                    BrowserSplitView(model: model)
-                    Divider()
+                    BrowserSplitView(model: model, searchText: searchText)
                     RemoteEditSessionsView(model: model)
                     TransferQueueView(model: model)
-                    StatusBar(model: model)
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .clipped()
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
+        .background(VoltTheme.appBackground)
+        .preferredColorScheme(appAppearance.wrappedValue.colorScheme)
         // Cho noi dung tran len vung titlebar de topBar va traffic lights chung mot hang
         // (khong bi day xuong thanh 2 dong).
         .ignoresSafeArea(.container, edges: .top)
-        .background(WindowConfigurator())
+        .background(WindowConfigurator(appAppearance: appAppearance.wrappedValue))
+        .sheet(isPresented: $model.showsConnectionEditor) {
+            ConnectionEditor(model: model)
+                .padding(4)
+                .frame(width: 820)
+                .presentationSizing(.fitted)
+        }
         .inspector(isPresented: $model.showsInspector) {
             InspectorView(model: model)
         }
@@ -2130,50 +2186,16 @@ struct ContentView: View {
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)) { _ in
             model.prepareForTermination()
         }
-        .onChange(of: model.isConnected) { _, connected in
-            // Ket noi xong thi thu sidebar de nhuong cho cho vung file; ngat ket noi thi hien lai.
-            // Nut sidebar.left tren topBar van cho phep bung lai giua chung de doi server.
-            withAnimation(.easeInOut(duration: 0.16)) {
-                showsSidebar = !connected
-            }
-        }
         .frame(minWidth: 1120, minHeight: 720)
-    }
-
-    // Thanh chrome tu dung thay cho .toolbar he thong: dat tren HSplitView nen tab
-    // (SessionTabBar) khong the de len sidebar (sidebar nam o hang duoi). Khong can do toa do.
-    private var topBar: some View {
-        HStack(spacing: 8) {
-            Button {
-                withAnimation(.easeInOut(duration: 0.16)) {
-                    showsSidebar.toggle()
-                }
-            } label: {
-                Image(systemName: "sidebar.left")
-                    .font(.system(size: 16, weight: .medium))
-                    .frame(width: 28, height: 28)
-            }
-            .buttonStyle(.plain)
-            .help(showsSidebar ? "Hide Sidebar" : "Show Sidebar")
-
-            SessionTabBar(model: model)
-
-            Button(action: { model.showsInspector.toggle() }) {
-                Image(systemName: model.showsInspector ? "info.circle.fill" : "info.circle")
-                    .font(.system(size: 15, weight: .medium))
-                    .frame(width: 28, height: 28)
-            }
-            .buttonStyle(.plain)
-            .help("Toggle Inspector")
-        }
-        .padding(.leading, 80)   // chua cho cho den giao thong (traffic lights)
-        .padding(.trailing, 12)
-        .frame(height: 28)       // khop chieu cao titlebar he thong de can giua trung tam voi traffic lights
-        .frame(maxWidth: .infinity)
     }
 }
 
 private struct WindowConfigurator: NSViewRepresentable {
+    var appAppearance: AppAppearance
+    private let topBarHeight: CGFloat = 48
+    private let trafficLightLeftPadding: CGFloat = 20
+    private let trafficLightSpacing: CGFloat = 26
+
     func makeNSView(context: Context) -> NSView {
         let view = NSView()
         DispatchQueue.main.async {
@@ -2195,6 +2217,40 @@ private struct WindowConfigurator: NSViewRepresentable {
         window.titlebarAppearsTransparent = true
         window.titlebarSeparatorStyle = .none
         window.isMovableByWindowBackground = true
+        window.appearance = NSAppearance(named: appAppearance.nsAppearanceName)
+        setNativeTrafficLights(hidden: true, in: window)
+        DispatchQueue.main.async {
+            positionTrafficLights(in: window)
+        }
+    }
+
+    private func setNativeTrafficLights(hidden: Bool, in window: NSWindow) {
+        window.standardWindowButton(.closeButton)?.isHidden = hidden
+        window.standardWindowButton(.miniaturizeButton)?.isHidden = hidden
+        window.standardWindowButton(.zoomButton)?.isHidden = hidden
+    }
+
+    private func positionTrafficLights(in window: NSWindow) {
+        let buttons = [
+            window.standardWindowButton(.closeButton),
+            window.standardWindowButton(.miniaturizeButton),
+            window.standardWindowButton(.zoomButton)
+        ].compactMap { $0 }
+        guard let closeButton = buttons.first, let superview = closeButton.superview else { return }
+
+        let y: CGFloat
+        if superview.bounds.height > topBarHeight {
+            y = superview.bounds.height - topBarHeight + (topBarHeight - closeButton.frame.height) / 2
+        } else {
+            y = (superview.bounds.height - closeButton.frame.height) / 2
+        }
+
+        for (index, button) in buttons.enumerated() {
+            button.setFrameOrigin(NSPoint(
+                x: trafficLightLeftPadding + CGFloat(index) * trafficLightSpacing,
+                y: y.rounded(.down)
+            ))
+        }
     }
 }
 
@@ -2344,41 +2400,6 @@ struct HostKeyVerificationView: View {
     }
 }
 
-struct SidebarView: View {
-    @ObservedObject var model: AppModel
-
-    var body: some View {
-        VStack(spacing: 0) {
-            List(selection: $model.selectedConnectionID) {
-                ForEach(model.connections) { connection in
-                    Label(connection.name, systemImage: "externaldrive.connected.to.line.below")
-                        .tag(connection.id)
-                        .contextMenu {
-                            Button("Edit") { model.editConnection(connection) }
-                            Button("Disconnect") { model.disconnectConnection(id: connection.id) }
-                                .disabled(model.selectedConnectionID != connection.id)
-                            Divider()
-                            Button("Remove") { model.removeConnection(id: connection.id) }
-                        }
-                }
-            }
-            .onChange(of: model.selectedConnectionID) { _, id in
-                model.sidebarSelectionChanged(id)
-            }
-
-            HStack {
-                Button(action: model.newConnection) { Image(systemName: "plus") }
-                    .help("New connection")
-                Button(action: model.deleteSelectedConnection) { Image(systemName: "trash") }
-                    .help("Delete connection")
-                    .disabled(model.selectedConnectionID == nil)
-            }
-            .buttonStyle(.borderless)
-            .padding(10)
-        }
-    }
-}
-
 struct ConnectionEditor: View {
     @ObservedObject var model: AppModel
 
@@ -2404,9 +2425,7 @@ struct ConnectionEditor: View {
                 }
                 .labelsHidden()
                 .frame(minWidth: 100, idealWidth: 160, maxWidth: 180)
-                if model.selectedConnection != nil {
-                    Button(action: model.hideConnectionEditor) { Label("Cancel", systemImage: "xmark.circle") }
-                }
+                Button(action: model.hideConnectionEditor) { Label("Cancel", systemImage: "xmark.circle") }
                 Button(action: model.saveDraft) { Label("Save", systemImage: "tray.and.arrow.down") }
                 Button(action: model.connectDraft) { Label("Connect", systemImage: "bolt.horizontal") }
                     .disabled(model.connectionDraft.host.isEmpty)
@@ -2528,33 +2547,84 @@ struct ConnectionSummaryView: View {
 
 struct BrowserSplitView: View {
     @ObservedObject var model: AppModel
+    var searchText: String
 
     var body: some View {
-        // Chua ket noi: chi hien Local full-width + CTA connect. Ket noi xong moi tach doi Local | Remote.
-        if model.isConnected {
-            HSplitView {
+        GeometryReader { proxy in
+            let paneWidth = max(300, proxy.size.width / 2)
+            HStack(spacing: 0) {
                 localPane
-                remotePane
-            }
-        } else {
-            VStack(spacing: 0) {
-                localPane
+                    .frame(width: paneWidth)
                 Divider()
-                connectCallToAction
+                if model.isConnected {
+                    remotePane
+                        .frame(width: paneWidth)
+                } else {
+                    disconnectedRemotePane
+                        .frame(width: paneWidth)
+                }
             }
+            .frame(width: proxy.size.width, height: proxy.size.height, alignment: .leading)
         }
+        .background(VoltTheme.paneBackground)
     }
 
-    private var connectCallToAction: some View {
+    private var disconnectedRemotePane: some View {
+        VStack(spacing: 0) {
+            disconnectedRemoteHeader
+            Divider()
+
+            VStack(spacing: 12) {
+                Image(systemName: "externaldrive.badge.wifi")
+                    .font(.system(size: 34, weight: .regular))
+                    .foregroundStyle(Color.accentColor)
+                Text("Choose or add a server")
+                    .font(.headline)
+                Text("Remote files will appear here after connecting.")
+                    .font(.subheadline)
+                    .foregroundStyle(VoltTheme.mutedText)
+                Button {
+                    model.showConnectionEditor()
+                } label: {
+                    Label("Add Server", systemImage: "plus")
+                }
+                .buttonStyle(.bordered)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+        .frame(minWidth: 300)
+        .background(VoltTheme.paneBackground)
+    }
+
+    private var disconnectedRemoteHeader: some View {
         HStack(spacing: 10) {
-            Image(systemName: "bolt.horizontal.circle")
-                .font(.system(size: 18))
-                .foregroundStyle(.secondary)
-            Text("Chưa kết nối server — điền thông tin phía trên rồi bấm Connect để xem file remote.")
-                .font(.callout)
-                .foregroundStyle(.secondary)
-                .lineLimit(2)
-            Spacer(minLength: 8)
+            HStack(spacing: 8) {
+                Image(systemName: "network")
+                    .foregroundStyle(.secondary)
+                Text("/")
+                    .font(.system(size: 13, weight: .medium))
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(.tertiary)
+                Text("remote")
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(.secondary)
+            }
+            .padding(.horizontal, 10)
+            .frame(height: 36)
+            .background(
+                RoundedRectangle(cornerRadius: 8)
+                    .fill(VoltTheme.controlBackground)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 8)
+                    .stroke(VoltTheme.hairline)
+            )
+
+            Spacer()
+            Text("Not connected")
+                .font(.caption)
+                .foregroundStyle(VoltTheme.mutedText)
             Button {
                 model.showConnectionEditor()
             } label: {
@@ -2562,9 +2632,8 @@ struct BrowserSplitView: View {
             }
             .buttonStyle(.borderedProminent)
         }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 12)
-        .frame(maxWidth: .infinity)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
     }
 
     private var localPane: some View {
@@ -2576,6 +2645,7 @@ struct BrowserSplitView: View {
                 selection: $model.selectedLocalID,
                 preferences: $model.localBrowserPreferences,
                 isRemote: false,
+                searchText: searchText,
                 toolbar: {
                     Button(action: model.chooseLocalFolder) { Image(systemName: "folder") }.help("Choose folder")
                     Button(action: model.localUp) { Image(systemName: "arrow.up") }.help("Parent folder")
@@ -2671,6 +2741,7 @@ struct BrowserSplitView: View {
                 selection: $model.selectedRemoteID,
                 preferences: $model.remoteBrowserPreferences,
                 isRemote: true,
+                searchText: searchText,
                 toolbar: {
                     Button(action: model.remoteUp) { Image(systemName: "arrow.up") }.help("Parent folder")
                     Button(action: model.refreshRemote) { Image(systemName: "arrow.clockwise") }.help("Refresh")
@@ -2777,24 +2848,23 @@ struct FilePane<ToolbarContent: View, ContextMenuContent: View, BackgroundContex
     @Binding var selection: FileItem.ID?
     @Binding var preferences: FileBrowserPreferences
     var isRemote: Bool
+    var searchText: String
     @ViewBuilder var toolbar: () -> ToolbarContent
     var open: (FileItem) -> Void
     @ViewBuilder var contextMenu: (FileItem) -> ContextMenuContent
     @ViewBuilder var backgroundContextMenu: () -> BackgroundContextMenuContent
 
     private var displayedItems: [FileItem] {
-        items.filter { preferences.showHiddenFiles || !$0.isHidden }.sorted(by: sortsBefore)
+        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        return items
+            .filter { preferences.showHiddenFiles || !$0.isHidden }
+            .filter { query.isEmpty || $0.name.localizedCaseInsensitiveContains(query) || $0.path.localizedCaseInsensitiveContains(query) }
+            .sorted(by: sortsBefore)
     }
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack(spacing: 8) {
-                Text(title).font(.headline).frame(width: 70, alignment: .leading)
-                TextField("Path", text: $path).textFieldStyle(.roundedBorder).submitLabel(.go).onSubmit(submitPath)
-                toolbar().buttonStyle(.borderless).controlSize(.large)
-                viewOptions
-            }
-            .padding(.horizontal, 12).padding(.vertical, 10)
+            paneHeader
 
             if preferences.viewMode == .list {
                 listHeader
@@ -2811,6 +2881,118 @@ struct FilePane<ToolbarContent: View, ContextMenuContent: View, BackgroundContex
             }
         }
         .frame(minWidth: 300)
+        .background(VoltTheme.paneBackground)
+    }
+
+    private var paneHeader: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 10) {
+                HStack(spacing: 8) {
+                    Image(systemName: isRemote ? "network" : "desktopcomputer")
+                        .foregroundStyle(.secondary)
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        pathBar
+                    }
+                }
+                .padding(.horizontal, 10)
+                .frame(height: 36)
+                .background(
+                    RoundedRectangle(cornerRadius: 8)
+                        .fill(VoltTheme.controlBackground)
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8)
+                        .stroke(VoltTheme.hairline)
+                )
+
+                Spacer(minLength: 10)
+
+                Text(itemCountText)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+
+                toolbar()
+                    .buttonStyle(.borderless)
+                    .controlSize(.large)
+                viewOptions
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 10)
+
+            Divider()
+        }
+    }
+
+    private var pathBar: some View {
+        HStack(spacing: 4) {
+            ForEach(pathCrumbs, id: \.path) { crumb in
+                Button {
+                    path = crumb.path
+                    submitPath()
+                } label: {
+                    Text(crumb.title)
+                        .font(.system(size: 13, weight: .medium))
+                        .lineLimit(1)
+                }
+                .buttonStyle(.plain)
+                .help(crumb.path)
+
+                if crumb.path != pathCrumbs.last?.path {
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(.tertiary)
+                }
+            }
+        }
+        .contextMenu {
+            TextField("Path", text: $path)
+                .textFieldStyle(.plain)
+                .onSubmit(submitPath)
+            Button("Go", action: submitPath)
+            Button("Copy Path") {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(path, forType: .string)
+            }
+        }
+    }
+
+    private var pathCrumbs: [(title: String, path: String)] {
+        let normalized = path.isEmpty ? (isRemote ? "/" : FileManager.default.homeDirectoryForCurrentUser.path) : path
+        if isRemote {
+            let parts = normalized.split(separator: "/").map(String.init)
+            var crumbs: [(String, String)] = [("/", "/")]
+            var current = ""
+            for part in parts {
+                current += "/" + part
+                crumbs.append((part, current))
+            }
+            return crumbs
+        }
+
+        let url = URL(fileURLWithPath: (normalized as NSString).expandingTildeInPath).standardizedFileURL
+        let components = url.pathComponents
+        var crumbs: [(String, String)] = []
+        var current = ""
+        for component in components {
+            if component == "/" {
+                current = "/"
+                crumbs.append(("/", "/"))
+            } else {
+                current = current == "/" ? "/" + component : current + "/" + component
+                let title = component == NSUserName() ? "Home" : component
+                crumbs.append((title, current))
+            }
+        }
+        return crumbs.isEmpty ? [("Home", FileManager.default.homeDirectoryForCurrentUser.path)] : crumbs
+    }
+
+    private var itemCountText: String {
+        let total = displayedItems.count
+        if let selected = selection, displayedItems.contains(where: { $0.id == selected }) {
+            return "1 of \(total) selected"
+        }
+        return "\(total) items"
     }
 
     @ViewBuilder private var browserContent: some View {
@@ -2839,23 +3021,34 @@ struct FilePane<ToolbarContent: View, ContextMenuContent: View, BackgroundContex
                 headerButton(column.rawValue, field: sortField(for: column)).frame(width: column.width, alignment: .leading)
             }
         }
-        .font(.headline).padding(.horizontal, 20).padding(.vertical, 8)
+        .font(.system(size: 12, weight: .semibold))
+        .foregroundStyle(.secondary)
+        .padding(.horizontal, 20)
+        .padding(.vertical, 8)
         .contentShape(Rectangle()).contextMenu { columnMenu }
     }
 
     private func listRow(_ item: FileItem, index: Int) -> some View {
         HStack(spacing: 12) {
-            Label(item.name, systemImage: item.isDirectory ? "folder" : "doc")
-                .lineLimit(1).frame(minWidth: 120, maxWidth: .infinity, alignment: .leading)
+            HStack(spacing: 9) {
+                Image(systemName: item.isDirectory ? "folder.fill" : "doc")
+                    .foregroundStyle(item.isDirectory ? Color.accentColor : Color.secondary)
+                    .frame(width: 18)
+                Text(item.name)
+                    .lineLimit(1)
+            }
+            .frame(minWidth: 120, maxWidth: .infinity, alignment: .leading)
             ForEach(preferences.visibleColumns) { column in
-                Text(text(for: column, item: item)).foregroundStyle(selection == item.id ? Color.white.opacity(0.9) : Color.secondary)
+                Text(text(for: column, item: item)).foregroundStyle(selection == item.id ? Color.primary.opacity(0.9) : Color.secondary)
                     .frame(width: column.width, alignment: .leading).lineLimit(1)
             }
         }
-        .font(.system(size: preferences.textSize)).padding(.horizontal, 10).padding(.vertical, 7)
-        .background(RoundedRectangle(cornerRadius: 6).fill(selection == item.id ? Color.accentColor : (preferences.showRowColors && index.isMultiple(of: 2) ? Color.primary.opacity(0.06) : Color.clear)))
+        .font(.system(size: preferences.textSize))
+        .padding(.horizontal, 10)
+        .padding(.vertical, 7)
+        .background(RoundedRectangle(cornerRadius: 6).fill(selection == item.id ? VoltTheme.selectedFill : (preferences.showRowColors && index.isMultiple(of: 2) ? Color.primary.opacity(0.035) : Color.clear)))
         .background { RightClickSelectionView { selection = item.id } }
-        .foregroundStyle(selection == item.id ? Color.white : Color.primary).clipShape(RoundedRectangle(cornerRadius: 6)).contentShape(Rectangle())
+        .foregroundStyle(Color.primary).clipShape(RoundedRectangle(cornerRadius: 6)).contentShape(Rectangle())
         .onTapGesture(count: 2) { selection = item.id; open(item) }
         .simultaneousGesture(TapGesture().onEnded { selection = item.id })
         .contextMenu { contextMenu(item) }
@@ -3058,60 +3251,6 @@ private final class RightClickTrackingView: NSView {
         if let eventMonitor {
             NSEvent.removeMonitor(eventMonitor)
             self.eventMonitor = nil
-        }
-    }
-}
-
-struct TransferQueueView: View {
-    @ObservedObject var model: AppModel
-
-    var body: some View {
-        if model.showsTransfers {
-            VStack(alignment: .leading, spacing: 6) {
-                HStack {
-                    Text("Transfers")
-                        .font(.headline)
-                    Spacer()
-                    Button {
-                        model.showsTransfers = false
-                    } label: {
-                        Image(systemName: "xmark.circle.fill")
-                            .foregroundStyle(.secondary)
-                    }
-                    .buttonStyle(.plain)
-                }
-                Table(model.transfers) {
-                    TableColumn("Direction") { Text($0.direction.rawValue) }.width(90)
-                    TableColumn("Source") { Text($0.source).lineLimit(1) }
-                    TableColumn("Destination") { Text($0.destination).lineLimit(1) }
-                    TableColumn("State") { Text($0.state.rawValue) }.width(80)
-                    TableColumn("Progress") { job in
-                        if job.totalBytes > 0 {
-                            let fraction = min(1, Double(job.transferredBytes) / Double(job.totalBytes))
-                            VStack(alignment: .leading, spacing: 2) {
-                                ProgressView(value: fraction)
-                                Text("\(Int(fraction * 100))% · \(ByteCountFormatter.string(fromByteCount: Int64(job.transferredBytes), countStyle: .file)) / \(ByteCountFormatter.string(fromByteCount: Int64(job.totalBytes), countStyle: .file))")
-                                    .font(.caption2)
-                                    .foregroundStyle(.secondary)
-                                    .lineLimit(1)
-                            }
-                        } else if job.transferredBytes > 0 {
-                            Text(ByteCountFormatter.string(fromByteCount: Int64(job.transferredBytes), countStyle: .file))
-                        } else {
-                            Text("—").foregroundStyle(.secondary)
-                        }
-                    }.width(min: 150, ideal: 210)
-                    TableColumn("Message") { Text($0.message).lineLimit(1) }
-                    TableColumn("") { job in
-                        Button("Cancel") {
-                            model.cancelTransfer(job.id)
-                        }
-                        .disabled(job.state != .queued && job.state != .running)
-                    }.width(70)
-                }
-                .frame(height: 140)
-            }
-            .padding(10)
         }
     }
 }
