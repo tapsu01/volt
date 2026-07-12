@@ -2153,6 +2153,16 @@ struct ContentView: View {
                 }
 
                 VStack(spacing: 0) {
+                    if model.tabs.count > 1 {
+                        SessionTabBar(model: model)
+                            .frame(height: 34)
+                            .background(VoltTheme.toolbarBackground)
+                            .overlay(alignment: .bottom) {
+                                Rectangle()
+                                    .fill(VoltTheme.hairline)
+                                    .frame(height: 1)
+                            }
+                    }
                     BrowserSplitView(model: model, searchText: searchText)
                     RemoteEditSessionsView(model: model)
                     TransferQueueView(model: model)
@@ -2256,23 +2266,24 @@ private struct WindowConfigurator: NSViewRepresentable {
 
 struct SessionTabBar: View {
     @ObservedObject var model: AppModel
-    private let tabWidth: CGFloat = 180
-    private let barHeight: CGFloat = 28
+    private let tabWidth: CGFloat = 190
+    private let barHeight: CGFloat = 34
 
     var body: some View {
         HStack(spacing: 0) {
             ScrollViewReader { proxy in
             ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 0) {
+                HStack(spacing: 8) {
                     ForEach(Array(model.tabs.enumerated()), id: \.element.id) { _, tab in
                         let isActive = tab.id == model.selectedTabID
-                        Divider()
                         Button {
                             model.selectTab(tab.id)
                         } label: {
                             HStack(spacing: 6) {
                                 Image(systemName: tab.isConnected ? "bolt.horizontal.fill" : "folder")
+                                    .foregroundStyle(tab.isConnected ? Color.accentColor : VoltTheme.mutedText)
                                 Text(tab.title)
+                                    .font(.system(size: 13, weight: isActive ? .semibold : .medium))
                                     .lineLimit(1)
                                 Spacer(minLength: 6)
                                 if model.tabs.count > 1 {
@@ -2281,10 +2292,17 @@ struct SessionTabBar: View {
                                     }
                                 }
                             }
-                            .padding(.horizontal, 10)
+                            .padding(.horizontal, 11)
                             .frame(width: tabWidth)
-                            .frame(maxHeight: .infinity)
-                            .background(isActive ? Color.primary.opacity(0.1) : Color.clear)
+                            .frame(height: 26)
+                            .background(
+                                RoundedRectangle(cornerRadius: 7)
+                                    .fill(isActive ? VoltTheme.selectedFill : Color.clear)
+                            )
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 7)
+                                    .stroke(isActive ? Color.accentColor.opacity(0.18) : Color.clear)
+                            )
                             .contentShape(Rectangle())
                         }
                         .buttonStyle(.plain)
@@ -2307,8 +2325,11 @@ struct SessionTabBar: View {
                         }
                     }
                 }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 4)
                 .frame(height: barHeight)
             }
+            .frame(height: barHeight)
             // Chon mot tab dang khuat -> cuon tab do vao tam nhin.
             .onChange(of: model.selectedTabID) { _, id in
                 guard let id else { return }
@@ -2317,16 +2338,15 @@ struct SessionTabBar: View {
                 }
             }
             }
-            Divider()
             Button(action: model.newTab) {
                 Image(systemName: "plus")
-                    .frame(width: 28, height: 28)
+                    .frame(width: 30, height: 30)
             }
             .buttonStyle(.plain)
             .help("New tab")
         }
-        .frame(maxHeight: .infinity)
-        .padding(.leading, 8)
+        .frame(height: barHeight)
+        .fixedSize(horizontal: false, vertical: true)
     }
 }
 
