@@ -160,6 +160,30 @@ static int known_host_key_type(int hostkey_type) {
     }
 }
 
+const char *volt_ssh_openssh_host_key_algorithm(int key_type) {
+    switch (key_type) {
+        case LIBSSH2_HOSTKEY_TYPE_RSA: return "rsa-sha2-512,rsa-sha2-256,ssh-rsa";
+        case LIBSSH2_HOSTKEY_TYPE_DSS: return "ssh-dss";
+        case LIBSSH2_HOSTKEY_TYPE_ECDSA_256: return "ecdsa-sha2-nistp256";
+        case LIBSSH2_HOSTKEY_TYPE_ECDSA_384: return "ecdsa-sha2-nistp384";
+        case LIBSSH2_HOSTKEY_TYPE_ECDSA_521: return "ecdsa-sha2-nistp521";
+        case LIBSSH2_HOSTKEY_TYPE_ED25519: return "ssh-ed25519";
+        default: return NULL;
+    }
+}
+
+const char *volt_ssh_openssh_known_host_key_type(int key_type) {
+    switch (key_type) {
+        case LIBSSH2_HOSTKEY_TYPE_RSA: return "ssh-rsa";
+        case LIBSSH2_HOSTKEY_TYPE_DSS: return "ssh-dss";
+        case LIBSSH2_HOSTKEY_TYPE_ECDSA_256: return "ecdsa-sha2-nistp256";
+        case LIBSSH2_HOSTKEY_TYPE_ECDSA_384: return "ecdsa-sha2-nistp384";
+        case LIBSSH2_HOSTKEY_TYPE_ECDSA_521: return "ecdsa-sha2-nistp521";
+        case LIBSSH2_HOSTKEY_TYPE_ED25519: return "ssh-ed25519";
+        default: return NULL;
+    }
+}
+
 static int check_host_key(
     LIBSSH2_SESSION *session,
     const char *host,

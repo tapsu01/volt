@@ -142,6 +142,10 @@ struct VoltTopToolbar: View {
                             model.makeLocalFolder()
                         }
                     }
+                    toolbarIconButton("terminal", help: "Open SSH terminal") {
+                        model.showTerminal()
+                    }
+                    .disabled(model.selectedConnection == nil)
                     toolbarIconButton("trash", help: "Delete selected item") {
                         if model.selectedRemote != nil {
                             model.deleteRemoteSelected()

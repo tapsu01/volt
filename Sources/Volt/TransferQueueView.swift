@@ -39,7 +39,14 @@ struct TransferQueueView: View {
     }
 
     private var availableTabs: [TransferPanelTab] {
-        model.remoteEditSessions.isEmpty ? [.transfers] : [.transfers, .remoteEdits]
+        var tabs: [TransferPanelTab] = [.transfers]
+        if !model.remoteEditSessions.isEmpty {
+            tabs.append(.remoteEdits)
+        }
+        if model.selectedConnection != nil || !model.terminalOutput.isEmpty || model.terminalStatus != .idle {
+            tabs.append(.terminal)
+        }
+        return tabs
     }
 
     private var selectedTab: TransferPanelTab {
@@ -134,6 +141,9 @@ struct TransferQueueView: View {
             if !model.remoteEditSessions.isEmpty {
                 Text("Remote Edits (\(model.remoteEditSessions.count))").tag(TransferPanelTab.remoteEdits)
             }
+            if model.selectedConnection != nil || !model.terminalOutput.isEmpty || model.terminalStatus != .idle {
+                Text("Terminal").tag(TransferPanelTab.terminal)
+            }
         }
         .pickerStyle(.segmented)
         .labelsHidden()
@@ -146,6 +156,8 @@ struct TransferQueueView: View {
             transfersTable
         case .remoteEdits:
             remoteEditsTable
+        case .terminal:
+            TerminalPanelView(model: model)
         }
     }
 
@@ -212,6 +224,9 @@ struct TransferQueueView: View {
             compactTransfersList
         case .remoteEdits:
             compactRemoteEditsList
+        case .terminal:
+            TerminalPanelView(model: model)
+                .frame(maxHeight: 150)
         }
     }
 
@@ -250,6 +265,184 @@ struct TransferQueueView: View {
                 }
             }
             .frame(maxHeight: 126)
+        }
+    }
+
+    private struct TerminalPanelView: View {
+        @ObservedObject var model: AppModel
+
+        var body: some View {
+            VStack(spacing: 0) {
+                HStack(spacing: 10) {
+                    Text(statusText)
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(statusColor)
+                    Spacer()
+                    Button(action: model.startTerminal) {
+                        Label(model.terminalStatus == .running ? "Reconnect" : "Connect", systemImage: "terminal")
+                    }
+                    .disabled(model.selectedConnection == nil || model.terminalStatus == .connecting)
+                    Button(action: model.stopCurrentTerminal) {
+                        Label("Disconnect", systemImage: "power")
+                    }
+                    .disabled(model.terminalStatus != .running && model.terminalStatus != .connecting)
+                    Button(action: model.clearTerminal) {
+                        Label("Clear", systemImage: "trash")
+                    }
+                    .disabled(model.terminalOutput.isEmpty)
+                }
+                .labelStyle(.iconOnly)
+                .buttonStyle(.plain)
+                .padding(.horizontal, 10)
+                .frame(height: 34)
+                .background(VoltTheme.toolbarBackground)
+                .overlay(alignment: .bottom) {
+                    Rectangle()
+                        .fill(VoltTheme.hairline)
+                        .frame(height: 1)
+                }
+
+                TerminalTextView(
+                    text: model.terminalOutput.isEmpty ? placeholderText : model.terminalOutput,
+                    isEnabled: model.terminalStatus == .running || model.terminalStatus == .connecting,
+                    onInput: model.sendTerminalInput,
+                    onResize: model.resizeTerminal
+                )
+            }
+            .background(Color.black)
+        }
+
+        private var placeholderText: String {
+            if model.selectedConnection == nil {
+                return "Choose a server to start an SSH terminal.\n"
+            }
+            return "Click Connect to open an SSH terminal for \(model.selectedConnection?.name ?? "this server").\n"
+        }
+
+        private var statusText: String {
+            switch model.terminalStatus {
+            case .idle:
+                return model.selectedConnection == nil ? "No server" : "Terminal idle"
+            case .connecting:
+                return "Connecting"
+            case .running:
+                return "Connected"
+            case .exited:
+                return "Exited"
+            case .failed:
+                return "Failed"
+            }
+        }
+
+        private var statusColor: Color {
+            switch model.terminalStatus {
+            case .running:
+                return .green
+            case .connecting:
+                return .accentColor
+            case .failed:
+                return .red
+            default:
+                return VoltTheme.mutedText
+            }
+        }
+    }
+
+    private struct TerminalTextView: NSViewRepresentable {
+        var text: String
+        var isEnabled: Bool
+        var onInput: (String) -> Void
+        var onResize: (Int, Int) -> Void
+
+        func makeNSView(context: Context) -> NSScrollView {
+            let scrollView = NSScrollView()
+            scrollView.hasVerticalScroller = true
+            scrollView.hasHorizontalScroller = false
+            scrollView.borderType = .noBorder
+            scrollView.drawsBackground = true
+            scrollView.backgroundColor = .black
+
+            let textView = TerminalNSTextView()
+            textView.onInput = onInput
+            textView.isEditable = true
+            textView.isSelectable = true
+            textView.isRichText = false
+            textView.importsGraphics = false
+            textView.backgroundColor = .black
+            textView.textColor = .white
+            textView.insertionPointColor = .white
+            textView.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
+            textView.textContainerInset = NSSize(width: 8, height: 8)
+            textView.textContainer?.widthTracksTextView = true
+            textView.autoresizingMask = [.width]
+            textView.string = text
+            scrollView.documentView = textView
+            context.coordinator.textView = textView
+            DispatchQueue.main.async {
+                scrollView.window?.makeFirstResponder(textView)
+            }
+            return scrollView
+        }
+
+        func updateNSView(_ scrollView: NSScrollView, context: Context) {
+            guard let textView = context.coordinator.textView else { return }
+            textView.onInput = onInput
+            textView.acceptsInput = isEnabled
+            if isEnabled {
+                DispatchQueue.main.async {
+                    scrollView.window?.makeFirstResponder(textView)
+                }
+            }
+            if textView.string != text {
+                textView.string = text
+                textView.textColor = .white
+                textView.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
+                textView.scrollToEndOfDocument(nil)
+            }
+
+            let characterWidth = max(7, textView.font?.maximumAdvancement.width ?? 7)
+            let lineHeight = max(14, textView.layoutManager?.defaultLineHeight(for: textView.font ?? .monospacedSystemFont(ofSize: 12, weight: .regular)) ?? 14)
+            let visibleSize = scrollView.contentView.bounds.size
+            let columns = Int(max(20, visibleSize.width / characterWidth))
+            let rows = Int(max(8, visibleSize.height / lineHeight))
+            if context.coordinator.lastColumns != columns || context.coordinator.lastRows != rows {
+                context.coordinator.lastColumns = columns
+                context.coordinator.lastRows = rows
+                onResize(columns, rows)
+            }
+        }
+
+        func makeCoordinator() -> Coordinator {
+            Coordinator()
+        }
+
+        final class Coordinator {
+            weak var textView: TerminalNSTextView?
+            var lastColumns = 0
+            var lastRows = 0
+        }
+    }
+
+    private final class TerminalNSTextView: NSTextView {
+        var onInput: ((String) -> Void)?
+        var acceptsInput = false
+
+        override func keyDown(with event: NSEvent) {
+            guard acceptsInput else { return }
+            if event.modifierFlags.contains(.command) {
+                super.keyDown(with: event)
+                return
+            }
+            if let characters = event.characters {
+                onInput?(characters)
+            }
+        }
+
+        override func paste(_ sender: Any?) {
+            guard acceptsInput,
+                  let text = NSPasteboard.general.string(forType: .string)
+            else { return }
+            onInput?(text)
         }
     }
 

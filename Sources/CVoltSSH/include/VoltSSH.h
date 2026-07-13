@@ -28,6 +28,8 @@ typedef int (*VoltSFTPProgressCallback)(uint64_t transferred, uint64_t total, vo
 
 int volt_ssh_probe_host_key(const char *host, int port, const char *known_hosts_path, unsigned char **key, size_t *key_len, int *key_type, int *trust_status, char *error, size_t error_len);
 int volt_ssh_commit_host_key(const char *host, int port, const char *known_hosts_path, const unsigned char *key, size_t key_len, int key_type, char *error, size_t error_len);
+const char *volt_ssh_openssh_host_key_algorithm(int key_type);
+const char *volt_ssh_openssh_known_host_key_type(int key_type);
 void volt_ssh_free_buffer(void *buffer);
 void volt_secure_zero(void *buffer, size_t length);
 int volt_publish_download(const char *temporary_path, const char *destination_path, int overwrite);

@@ -1,6 +1,7 @@
 import AppKit
 import CVoltSSH
 import CryptoKit
+import Darwin
 import Foundation
 import Security
 import SwiftUI
@@ -227,6 +228,15 @@ enum TransferState: String {
 enum TransferPanelTab: String {
     case transfers = "Transfers"
     case remoteEdits = "Remote Edits"
+    case terminal = "Terminal"
+}
+
+enum TerminalStatus: String, Equatable {
+    case idle = "Idle"
+    case connecting = "Connecting"
+    case running = "Running"
+    case exited = "Exited"
+    case failed = "Failed"
 }
 
 struct TransferJob: Identifiable {
@@ -301,6 +311,8 @@ struct BrowserTab: Identifiable, Equatable {
     var selectedLocalIDs: Set<FileItem.ID> = []
     var selectedRemoteIDs: Set<FileItem.ID> = []
     var remoteEditSessions: [RemoteEditSession] = []
+    var terminalOutput = ""
+    var terminalStatus: TerminalStatus = .idle
     var isConnected = false
     var showsConnectionEditor = false
     var showsInspector = false
@@ -384,6 +396,208 @@ final class CommandRunner: @unchecked Sendable {
         let stdout = String(data: output.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
         let stderr = String(data: error.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
         return CommandResult(stdout: stdout, stderr: stderr, status: process.terminationStatus)
+    }
+}
+
+final class SSHTerminalSession: @unchecked Sendable {
+    private let lock = NSLock()
+    private var process: Process?
+    private var masterHandle: FileHandle?
+    private var slaveHandle: FileHandle?
+    private var securityScopedKeyURL: URL?
+
+    var isRunning: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return process?.isRunning == true
+    }
+
+    func start(
+        connection: SavedConnection,
+        knownHostsPath: String,
+        hostKeyAlgorithm: String?,
+        onOutput: @escaping @Sendable (String) -> Void,
+        onExit: @escaping @Sendable (Int32) -> Void
+    ) throws {
+        lock.lock()
+        let alreadyRunning = process?.isRunning == true
+        lock.unlock()
+        guard !alreadyRunning else { return }
+
+        var master: Int32 = -1
+        var slave: Int32 = -1
+        var windowSize = winsize(ws_row: 24, ws_col: 100, ws_xpixel: 0, ws_ypixel: 0)
+        guard openpty(&master, &slave, nil, nil, &windowSize) == 0 else {
+            throw AppError.commandFailed("Could not open SSH terminal.")
+        }
+
+        let masterFile = FileHandle(fileDescriptor: master, closeOnDealloc: true)
+        let slaveFile = FileHandle(fileDescriptor: slave, closeOnDealloc: true)
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
+        process.arguments = try sshArguments(connection: connection, knownHostsPath: knownHostsPath, hostKeyAlgorithm: hostKeyAlgorithm)
+        process.standardInput = slaveFile
+        process.standardOutput = slaveFile
+        process.standardError = slaveFile
+
+        masterFile.readabilityHandler = { handle in
+            let data = handle.availableData
+            guard !data.isEmpty else { return }
+            let text = Self.sanitizedOutput(from: data)
+            guard !text.isEmpty else { return }
+            onOutput(text)
+        }
+        process.terminationHandler = { process in
+            masterFile.readabilityHandler = nil
+            onExit(process.terminationStatus)
+        }
+
+        lock.lock()
+        self.process = process
+        self.masterHandle = masterFile
+        self.slaveHandle = slaveFile
+        lock.unlock()
+
+        do {
+            try process.run()
+            try? slaveFile.close()
+        } catch {
+            masterFile.readabilityHandler = nil
+            try? masterFile.close()
+            try? slaveFile.close()
+            lock.lock()
+            self.process = nil
+            self.masterHandle = nil
+            self.slaveHandle = nil
+            lock.unlock()
+            throw error
+        }
+    }
+
+    func write(_ text: String) {
+        guard let data = text.data(using: .utf8) else { return }
+        lock.lock()
+        let handle = masterHandle
+        lock.unlock()
+        try? handle?.write(contentsOf: data)
+    }
+
+    func resize(columns: Int, rows: Int) {
+        lock.lock()
+        let fileDescriptor = masterHandle?.fileDescriptor
+        lock.unlock()
+        guard let fileDescriptor else { return }
+        var windowSize = winsize(
+            ws_row: UInt16(max(8, min(rows, 200))),
+            ws_col: UInt16(max(20, min(columns, 400))),
+            ws_xpixel: 0,
+            ws_ypixel: 0
+        )
+        _ = ioctl(fileDescriptor, TIOCSWINSZ, &windowSize)
+    }
+
+    func terminate() {
+        lock.lock()
+        let process = process
+        let masterHandle = masterHandle
+        let slaveHandle = slaveHandle
+        self.process = nil
+        self.masterHandle = nil
+        self.slaveHandle = nil
+        lock.unlock()
+
+        masterHandle?.readabilityHandler = nil
+        if process?.isRunning == true {
+            process?.terminate()
+        }
+        try? masterHandle?.close()
+        try? slaveHandle?.close()
+        stopAccessingKey()
+    }
+
+    private func sshArguments(connection: SavedConnection, knownHostsPath: String, hostKeyAlgorithm: String?) throws -> [String] {
+        var args = [
+            "-F", "/dev/null",
+            "-o", "BatchMode=no",
+            "-o", "StrictHostKeyChecking=yes",
+            "-o", "UserKnownHostsFile=\(knownHostsPath)",
+            "-o", "GlobalKnownHostsFile=/dev/null",
+            "-o", "ClearAllForwardings=yes",
+            "-p", "\(connection.port)"
+        ]
+        if let hostKeyAlgorithm {
+            args.append(contentsOf: ["-o", "HostKeyAlgorithms=\(hostKeyAlgorithm)"])
+        }
+        let keyPath = try privateKeyPath(for: connection)
+        if !keyPath.isEmpty {
+            args.append(contentsOf: ["-i", keyPath])
+        }
+        args.append("--")
+        args.append("\(connection.username)@\(connection.host)")
+        return args
+    }
+
+    private func privateKeyPath(for connection: SavedConnection) throws -> String {
+        var bookmarkIsStale = false
+        if let bookmark = connection.privateKeyBookmark,
+           let url = try? URL(
+                resolvingBookmarkData: bookmark,
+                options: [.withSecurityScope, .withoutUI],
+                relativeTo: nil,
+                bookmarkDataIsStale: &bookmarkIsStale
+           ) {
+            if url.startAccessingSecurityScopedResource() {
+                securityScopedKeyURL = url
+            }
+            return url.path.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        return connection.privateKeyPath.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func stopAccessingKey() {
+        securityScopedKeyURL?.stopAccessingSecurityScopedResource()
+        securityScopedKeyURL = nil
+    }
+
+    private static func sanitizedOutput(from data: Data) -> String {
+        let text = String(decoding: data, as: UTF8.self)
+        return stripControlSequences(from: text)
+    }
+
+    private static func stripControlSequences(from text: String) -> String {
+        var output = ""
+        var iterator = text.unicodeScalars.makeIterator()
+        while let scalar = iterator.next() {
+            if scalar == "\u{1B}" {
+                guard let next = iterator.next() else { break }
+                if next == "]" {
+                    while let osc = iterator.next() {
+                        if osc == "\u{7}" { break }
+                        if osc == "\u{1B}" {
+                            _ = iterator.next()
+                            break
+                        }
+                    }
+                } else if next == "[" {
+                    while let csi = iterator.next() {
+                        if (0x40...0x7E).contains(Int(csi.value)) { break }
+                    }
+                }
+                continue
+            }
+            if scalar == "\u{8}" || scalar == "\u{9}" || scalar == "\u{A}" || scalar == "\u{D}" || scalar.value >= 0x20 {
+                output.unicodeScalars.append(scalar)
+            }
+        }
+        return output
+    }
+
+    private static func shellQuoted(_ value: String) -> String {
+        "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    }
+
+    deinit {
+        terminate()
     }
 }
 
@@ -852,6 +1066,8 @@ final class AppModel: ObservableObject {
     }
     @Published var transfers: [TransferJob] = []
     @Published var remoteEditSessions: [RemoteEditSession] = []
+    @Published var terminalOutput = ""
+    @Published var terminalStatus: TerminalStatus = .idle
     @Published var status = "Ready"
     @Published var isBusy = false
     @Published var isConnected = false
@@ -865,6 +1081,7 @@ final class AppModel: ObservableObject {
     @Published var pendingHostKeyHost = ""
     private var hostKeyConfirmationContinuation: CheckedContinuation<Bool, Never>?
     private var tabCredentials: [BrowserTab.ID: SensitiveCredential] = [:]
+    private var terminalSessions: [BrowserTab.ID: SSHTerminalSession] = [:]
     private var verifiedHosts: Set<String> = []
     private var remoteDirectoryCache: [String: [FileItem]] = [:]
 
@@ -1011,6 +1228,7 @@ final class AppModel: ObservableObject {
             guard confirmDiscardEditSessions(tab.remoteEditSessions, action: "close this tab") else { return }
             cleanupEditSessions(tab.remoteEditSessions)
         }
+        stopTerminal(for: id)
         tabCredentials.removeValue(forKey: id)?.clear()
         let index = tabs.firstIndex { $0.id == id } ?? 0
         tabs.removeAll { $0.id == id }
@@ -1035,6 +1253,8 @@ final class AppModel: ObservableObject {
             selectedLocalIDs: tab.selectedLocalIDs,
             selectedRemoteIDs: tab.selectedRemoteIDs,
             remoteEditSessions: [],
+            terminalOutput: "",
+            terminalStatus: .idle,
             isConnected: tab.isConnected,
             showsConnectionEditor: tab.showsConnectionEditor,
             showsInspector: tab.showsInspector
@@ -1053,6 +1273,7 @@ final class AppModel: ObservableObject {
         if selectedTabID != id { selectTab(id) }
         for tab in others {
             cleanupEditSessions(tab.remoteEditSessions)
+            stopTerminal(for: tab.id)
             tabCredentials.removeValue(forKey: tab.id)?.clear()
         }
         tabs.removeAll { $0.id != id }
@@ -1090,6 +1311,7 @@ final class AppModel: ObservableObject {
         if selectedConnectionID != connection.id {
             guard confirmDiscardEditSessions(remoteEditSessions, action: "switch connections") else { return }
             cleanupEditSessions(remoteEditSessions)
+            if let selectedTabID { stopTerminal(for: selectedTabID) }
             remoteEditSessions = []
         }
         isSelectingConnection = true
@@ -1114,6 +1336,7 @@ final class AppModel: ObservableObject {
         if selectedConnectionID != connection.id {
             guard confirmDiscardEditSessions(remoteEditSessions, action: "edit another connection") else { return }
             cleanupEditSessions(remoteEditSessions)
+            if let selectedTabID { stopTerminal(for: selectedTabID) }
             remoteEditSessions = []
         }
         isSuppressingSidebarSelection = true
@@ -1168,6 +1391,7 @@ final class AppModel: ObservableObject {
     func newConnection() {
         guard confirmDiscardEditSessions(remoteEditSessions, action: "create a new connection") else { return }
         cleanupEditSessions(remoteEditSessions)
+        if let selectedTabID { stopTerminal(for: selectedTabID) }
         connectionDraft = SavedConnection()
         credentialForCurrentTab().clear()
         selectedConnectionID = nil
@@ -1202,6 +1426,7 @@ final class AppModel: ObservableObject {
         for tabID in targetTabIDs {
             if let index = tabs.firstIndex(where: { $0.id == tabID }) {
                 cleanupEditSessions(tabs[index].remoteEditSessions)
+                stopTerminal(for: tabID)
                 resetConnectionState(forTabAt: index, showEditor: tabID == selectedTabID)
             }
             tabCredentials.removeValue(forKey: tabID)?.clear()
@@ -2353,8 +2578,128 @@ final class AppModel: ObservableObject {
         transfers[index].message = "Cancelling…"
     }
 
+    func showTerminal() {
+        showsTransfers = true
+        transferPanelTab = .terminal
+    }
+
+    func startTerminal() {
+        guard let selectedTabID else { return }
+        guard let connection = selectedConnection else {
+            status = "Choose a connection"
+            return
+        }
+        if terminalSessions[selectedTabID]?.isRunning == true {
+            showTerminal()
+            return
+        }
+        terminalStatus = .connecting
+        appendTerminalOutput("Connecting to \(connection.username)@\(connection.host):\(connection.port)...\n")
+        syncCurrentTab()
+        showTerminal()
+
+        let tabID = selectedTabID
+        Task {
+            do {
+                let probe = try await verifiedHostKeyProbe(for: connection)
+                let knownHostsPath = try terminalKnownHostsPath(for: connection, probe: probe)
+                await MainActor.run {
+                    self.appendTerminalOutput("Using terminal known_hosts: \(knownHostsPath)\n", tabID: tabID)
+                }
+                let session = SSHTerminalSession()
+                try session.start(
+                    connection: connection,
+                    knownHostsPath: knownHostsPath,
+                    hostKeyAlgorithm: openSSHHostKeyAlgorithm(for: probe.keyType),
+                    onOutput: { [weak self] text in
+                        Task { @MainActor [weak self] in
+                            self?.appendTerminalOutput(text, tabID: tabID)
+                        }
+                    },
+                    onExit: { [weak self] code in
+                        Task { @MainActor [weak self] in
+                            self?.terminalDidExit(tabID: tabID, code: code)
+                        }
+                    }
+                )
+                await MainActor.run {
+                    self.terminalSessions[tabID] = session
+                    self.setTerminalStatus(.running, tabID: tabID)
+                }
+            } catch {
+                await MainActor.run {
+                    self.appendTerminalOutput("Terminal failed: \(error.localizedDescription)\n", tabID: tabID)
+                    self.setTerminalStatus(.failed, tabID: tabID)
+                    self.status = error.localizedDescription
+                }
+            }
+        }
+    }
+
+    func stopCurrentTerminal() {
+        guard let selectedTabID else { return }
+        stopTerminal(for: selectedTabID)
+    }
+
+    func clearTerminal() {
+        terminalOutput = ""
+        syncCurrentTab()
+    }
+
+    func sendTerminalInput(_ input: String) {
+        guard let selectedTabID else { return }
+        terminalSessions[selectedTabID]?.write(input)
+    }
+
+    func resizeTerminal(columns: Int, rows: Int) {
+        guard let selectedTabID else { return }
+        terminalSessions[selectedTabID]?.resize(columns: columns, rows: rows)
+    }
+
+    private func appendTerminalOutput(_ text: String, tabID: BrowserTab.ID? = nil) {
+        let targetTabID = tabID ?? selectedTabID
+        guard let targetTabID else { return }
+        let limit = 80_000
+        if targetTabID == selectedTabID {
+            terminalOutput.append(text)
+            if terminalOutput.count > limit {
+                terminalOutput.removeFirst(terminalOutput.count - limit)
+            }
+            syncCurrentTab()
+        } else if let index = tabs.firstIndex(where: { $0.id == targetTabID }) {
+            tabs[index].terminalOutput.append(text)
+            if tabs[index].terminalOutput.count > limit {
+                tabs[index].terminalOutput.removeFirst(tabs[index].terminalOutput.count - limit)
+            }
+        }
+    }
+
+    private func setTerminalStatus(_ value: TerminalStatus, tabID: BrowserTab.ID? = nil) {
+        let targetTabID = tabID ?? selectedTabID
+        guard let targetTabID else { return }
+        if targetTabID == selectedTabID {
+            terminalStatus = value
+            syncCurrentTab()
+        } else if let index = tabs.firstIndex(where: { $0.id == targetTabID }) {
+            tabs[index].terminalStatus = value
+        }
+    }
+
+    private func terminalDidExit(tabID: BrowserTab.ID, code: Int32) {
+        terminalSessions.removeValue(forKey: tabID)
+        appendTerminalOutput("\nSSH session exited with status \(code).\n", tabID: tabID)
+        setTerminalStatus(.exited, tabID: tabID)
+    }
+
+    private func stopTerminal(for tabID: BrowserTab.ID) {
+        terminalSessions.removeValue(forKey: tabID)?.terminate()
+        setTerminalStatus(.idle, tabID: tabID)
+    }
+
     func prepareForTermination() {
         for control in transferControls.values { control.cancel() }
+        for session in terminalSessions.values { session.terminate() }
+        terminalSessions.removeAll()
         for credential in tabCredentials.values { credential.clear() }
         tabCredentials.removeAll()
         cleanupEditSessions(tabs.flatMap(\.remoteEditSessions) + remoteEditSessions)
@@ -2455,6 +2800,8 @@ final class AppModel: ObservableObject {
         tabs[index].remoteItems = []
         tabs[index].selectedRemoteIDs = []
         tabs[index].remoteEditSessions = []
+        tabs[index].terminalOutput = ""
+        tabs[index].terminalStatus = .idle
         tabs[index].isConnected = false
         tabs[index].showsConnectionEditor = showEditor
         tabs[index].title = tabTitle(forLocalPath: tabs[index].localPath)
@@ -2482,6 +2829,8 @@ final class AppModel: ObservableObject {
             selectedLocalIDs: selectedLocalIDs,
             selectedRemoteIDs: selectedRemoteIDs,
             remoteEditSessions: remoteEditSessions,
+            terminalOutput: "",
+            terminalStatus: .idle,
             isConnected: isConnected,
             showsConnectionEditor: showsConnectionEditor,
             showsInspector: showsInspector
@@ -2503,6 +2852,8 @@ final class AppModel: ObservableObject {
         tabs[index].selectedLocalIDs = selectedLocalIDs
         tabs[index].selectedRemoteIDs = selectedRemoteIDs
         tabs[index].remoteEditSessions = remoteEditSessions
+        tabs[index].terminalOutput = terminalOutput
+        tabs[index].terminalStatus = terminalStatus
         tabs[index].isConnected = isConnected
         tabs[index].showsConnectionEditor = showsConnectionEditor
         tabs[index].showsInspector = showsInspector
@@ -2526,6 +2877,8 @@ final class AppModel: ObservableObject {
         selectedLocalIDs = tab.selectedLocalIDs
         selectedRemoteIDs = tab.selectedRemoteIDs
         remoteEditSessions = tab.remoteEditSessions
+        terminalOutput = tab.terminalOutput
+        terminalStatus = tab.terminalStatus
         isConnected = tab.isConnected
         showsConnectionEditor = tab.showsConnectionEditor
         showsInspector = tab.showsInspector
@@ -2553,16 +2906,19 @@ final class AppModel: ObservableObject {
     // MARK: - Host Key Verification
 
     private func verifyHostKey(for connection: SavedConnection) async throws {
+        _ = try await verifiedHostKeyProbe(for: connection)
+    }
+
+    private func verifiedHostKeyProbe(for connection: SavedConnection) async throws -> HostKeyProbe {
         let host = connection.host
         let port = connection.port
         let lookupHost = port == 22 ? host : "[\(host)]:\(port)"
         let verificationKey = "\(connection.id.uuidString):\(lookupHost)"
-        if verifiedHosts.contains(verificationKey) { return }
 
         let probe = try await sftp.probeHostKey(connection: connection)
         if probe.trustStatus == VOLT_HOSTKEY_MATCH {
             verifiedHosts.insert(verificationKey)
-            return
+            return probe
         }
         if probe.trustStatus == VOLT_HOSTKEY_MISMATCH {
             throw AppError.commandFailed("Host key for \(lookupHost) changed. The connection was rejected.")
@@ -2583,6 +2939,33 @@ final class AppModel: ObservableObject {
         }
         try await sftp.commitHostKey(connection: connection, probe: probe)
         verifiedHosts.insert(verificationKey)
+        return probe
+    }
+
+    private func openSSHHostKeyAlgorithm(for keyType: Int32) -> String? {
+        guard let algorithm = volt_ssh_openssh_host_key_algorithm(keyType) else { return nil }
+        return String(cString: algorithm)
+    }
+
+    private func terminalKnownHostsPath(for connection: SavedConnection, probe: HostKeyProbe) throws -> String {
+        guard let keyTypePointer = volt_ssh_openssh_known_host_key_type(probe.keyType) else {
+            throw AppError.commandFailed("Unsupported SSH host key type.")
+        }
+        let keyType = String(cString: keyTypePointer)
+        let hostField = connection.port == 22 ? connection.host : "[\(connection.host)]:\(connection.port)"
+        let line = "\(hostField) \(keyType) \(probe.key.base64EncodedString())\n"
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("VoltTerminalKnownHosts", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
+        let url = directory.appendingPathComponent("\(connection.id.uuidString)-\(connection.port).known_hosts", isDirectory: false)
+        try Data(line.utf8).write(to: url, options: [.atomic])
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+        return url.path
     }
 
     func confirmHostKey() {
@@ -3535,6 +3918,8 @@ struct BrowserSplitView: View {
                     Button(action: model.refreshRemote) { Image(systemName: "arrow.clockwise") }.help("Refresh")
                     Button(action: model.makeRemoteFolder) { Image(systemName: "folder.badge.plus") }.help("New folder")
                     Button(action: model.uploadFromPicker) { Image(systemName: "square.and.arrow.up") }.help("Upload files or folders")
+                        .disabled(model.selectedConnection == nil)
+                    Button(action: model.showTerminal) { Image(systemName: "terminal") }.help("Open SSH terminal")
                         .disabled(model.selectedConnection == nil)
                     Button(action: model.downloadSelected) { Image(systemName: "arrow.left.circle") }.help("Download")
                         .disabled(model.selectedRemoteItems.isEmpty)
