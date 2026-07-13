@@ -100,9 +100,47 @@ struct FolderDownloadSummary {
     var skippedItems = 0
 }
 
+struct FolderDownloadFile: Sendable {
+    var id: String
+    var remotePath: String
+    var localPath: String
+    var name: String
+    var size: UInt64
+}
+
+struct FolderDownloadPlan: Sendable {
+    var files: [FolderDownloadFile] = []
+    var directories: [String] = []
+    var skippedItems = 0
+
+    var totalBytes: UInt64 {
+        files.reduce(UInt64(0)) { $0 + $1.size }
+    }
+}
+
+actor FolderDownloadProgress {
+    private let totalBytes: UInt64
+    private var transferredByFile: [String: UInt64] = [:]
+
+    init(totalBytes: UInt64) {
+        self.totalBytes = totalBytes
+    }
+
+    func update(fileID: String, transferred: UInt64) -> (transferred: UInt64, total: UInt64) {
+        transferredByFile[fileID] = transferred
+        let totalTransferred = transferredByFile.values.reduce(UInt64(0), +)
+        return (min(totalTransferred, totalBytes), totalBytes)
+    }
+}
+
 struct FolderUploadSummary {
     var uploadedFiles = 0
     var skippedItems = 0
+}
+
+private enum TransferTuning {
+    static let maxConcurrentTransfers = 4
+    static let maxConcurrentFolderDownloads = 4
 }
 
 enum FileBrowserViewMode: String, Codable, CaseIterable, Identifiable {
@@ -442,9 +480,11 @@ final class TransferControl: @unchecked Sendable {
     private let lock = NSLock()
     private var cancelled = false
     private var lastProgressUpdate: TimeInterval = 0
+    private weak var parent: TransferControl?
     private let progressHandler: @Sendable (UInt64, UInt64) -> Void
 
-    init(progressHandler: @escaping @Sendable (UInt64, UInt64) -> Void) {
+    init(parent: TransferControl? = nil, progressHandler: @escaping @Sendable (UInt64, UInt64) -> Void) {
+        self.parent = parent
         self.progressHandler = progressHandler
     }
 
@@ -467,7 +507,7 @@ final class TransferControl: @unchecked Sendable {
         if shouldReport {
             lastProgressUpdate = now
         }
-        let shouldCancel = cancelled
+        let shouldCancel = cancelled || parent?.isCancelled == true
         lock.unlock()
         if shouldReport {
             progressHandler(transferred, total)
@@ -824,7 +864,7 @@ final class AppModel: ObservableObject {
     private var remoteDirectoryCache: [String: [FileItem]] = [:]
 
     private let sftp = SFTPClient()
-    private let transferLimiter = TransferLimiter(limit: 3)
+    private let transferLimiter = TransferLimiter(limit: TransferTuning.maxConcurrentTransfers)
     private var transferControls: [UUID: TransferControl] = [:]
     private var activeOperationCount = 0
     private var isRestoringTab = false
@@ -1587,18 +1627,23 @@ final class AppModel: ObservableObject {
         let transferID = enqueue(direction: .download, source: item.path, destination: destination)
         guard let control = transferControls[transferID] else { return }
         runBusy("Downloading folder", transferID: transferID) {
-            let summary = try await self.transferLimiter.withPermit {
-                guard !control.isCancelled else { throw AppError.commandFailed("Transfer cancelled.") }
-                await MainActor.run { self.markTransfer(transferID, .running, "Preparing folder") }
-                return try await self.downloadRemoteFolder(
-                    connection: connection,
-                    credential: credential,
-                    remotePath: item.path,
-                    localURL: URL(fileURLWithPath: destination, isDirectory: true),
-                    control: control,
-                    transferID: transferID
-                )
-            }
+            guard !control.isCancelled else { throw AppError.commandFailed("Transfer cancelled.") }
+            await MainActor.run { self.markTransfer(transferID, .running, "Preparing folder") }
+            let plan = try await self.planRemoteFolderDownload(
+                connection: connection,
+                credential: credential,
+                remotePath: item.path,
+                localURL: URL(fileURLWithPath: destination, isDirectory: true),
+                control: control,
+                transferID: transferID
+            )
+            let summary = try await self.downloadPlannedFolderFiles(
+                connection: connection,
+                credential: credential,
+                plan: plan,
+                parentControl: control,
+                transferID: transferID
+            )
             await MainActor.run {
                 let fileText = "\(summary.downloadedFiles) file\(summary.downloadedFiles == 1 ? "" : "s")"
                 let skippedText = summary.skippedItems > 0 ? ", skipped \(summary.skippedItems)" : ""
@@ -1635,21 +1680,21 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private func downloadRemoteFolder(
+    private func planRemoteFolderDownload(
         connection: SavedConnection,
         credential: SensitiveCredential,
         remotePath: String,
         localURL: URL,
         control: TransferControl,
         transferID: UUID
-    ) async throws -> FolderDownloadSummary {
+    ) async throws -> FolderDownloadPlan {
         guard !control.isCancelled else { throw AppError.commandFailed("Transfer cancelled.") }
-        try FileManager.default.createDirectory(at: localURL, withIntermediateDirectories: true)
         await MainActor.run {
             self.markTransfer(transferID, .running, "Listing \(URL(fileURLWithPath: remotePath).lastPathComponent)")
         }
 
-        var summary = FolderDownloadSummary()
+        var plan = FolderDownloadPlan()
+        plan.directories.append(localURL.path)
         let result = try await sftp.list(connection: connection, credential: credential, path: remotePath)
         for child in result.items {
             guard !control.isCancelled else { throw AppError.commandFailed("Transfer cancelled.") }
@@ -1658,7 +1703,7 @@ final class AppModel: ObservableObject {
             }
 
             if child.isDirectory {
-                let childSummary = try await downloadRemoteFolder(
+                let childPlan = try await planRemoteFolderDownload(
                     connection: connection,
                     credential: credential,
                     remotePath: child.path,
@@ -1666,39 +1711,104 @@ final class AppModel: ObservableObject {
                     control: control,
                     transferID: transferID
                 )
-                summary.downloadedFiles += childSummary.downloadedFiles
-                summary.skippedItems += childSummary.skippedItems
+                plan.files.append(contentsOf: childPlan.files)
+                plan.directories.append(contentsOf: childPlan.directories)
+                plan.skippedItems += childPlan.skippedItems
             } else {
                 guard child.isRegularFile else {
-                    summary.skippedItems += 1
+                    plan.skippedItems += 1
                     await MainActor.run {
                         self.markTransfer(transferID, .running, "Skipped unsupported item \(child.name)")
                     }
                     continue
                 }
                 let fileDestination = availableDownloadPathIfNeeded(for: childURL.path)
-                await MainActor.run {
-                    self.markTransfer(transferID, .running, "Downloading \(child.name)")
-                }
-                do {
-                    try await sftp.download(
-                        connection: connection,
-                        credential: credential,
-                        remotePath: child.path,
-                        localPath: fileDestination,
-                        policy: .createNew,
-                        control: control
-                    )
-                    summary.downloadedFiles += 1
-                } catch {
-                    guard !control.isCancelled else { throw error }
-                    summary.skippedItems += 1
-                    await MainActor.run {
-                        self.markTransfer(transferID, .running, "Skipped \(child.name): \(error.localizedDescription)")
+                plan.files.append(FolderDownloadFile(
+                    id: child.path,
+                    remotePath: child.path,
+                    localPath: fileDestination,
+                    name: child.name,
+                    size: UInt64(max(0, child.size ?? 0))
+                ))
+            }
+        }
+        return plan
+    }
+
+    private func downloadPlannedFolderFiles(
+        connection: SavedConnection,
+        credential: SensitiveCredential,
+        plan: FolderDownloadPlan,
+        parentControl: TransferControl,
+        transferID: UUID
+    ) async throws -> FolderDownloadSummary {
+        for directory in plan.directories {
+            try FileManager.default.createDirectory(
+                at: URL(fileURLWithPath: directory, isDirectory: true),
+                withIntermediateDirectories: true
+            )
+        }
+
+        let progress = FolderDownloadProgress(totalBytes: plan.totalBytes)
+        await MainActor.run {
+            self.updateTransferProgress(transferID, transferred: 0, total: plan.totalBytes)
+        }
+
+        let folderLimiter = TransferLimiter(limit: TransferTuning.maxConcurrentFolderDownloads)
+        var summary = FolderDownloadSummary(downloadedFiles: 0, skippedItems: plan.skippedItems)
+
+        try await withThrowingTaskGroup(of: Bool.self) { group in
+            for file in plan.files {
+                group.addTask {
+                    try await folderLimiter.withPermit {
+                        try await self.transferLimiter.withPermit {
+                            guard !parentControl.isCancelled else { throw AppError.commandFailed("Transfer cancelled.") }
+                            let childControl = TransferControl(parent: parentControl) { transferred, _ in
+                                Task {
+                                    let aggregate = await progress.update(fileID: file.id, transferred: transferred)
+                                    await MainActor.run {
+                                        self.updateTransferProgress(transferID, transferred: aggregate.transferred, total: aggregate.total)
+                                    }
+                                }
+                            }
+                            await MainActor.run {
+                                self.markTransfer(transferID, .running, "Downloading \(file.name)")
+                            }
+                            do {
+                                try await self.sftp.download(
+                                    connection: connection,
+                                    credential: credential,
+                                    remotePath: file.remotePath,
+                                    localPath: file.localPath,
+                                    policy: .createNew,
+                                    control: childControl
+                                )
+                                let aggregate = await progress.update(fileID: file.id, transferred: file.size)
+                                await MainActor.run {
+                                    self.updateTransferProgress(transferID, transferred: aggregate.transferred, total: aggregate.total)
+                                }
+                                return true
+                            } catch {
+                                guard !parentControl.isCancelled else { throw error }
+                                await MainActor.run {
+                                    self.markTransfer(transferID, .running, "Skipped \(file.name): \(error.localizedDescription)")
+                                }
+                                return false
+                            }
+                        }
                     }
                 }
             }
+
+            for try await didDownload in group {
+                if didDownload {
+                    summary.downloadedFiles += 1
+                } else {
+                    summary.skippedItems += 1
+                }
+            }
         }
+
         return summary
     }
 
@@ -3350,6 +3460,20 @@ struct BrowserSplitView: View {
 }
 
 struct FilePane<ToolbarContent: View, ContextMenuContent: View, BackgroundContextMenuContent: View>: View {
+    private enum ListColumn: Equatable {
+        case name
+        case metadata(FileBrowserColumn)
+    }
+
+    private struct ColumnResizeDraft {
+        var left: ListColumn
+        var right: ListColumn
+        var baseLeftWidth: CGFloat
+        var baseRightWidth: CGFloat
+        var leftWidth: CGFloat
+        var rightWidth: CGFloat
+    }
+
     var title: String
     @Binding var path: String
     var submitPath: () -> Void
@@ -3363,6 +3487,7 @@ struct FilePane<ToolbarContent: View, ContextMenuContent: View, BackgroundContex
     @ViewBuilder var contextMenu: (FileItem) -> ContextMenuContent
     @ViewBuilder var backgroundContextMenu: () -> BackgroundContextMenuContent
     @State private var anchorSelectionID: FileItem.ID?
+    @State private var columnResizeDraft: ColumnResizeDraft?
 
     private var displayedItems: [FileItem] {
         let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -3509,10 +3634,17 @@ struct FilePane<ToolbarContent: View, ContextMenuContent: View, BackgroundContex
     @ViewBuilder private var browserContent: some View {
         switch preferences.viewMode {
         case .list:
-            ScrollView {
-                LazyVStack(spacing: 2) {
-                    ForEach(Array(displayedItems.enumerated()), id: \.element.id) { index, item in listRow(item, index: index) }
-                }.padding(.horizontal, 10).padding(.vertical, 6)
+            GeometryReader { proxy in
+                ScrollView {
+                    LazyVStack(spacing: 2) {
+                        ForEach(Array(displayedItems.enumerated()), id: \.element.id) { index, item in
+                            listRow(item, index: index, availableWidth: max(0, proxy.size.width - 20))
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                }
             }
         case .icons, .thumbnails:
             ScrollView {
@@ -3525,17 +3657,44 @@ struct FilePane<ToolbarContent: View, ContextMenuContent: View, BackgroundContex
         }
     }
 
-    private var listHeader: some View {
-        HStack(spacing: 12) {
-            resizableHeader(title: "Name", field: .name, width: preferences.nameColumnWidth) { width in
-                preferences.nameColumnWidth = width
-            }
-            ForEach(preferences.visibleColumns) { column in
-                resizableHeader(title: column.rawValue, field: sortField(for: column), width: width(for: column)) { width in
-                    preferences.columnWidths[column] = width
-                }
-            }
+    @ViewBuilder private var listHeader: some View {
+        GeometryReader { proxy in
+            listHeaderContent(availableWidth: max(0, proxy.size.width - 40))
         }
+        .frame(height: 38)
+    }
+
+    @ViewBuilder private func listHeaderContent(availableWidth: CGFloat) -> some View {
+        let visibleColumns = preferences.visibleColumns
+        HStack(spacing: 12) {
+            resizableHeader(
+                title: "Name",
+                field: .name,
+                width: displayWidth(for: .name, visibleColumns: visibleColumns, availableWidth: availableWidth),
+                onResizeDelta: visibleColumns.first.map { firstColumn in
+                    { delta in
+                        resizeBoundary(left: .name, right: .metadata(firstColumn), delta: delta)
+                    }
+                },
+                onResizeEnd: commitColumnResize
+            )
+            ForEach(Array(visibleColumns.enumerated()), id: \.element.id) { index, column in
+                let nextColumn = visibleColumns.indices.contains(index + 1) ? visibleColumns[index + 1] : nil
+                resizableHeader(
+                    title: column.rawValue,
+                    field: sortField(for: column),
+                    width: displayWidth(for: .metadata(column), visibleColumns: visibleColumns, availableWidth: availableWidth),
+                    onResizeDelta: nextColumn.map { nextColumn in
+                        { delta in
+                            resizeBoundary(left: .metadata(column), right: .metadata(nextColumn), delta: delta)
+                        }
+                    },
+                    onResizeEnd: commitColumnResize
+                )
+            }
+            Spacer(minLength: 0)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
         .font(.system(size: 12, weight: .semibold))
         .foregroundStyle(.secondary)
         .padding(.horizontal, 20)
@@ -3543,7 +3702,8 @@ struct FilePane<ToolbarContent: View, ContextMenuContent: View, BackgroundContex
         .contentShape(Rectangle()).contextMenu { columnMenu }
     }
 
-    private func listRow(_ item: FileItem, index: Int) -> some View {
+    @ViewBuilder private func listRow(_ item: FileItem, index: Int, availableWidth: CGFloat) -> some View {
+        let visibleColumns = preferences.visibleColumns
         HStack(spacing: 12) {
             HStack(spacing: 9) {
                 Image(systemName: item.isDirectory ? "folder.fill" : "doc")
@@ -3552,12 +3712,14 @@ struct FilePane<ToolbarContent: View, ContextMenuContent: View, BackgroundContex
                 Text(item.name)
                     .lineLimit(1)
             }
-            .frame(width: preferences.nameColumnWidth, alignment: .leading)
-            ForEach(preferences.visibleColumns) { column in
+            .frame(width: displayWidth(for: .name, visibleColumns: visibleColumns, availableWidth: max(0, availableWidth - 20)), alignment: .leading)
+            ForEach(visibleColumns) { column in
                 Text(text(for: column, item: item)).foregroundStyle(isSelected(item) ? Color.primary.opacity(0.9) : Color.secondary)
-                    .frame(width: width(for: column), alignment: .leading).lineLimit(1)
+                    .frame(width: displayWidth(for: .metadata(column), visibleColumns: visibleColumns, availableWidth: max(0, availableWidth - 20)), alignment: .leading).lineLimit(1)
             }
+            Spacer(minLength: 0)
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
         .font(.system(size: preferences.textSize))
         .padding(.horizontal, 10)
         .padding(.vertical, 7)
@@ -3641,6 +3803,8 @@ struct FilePane<ToolbarContent: View, ContextMenuContent: View, BackgroundContex
         ForEach(FileBrowserColumn.allCases) { column in
             Toggle(column.rawValue, isOn: columnVisibilityBinding(for: column))
         }
+        Divider()
+        Button("Reset Column Widths", action: resetColumnWidths)
     }
 
     private func headerButton(_ title: String, field: FileBrowserSortField) -> some View {
@@ -3655,12 +3819,20 @@ struct FilePane<ToolbarContent: View, ContextMenuContent: View, BackgroundContex
         }.buttonStyle(.plain)
     }
 
-    private func resizableHeader(title: String, field: FileBrowserSortField, width: CGFloat, onResize: @escaping (CGFloat) -> Void) -> some View {
+    private func resizableHeader(
+        title: String,
+        field: FileBrowserSortField,
+        width: CGFloat,
+        onResizeDelta: ((CGFloat) -> Void)?,
+        onResizeEnd: @escaping () -> Void
+    ) -> some View {
         headerButton(title, field: field)
             .frame(width: width, alignment: .leading)
             .overlay(alignment: .trailing) {
-                ColumnResizeHandle(width: width, onResize: onResize)
-                    .offset(x: 8)
+                if let onResizeDelta {
+                    ColumnResizeHandle(onResizeDelta: onResizeDelta, onResizeEnd: onResizeEnd)
+                        .offset(x: 8)
+                }
             }
     }
 
@@ -3681,8 +3853,101 @@ struct FilePane<ToolbarContent: View, ContextMenuContent: View, BackgroundContex
         switch column { case .size: .size; case .date: .date; case .kind: .kind; case .owner: .owner; case .group: .group; case .permissions: .permissions }
     }
 
-    private func width(for column: FileBrowserColumn) -> CGFloat {
-        preferences.columnWidths[column] ?? column.width
+    private func width(for column: ListColumn) -> CGFloat {
+        if let columnResizeDraft {
+            if columnResizeDraft.left == column { return columnResizeDraft.leftWidth }
+            if columnResizeDraft.right == column { return columnResizeDraft.rightWidth }
+        }
+        return storedWidth(for: column)
+    }
+
+    private func storedWidth(for column: ListColumn) -> CGFloat {
+        switch column {
+        case .name:
+            max(minWidth(for: column), preferences.nameColumnWidth)
+        case .metadata(let metadataColumn):
+            max(minWidth(for: column), preferences.columnWidths[metadataColumn] ?? metadataColumn.width)
+        }
+    }
+
+    private func displayWidth(for column: ListColumn, visibleColumns: [FileBrowserColumn], availableWidth: CGFloat) -> CGFloat {
+        let baseWidth = width(for: column)
+        guard trailingColumn(for: visibleColumns) == column else { return baseWidth }
+        let extraWidth = max(0, availableWidth - naturalColumnsWidth(for: visibleColumns))
+        return baseWidth + extraWidth
+    }
+
+    private func trailingColumn(for visibleColumns: [FileBrowserColumn]) -> ListColumn {
+        if let lastColumn = visibleColumns.last {
+            return .metadata(lastColumn)
+        }
+        return .name
+    }
+
+    private func naturalColumnsWidth(for visibleColumns: [FileBrowserColumn]) -> CGFloat {
+        let columns = [ListColumn.name] + visibleColumns.map { ListColumn.metadata($0) }
+        let columnWidths = columns.reduce(CGFloat(0)) { $0 + width(for: $1) }
+        let spacing = CGFloat(max(0, columns.count - 1)) * 12
+        return columnWidths + spacing
+    }
+
+    private func setWidth(_ width: CGFloat, for column: ListColumn) {
+        let clampedWidth = max(minWidth(for: column), width)
+        switch column {
+        case .name:
+            preferences.nameColumnWidth = clampedWidth
+        case .metadata(let metadataColumn):
+            preferences.columnWidths[metadataColumn] = clampedWidth
+        }
+    }
+
+    private func minWidth(for column: ListColumn) -> CGFloat {
+        switch column {
+        case .name: 160
+        case .metadata: 72
+        }
+    }
+
+    private func resizeBoundary(left: ListColumn, right: ListColumn, delta: CGFloat) {
+        let draft: ColumnResizeDraft
+        if let currentDraft = columnResizeDraft, currentDraft.left == left, currentDraft.right == right {
+            draft = currentDraft
+        } else {
+            let baseLeftWidth = storedWidth(for: left)
+            let baseRightWidth = storedWidth(for: right)
+            draft = ColumnResizeDraft(
+                left: left,
+                right: right,
+                baseLeftWidth: baseLeftWidth,
+                baseRightWidth: baseRightWidth,
+                leftWidth: baseLeftWidth,
+                rightWidth: baseRightWidth
+            )
+        }
+        let minimumDelta = minWidth(for: left) - draft.baseLeftWidth
+        let maximumDelta = draft.baseRightWidth - minWidth(for: right)
+        let clampedDelta = min(max(delta, minimumDelta), maximumDelta)
+        columnResizeDraft = ColumnResizeDraft(
+            left: left,
+            right: right,
+            baseLeftWidth: draft.baseLeftWidth,
+            baseRightWidth: draft.baseRightWidth,
+            leftWidth: draft.baseLeftWidth + clampedDelta,
+            rightWidth: draft.baseRightWidth - clampedDelta
+        )
+    }
+
+    private func commitColumnResize() {
+        guard let draft = columnResizeDraft else { return }
+        setWidth(draft.leftWidth, for: draft.left)
+        setWidth(draft.rightWidth, for: draft.right)
+        columnResizeDraft = nil
+    }
+
+    private func resetColumnWidths() {
+        preferences.nameColumnWidth = 360
+        preferences.columnWidths = [:]
+        columnResizeDraft = nil
     }
 
     private func isSelected(_ item: FileItem) -> Bool {
@@ -3788,32 +4053,28 @@ private struct RightClickSelectionView: NSViewRepresentable {
 }
 
 private struct ColumnResizeHandle: View {
-    var width: CGFloat
-    var onResize: (CGFloat) -> Void
-    @State private var startWidth: CGFloat?
+    var onResizeDelta: (CGFloat) -> Void
+    var onResizeEnd: () -> Void
 
     var body: some View {
-        Rectangle()
-            .fill(Color.clear)
-            .frame(width: 10)
-            .contentShape(Rectangle())
-            .overlay {
-                Rectangle()
-                    .fill(VoltTheme.hairline)
-                    .frame(width: 1)
-            }
-            .gesture(
-                DragGesture(minimumDistance: 1)
-                    .onChanged { value in
-                        let start = startWidth ?? width
-                        startWidth = start
-                        onResize(min(520, max(72, start + value.translation.width)))
-                    }
-                    .onEnded { _ in
-                        startWidth = nil
-                    }
+        ZStack {
+            ResizeDragHandleView(
+                axis: .horizontal,
+                cursor: .resizeLeftRight,
+                currentValue: 0,
+                minValue: -10_000,
+                maxValue: 10_000,
+                onResize: onResizeDelta,
+                onResizeEnd: onResizeEnd
             )
-            .help("Drag to resize column")
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            Rectangle()
+                .fill(VoltTheme.hairline)
+                .frame(width: 1)
+                .allowsHitTesting(false)
+        }
+        .frame(width: 12)
+        .help("Drag to resize column")
     }
 }
 

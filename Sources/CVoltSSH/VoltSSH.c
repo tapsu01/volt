@@ -17,6 +17,8 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#define VOLT_SFTP_TRANSFER_BUFFER_SIZE (256 * 1024)
+
 typedef struct VoltSession {
     int sock;
     LIBSSH2_SESSION *session;
@@ -660,7 +662,7 @@ int volt_sftp_upload(const char *host, int port, const char *username, const cha
         close_session(&session);
         return -1;
     }
-    char buffer[32768];
+    char buffer[VOLT_SFTP_TRANSFER_BUFFER_SIZE];
     size_t n;
     while ((n = fread(buffer, 1, sizeof(buffer), input)) > 0) {
         char *ptr = buffer;
@@ -784,7 +786,7 @@ int volt_sftp_download(const char *host, int port, const char *username, const c
         close_session(&session);
         return -1;
     }
-    char buffer[32768];
+    char buffer[VOLT_SFTP_TRANSFER_BUFFER_SIZE];
     while (1) {
         ssize_t n = libssh2_sftp_read(file, buffer, sizeof(buffer));
         if (n > 0) {
@@ -817,9 +819,8 @@ int volt_sftp_download(const char *host, int port, const char *username, const c
         }
     }
     int flush_result = fflush(output);
-    int sync_result = fsync(output_fd);
     int output_close_result = fclose(output);
-    if (flush_result != 0 || sync_result != 0 || output_close_result != 0) {
+    if (flush_result != 0 || output_close_result != 0) {
         unlink(temp_path);
         libssh2_sftp_close(file);
         set_error(error, error_len, "Could not finalize the downloaded file.");

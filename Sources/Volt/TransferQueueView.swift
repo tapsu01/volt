@@ -1,11 +1,12 @@
 import Foundation
+import AppKit
 import SwiftUI
 
 struct TransferQueueView: View {
     @ObservedObject var model: AppModel
     var layout: AppLayoutContext
     @AppStorage("Volt.TransferQueueHeight") private var expandedHeight: Double = 210
-    @State private var dragStartHeight: CGFloat?
+    @State private var isHoveringResizeHandle = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -41,23 +42,26 @@ struct TransferQueueView: View {
         ZStack {
             Rectangle()
                 .fill(VoltTheme.transferPanelBackground)
+            ResizeDragHandleView(
+                axis: .vertical,
+                cursor: .resizeUpDown,
+                currentValue: queueHeight,
+                minValue: 150,
+                maxValue: 420,
+                direction: 1
+            ) { height in
+                expandedHeight = Double(height)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
             Capsule()
-                .fill(VoltTheme.hairline)
-                .frame(width: 46, height: 4)
+                .fill(isHoveringResizeHandle ? Color.accentColor.opacity(0.55) : VoltTheme.hairline)
+                .frame(width: 58, height: 4)
+                .allowsHitTesting(false)
         }
-        .frame(height: 10)
-        .contentShape(Rectangle())
-        .gesture(
-            DragGesture(minimumDistance: 1)
-                .onChanged { value in
-                    let start = dragStartHeight ?? queueHeight
-                    dragStartHeight = start
-                    expandedHeight = Double(min(420, max(150, start - value.translation.height)))
-                }
-                .onEnded { _ in
-                    dragStartHeight = nil
-                }
-        )
+        .frame(height: 18)
+        .onHover { hovering in
+            isHoveringResizeHandle = hovering
+        }
         .help("Drag to resize transfers")
     }
 
