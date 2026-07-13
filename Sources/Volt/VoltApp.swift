@@ -401,15 +401,14 @@ final class CommandRunner: @unchecked Sendable {
 
 final class SSHTerminalSession: @unchecked Sendable {
     private let lock = NSLock()
-    private var process: Process?
+    private var childPID: pid_t?
     private var masterHandle: FileHandle?
-    private var slaveHandle: FileHandle?
     private var securityScopedKeyURL: URL?
 
     var isRunning: Bool {
         lock.lock()
         defer { lock.unlock() }
-        return process?.isRunning == true
+        return childPID != nil
     }
 
     func start(
@@ -420,57 +419,62 @@ final class SSHTerminalSession: @unchecked Sendable {
         onExit: @escaping @Sendable (Int32) -> Void
     ) throws {
         lock.lock()
-        let alreadyRunning = process?.isRunning == true
+        let alreadyRunning = childPID != nil
         lock.unlock()
         guard !alreadyRunning else { return }
 
+        let executable = "/usr/bin/ssh"
+        let arguments = try sshArguments(connection: connection, knownHostsPath: knownHostsPath, hostKeyAlgorithm: hostKeyAlgorithm)
+        let argv = Self.makeArgv(executable: executable, arguments: arguments)
+        guard let executablePointer = argv.executablePointer else {
+            Self.freeArgv(argv)
+            throw AppError.commandFailed("Could not prepare SSH terminal.")
+        }
+
         var master: Int32 = -1
-        var slave: Int32 = -1
         var windowSize = winsize(ws_row: 24, ws_col: 100, ws_xpixel: 0, ws_ypixel: 0)
-        guard openpty(&master, &slave, nil, nil, &windowSize) == 0 else {
+        let pid = forkpty(&master, nil, nil, &windowSize)
+        if pid == 0 {
+            execv(executablePointer, argv.argumentPointers)
+            _exit(127)
+        }
+        Self.freeArgv(argv)
+
+        guard pid > 0 else {
             throw AppError.commandFailed("Could not open SSH terminal.")
         }
 
         let masterFile = FileHandle(fileDescriptor: master, closeOnDealloc: true)
-        let slaveFile = FileHandle(fileDescriptor: slave, closeOnDealloc: true)
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
-        process.arguments = try sshArguments(connection: connection, knownHostsPath: knownHostsPath, hostKeyAlgorithm: hostKeyAlgorithm)
-        process.standardInput = slaveFile
-        process.standardOutput = slaveFile
-        process.standardError = slaveFile
 
         masterFile.readabilityHandler = { handle in
             let data = handle.availableData
-            guard !data.isEmpty else { return }
+            guard !data.isEmpty else {
+                handle.readabilityHandler = nil
+                return
+            }
             let text = Self.sanitizedOutput(from: data)
             guard !text.isEmpty else { return }
             onOutput(text)
         }
-        process.terminationHandler = { process in
-            masterFile.readabilityHandler = nil
-            onExit(process.terminationStatus)
-        }
 
         lock.lock()
-        self.process = process
+        self.childPID = pid
         self.masterHandle = masterFile
-        self.slaveHandle = slaveFile
         lock.unlock()
 
-        do {
-            try process.run()
-            try? slaveFile.close()
-        } catch {
-            masterFile.readabilityHandler = nil
-            try? masterFile.close()
-            try? slaveFile.close()
-            lock.lock()
-            self.process = nil
-            self.masterHandle = nil
-            self.slaveHandle = nil
-            lock.unlock()
-            throw error
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            var status: Int32 = 0
+            while waitpid(pid, &status, 0) == -1 {
+                if errno != EINTR { break }
+            }
+
+            let exitCode = Self.exitCode(fromWaitStatus: status)
+
+            guard let self else { return }
+            let shouldNotify = self.finishChild(pid: pid)
+            if shouldNotify {
+                onExit(exitCode)
+            }
         }
     }
 
@@ -498,21 +502,36 @@ final class SSHTerminalSession: @unchecked Sendable {
 
     func terminate() {
         lock.lock()
-        let process = process
+        let childPID = childPID
         let masterHandle = masterHandle
-        let slaveHandle = slaveHandle
-        self.process = nil
+        self.childPID = nil
         self.masterHandle = nil
-        self.slaveHandle = nil
         lock.unlock()
 
         masterHandle?.readabilityHandler = nil
-        if process?.isRunning == true {
-            process?.terminate()
+        if let childPID {
+            kill(childPID, SIGTERM)
         }
         try? masterHandle?.close()
-        try? slaveHandle?.close()
         stopAccessingKey()
+    }
+
+    private func finishChild(pid: pid_t) -> Bool {
+        lock.lock()
+        let shouldNotify = childPID == pid
+        let masterHandle = shouldNotify ? masterHandle : nil
+        if shouldNotify {
+            childPID = nil
+            self.masterHandle = nil
+        }
+        lock.unlock()
+
+        masterHandle?.readabilityHandler = nil
+        try? masterHandle?.close()
+        if shouldNotify {
+            stopAccessingKey()
+        }
+        return shouldNotify
     }
 
     private func sshArguments(connection: SavedConnection, knownHostsPath: String, hostKeyAlgorithm: String?) throws -> [String] {
@@ -557,6 +576,41 @@ final class SSHTerminalSession: @unchecked Sendable {
     private func stopAccessingKey() {
         securityScopedKeyURL?.stopAccessingSecurityScopedResource()
         securityScopedKeyURL = nil
+    }
+
+    private static func exitCode(fromWaitStatus status: Int32) -> Int32 {
+        let statusMask = status & 0o177
+        if statusMask == 0 {
+            return (status >> 8) & 0xFF
+        }
+        if statusMask != 0o177 {
+            return 128 + statusMask
+        }
+        return status
+    }
+
+    private typealias Argv = (
+        executablePointer: UnsafeMutablePointer<CChar>?,
+        argumentPointers: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>
+    )
+
+    private static func makeArgv(executable: String, arguments: [String]) -> Argv {
+        let values = [executable] + arguments
+        let argumentPointers = UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>.allocate(capacity: values.count + 1)
+        for (index, value) in values.enumerated() {
+            argumentPointers[index] = strdup(value)
+        }
+        argumentPointers[values.count] = nil
+        return (argumentPointers[0], argumentPointers)
+    }
+
+    private static func freeArgv(_ argv: Argv) {
+        var index = 0
+        while let pointer = argv.argumentPointers[index] {
+            free(pointer)
+            index += 1
+        }
+        argv.argumentPointers.deallocate()
     }
 
     private static func sanitizedOutput(from data: Data) -> String {
