@@ -149,6 +149,8 @@ enum FileBrowserSortField: String, Codable {
 struct FileBrowserPreferences: Codable, Equatable {
     var viewMode: FileBrowserViewMode = .list
     var visibleColumns: [FileBrowserColumn] = [.size, .date]
+    var nameColumnWidth: CGFloat = 360
+    var columnWidths: [FileBrowserColumn: CGFloat] = [:]
     var showHiddenFiles = false
     var foldersFirst = true
     var showRowColors = true
@@ -3525,9 +3527,13 @@ struct FilePane<ToolbarContent: View, ContextMenuContent: View, BackgroundContex
 
     private var listHeader: some View {
         HStack(spacing: 12) {
-            headerButton("Name", field: .name).frame(minWidth: 120, maxWidth: .infinity, alignment: .leading)
+            resizableHeader(title: "Name", field: .name, width: preferences.nameColumnWidth) { width in
+                preferences.nameColumnWidth = width
+            }
             ForEach(preferences.visibleColumns) { column in
-                headerButton(column.rawValue, field: sortField(for: column)).frame(width: column.width, alignment: .leading)
+                resizableHeader(title: column.rawValue, field: sortField(for: column), width: width(for: column)) { width in
+                    preferences.columnWidths[column] = width
+                }
             }
         }
         .font(.system(size: 12, weight: .semibold))
@@ -3546,10 +3552,10 @@ struct FilePane<ToolbarContent: View, ContextMenuContent: View, BackgroundContex
                 Text(item.name)
                     .lineLimit(1)
             }
-            .frame(minWidth: 120, maxWidth: .infinity, alignment: .leading)
+            .frame(width: preferences.nameColumnWidth, alignment: .leading)
             ForEach(preferences.visibleColumns) { column in
                 Text(text(for: column, item: item)).foregroundStyle(isSelected(item) ? Color.primary.opacity(0.9) : Color.secondary)
-                    .frame(width: column.width, alignment: .leading).lineLimit(1)
+                    .frame(width: width(for: column), alignment: .leading).lineLimit(1)
             }
         }
         .font(.system(size: preferences.textSize))
@@ -3649,6 +3655,15 @@ struct FilePane<ToolbarContent: View, ContextMenuContent: View, BackgroundContex
         }.buttonStyle(.plain)
     }
 
+    private func resizableHeader(title: String, field: FileBrowserSortField, width: CGFloat, onResize: @escaping (CGFloat) -> Void) -> some View {
+        headerButton(title, field: field)
+            .frame(width: width, alignment: .leading)
+            .overlay(alignment: .trailing) {
+                ColumnResizeHandle(width: width, onResize: onResize)
+                    .offset(x: 8)
+            }
+    }
+
     private func columnVisibilityBinding(for column: FileBrowserColumn) -> Binding<Bool> {
         Binding(
             get: { preferences.visibleColumns.contains(column) },
@@ -3664,6 +3679,10 @@ struct FilePane<ToolbarContent: View, ContextMenuContent: View, BackgroundContex
 
     private func sortField(for column: FileBrowserColumn) -> FileBrowserSortField {
         switch column { case .size: .size; case .date: .date; case .kind: .kind; case .owner: .owner; case .group: .group; case .permissions: .permissions }
+    }
+
+    private func width(for column: FileBrowserColumn) -> CGFloat {
+        preferences.columnWidths[column] ?? column.width
     }
 
     private func isSelected(_ item: FileItem) -> Bool {
@@ -3765,6 +3784,36 @@ private struct RightClickSelectionView: NSViewRepresentable {
 
     func updateNSView(_ nsView: RightClickTrackingView, context: Context) {
         nsView.onRightClick = onRightClick
+    }
+}
+
+private struct ColumnResizeHandle: View {
+    var width: CGFloat
+    var onResize: (CGFloat) -> Void
+    @State private var startWidth: CGFloat?
+
+    var body: some View {
+        Rectangle()
+            .fill(Color.clear)
+            .frame(width: 10)
+            .contentShape(Rectangle())
+            .overlay {
+                Rectangle()
+                    .fill(VoltTheme.hairline)
+                    .frame(width: 1)
+            }
+            .gesture(
+                DragGesture(minimumDistance: 1)
+                    .onChanged { value in
+                        let start = startWidth ?? width
+                        startWidth = start
+                        onResize(min(520, max(72, start + value.translation.width)))
+                    }
+                    .onEnded { _ in
+                        startWidth = nil
+                    }
+            )
+            .help("Drag to resize column")
     }
 }
 
