@@ -38,6 +38,17 @@ struct TransferQueueView: View {
         max(90, queueHeight - 70)
     }
 
+    private var availableTabs: [TransferPanelTab] {
+        model.remoteEditSessions.isEmpty ? [.transfers] : [.transfers, .remoteEdits]
+    }
+
+    private var selectedTab: TransferPanelTab {
+        if availableTabs.contains(model.transferPanelTab) {
+            return model.transferPanelTab
+        }
+        return .transfers
+    }
+
     private var resizeHandle: some View {
         ZStack {
             Rectangle()
@@ -68,9 +79,7 @@ struct TransferQueueView: View {
     private var expandedQueue: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack {
-                Text("Transfers")
-                    .font(.headline)
-                    .foregroundStyle(.primary)
+                panelTabs
                 Spacer()
                 Button {
                     model.showsTransfers = false
@@ -80,35 +89,7 @@ struct TransferQueueView: View {
                 }
                 .buttonStyle(.plain)
             }
-            Table(model.transfers) {
-                TableColumn("Direction") { Text($0.direction.rawValue) }.width(90)
-                TableColumn("Source") { Text($0.source).lineLimit(1) }
-                TableColumn("Destination") { Text($0.destination).lineLimit(1) }
-                TableColumn("State") { Text($0.state.rawValue) }.width(80)
-                TableColumn("Progress") { job in
-                    if job.totalBytes > 0 {
-                        let fraction = min(1, Double(job.transferredBytes) / Double(job.totalBytes))
-                        VStack(alignment: .leading, spacing: 2) {
-                            ProgressView(value: fraction)
-                            Text("\(Int(fraction * 100))% · \(ByteCountFormatter.string(fromByteCount: Int64(job.transferredBytes), countStyle: .file)) / \(ByteCountFormatter.string(fromByteCount: Int64(job.totalBytes), countStyle: .file))")
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
-                                .lineLimit(1)
-                        }
-                    } else if job.transferredBytes > 0 {
-                        Text(ByteCountFormatter.string(fromByteCount: Int64(job.transferredBytes), countStyle: .file))
-                    } else {
-                        Text("--").foregroundStyle(.secondary)
-                    }
-                }.width(min: 150, ideal: 210)
-                TableColumn("Message") { Text($0.message).lineLimit(1) }
-                TableColumn("") { job in
-                    Button("Cancel") {
-                        model.cancelTransfer(job.id)
-                    }
-                    .disabled(job.state != .queued && job.state != .running)
-                }.width(70)
-            }
+            expandedPanelContent
             .frame(height: tableHeight)
             .background(VoltTheme.paneBackground)
             .clipShape(RoundedRectangle(cornerRadius: 7))
@@ -127,8 +108,7 @@ struct TransferQueueView: View {
     private var compactExpandedQueue: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
-                Text("Transfers")
-                    .font(.headline)
+                panelTabs
                 Spacer()
                 Button {
                     model.showsTransfers = false
@@ -139,25 +119,138 @@ struct TransferQueueView: View {
                 .buttonStyle(.plain)
             }
 
-            if model.transfers.isEmpty {
-                Text("No transfers")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.vertical, 10)
-            } else {
-                ScrollView {
-                    LazyVStack(spacing: 6) {
-                        ForEach(model.transfers) { job in
-                            compactTransferRow(job)
-                        }
-                    }
-                }
-                .frame(maxHeight: 126)
-            }
+            compactPanelContent
         }
         .padding(10)
         .background(VoltTheme.transferPanelBackground)
+    }
+
+    private var panelTabs: some View {
+        Picker("Transfer panel", selection: Binding(
+            get: { selectedTab },
+            set: { model.transferPanelTab = $0 }
+        )) {
+            Text("Transfers (\(model.transfers.count))").tag(TransferPanelTab.transfers)
+            if !model.remoteEditSessions.isEmpty {
+                Text("Remote Edits (\(model.remoteEditSessions.count))").tag(TransferPanelTab.remoteEdits)
+            }
+        }
+        .pickerStyle(.segmented)
+        .labelsHidden()
+        .frame(maxWidth: 360)
+    }
+
+    @ViewBuilder private var expandedPanelContent: some View {
+        switch selectedTab {
+        case .transfers:
+            transfersTable
+        case .remoteEdits:
+            remoteEditsTable
+        }
+    }
+
+    private var transfersTable: some View {
+        Table(model.transfers) {
+            TableColumn("Direction") { Text($0.direction.rawValue) }.width(90)
+            TableColumn("Source") { Text($0.source).lineLimit(1) }
+            TableColumn("Destination") { Text($0.destination).lineLimit(1) }
+            TableColumn("State") { Text($0.state.rawValue) }.width(80)
+            TableColumn("Progress") { job in
+                if job.totalBytes > 0 {
+                    let fraction = min(1, Double(job.transferredBytes) / Double(job.totalBytes))
+                    VStack(alignment: .leading, spacing: 2) {
+                        ProgressView(value: fraction)
+                        Text("\(Int(fraction * 100))% · \(ByteCountFormatter.string(fromByteCount: Int64(job.transferredBytes), countStyle: .file)) / \(ByteCountFormatter.string(fromByteCount: Int64(job.totalBytes), countStyle: .file))")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+                } else if job.transferredBytes > 0 {
+                    Text(ByteCountFormatter.string(fromByteCount: Int64(job.transferredBytes), countStyle: .file))
+                } else {
+                    Text("--").foregroundStyle(.secondary)
+                }
+            }.width(min: 150, ideal: 210)
+            TableColumn("Message") { Text($0.message).lineLimit(1) }
+            TableColumn("") { job in
+                Button("Cancel") {
+                    model.cancelTransfer(job.id)
+                }
+                .disabled(job.state != .queued && job.state != .running)
+            }.width(70)
+        }
+    }
+
+    private var remoteEditsTable: some View {
+        Table(model.remoteEditSessions) {
+            TableColumn("File") { session in
+                Text(session.fileName)
+                    .lineLimit(1)
+            }
+            TableColumn("Remote Path") { session in
+                Text(session.remotePath)
+                    .lineLimit(1)
+                    .foregroundStyle(.secondary)
+            }
+            TableColumn("Action") { session in
+                HStack(spacing: 8) {
+                    Button("Upload Edited") {
+                        model.uploadEditedRemoteFile(session)
+                    }
+                    Button("Discard") {
+                        model.discardRemoteEditSession(session)
+                    }
+                }
+            }
+            .width(210)
+        }
+    }
+
+    @ViewBuilder private var compactPanelContent: some View {
+        switch selectedTab {
+        case .transfers:
+            compactTransfersList
+        case .remoteEdits:
+            compactRemoteEditsList
+        }
+    }
+
+    @ViewBuilder private var compactTransfersList: some View {
+        if model.transfers.isEmpty {
+            Text("No transfers")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.vertical, 10)
+        } else {
+            ScrollView {
+                LazyVStack(spacing: 6) {
+                    ForEach(model.transfers) { job in
+                        compactTransferRow(job)
+                    }
+                }
+            }
+            .frame(maxHeight: 126)
+        }
+    }
+
+    @ViewBuilder private var compactRemoteEditsList: some View {
+        if model.remoteEditSessions.isEmpty {
+            Text("No remote edits")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.vertical, 10)
+        } else {
+            ScrollView {
+                LazyVStack(spacing: 6) {
+                    ForEach(model.remoteEditSessions) { session in
+                        compactRemoteEditRow(session)
+                    }
+                }
+            }
+            .frame(maxHeight: 126)
+        }
     }
 
     private var compactBar: some View {
@@ -186,7 +279,7 @@ struct TransferQueueView: View {
             Button {
                 model.showsTransfers.toggle()
             } label: {
-                Text("\(model.transfers.count) transfers")
+                Text(queueCountText)
                     .fontWeight(.semibold)
             }
             .buttonStyle(.plain)
@@ -271,6 +364,36 @@ struct TransferQueueView: View {
         )
     }
 
+    private func compactRemoteEditRow(_ session: RemoteEditSession) -> some View {
+        HStack(spacing: 9) {
+            Image(systemName: "doc.text")
+                .foregroundStyle(Color.accentColor)
+                .frame(width: 18)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(session.fileName)
+                    .font(.caption.weight(.medium))
+                    .lineLimit(1)
+                Text(session.remotePath)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            Spacer(minLength: 8)
+            Button("Upload") {
+                model.uploadEditedRemoteFile(session)
+            }
+            Button("Discard") {
+                model.discardRemoteEditSession(session)
+            }
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
+        .background(
+            RoundedRectangle(cornerRadius: 6)
+                .fill(VoltTheme.controlBackground)
+        )
+    }
+
     private var primaryTransfer: TransferJob? {
         model.transfers.first { $0.state == .running || $0.state == .queued } ?? model.transfers.first
     }
@@ -285,6 +408,13 @@ struct TransferQueueView: View {
         let total = model.transfers.reduce(UInt64(0)) { $0 + $1.totalBytes }
         guard total > 0 else { return "Total --" }
         return "Total \(ByteCountFormatter.string(fromByteCount: Int64(transferred), countStyle: .file)) / \(ByteCountFormatter.string(fromByteCount: Int64(total), countStyle: .file))"
+    }
+
+    private var queueCountText: String {
+        if model.remoteEditSessions.isEmpty {
+            return "\(model.transfers.count) transfers"
+        }
+        return "\(model.transfers.count) transfers · \(model.remoteEditSessions.count) edits"
     }
 
     private func transferChip(_ job: TransferJob) -> some View {

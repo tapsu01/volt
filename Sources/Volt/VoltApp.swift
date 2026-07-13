@@ -224,6 +224,11 @@ enum TransferState: String {
     case cancelled = "Cancelled"
 }
 
+enum TransferPanelTab: String {
+    case transfers = "Transfers"
+    case remoteEdits = "Remote Edits"
+}
+
 struct TransferJob: Identifiable {
     let id = UUID()
     var direction: TransferDirection
@@ -853,6 +858,7 @@ final class AppModel: ObservableObject {
     @Published var showsConnectionEditor = false
     @Published var showsInspector = false
     @Published var showsTransfers = false
+    @Published var transferPanelTab: TransferPanelTab = .transfers
     @Published var showsPasswordPrompt = false
     @Published var showsHostKeyPrompt = false
     @Published var pendingHostKeyFingerprint = ""
@@ -2192,6 +2198,8 @@ final class AppModel: ObservableObject {
             await MainActor.run {
                 self.remoteEditSessions.insert(RemoteEditSession(remotePath: remoteItem.path, localPath: localURL.path, fileName: remoteItem.name), at: 0)
                 self.markTransfer(transferID, .done, "Opened for edit")
+                self.showsTransfers = true
+                self.transferPanelTab = .remoteEdits
                 self.status = "Editing \(remoteItem.name). Save in editor, then click Upload Edited."
                 self.openFile(localURL, with: appURL)
             }
@@ -2656,7 +2664,6 @@ private struct MainLayoutView: View {
                 activePane: $activeBrowserPane,
                 searchText: searchText
             )
-            RemoteEditSessionsView(model: model)
             TransferQueueView(model: model, layout: layout)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -4194,44 +4201,6 @@ private final class RightClickTrackingView: NSView {
         if let eventMonitor {
             NSEvent.removeMonitor(eventMonitor)
             self.eventMonitor = nil
-        }
-    }
-}
-
-struct RemoteEditSessionsView: View {
-    @ObservedObject var model: AppModel
-
-    var body: some View {
-        if !model.remoteEditSessions.isEmpty {
-            VStack(alignment: .leading, spacing: 6) {
-                Text("Remote Edits")
-                    .font(.headline)
-                Table(model.remoteEditSessions) {
-                    TableColumn("File") { session in
-                        Text(session.fileName)
-                            .lineLimit(1)
-                    }
-                    TableColumn("Remote Path") { session in
-                        Text(session.remotePath)
-                            .lineLimit(1)
-                            .foregroundStyle(.secondary)
-                    }
-                    TableColumn("Action") { session in
-                        HStack(spacing: 8) {
-                            Button("Upload Edited") {
-                                model.uploadEditedRemoteFile(session)
-                            }
-                            Button("Discard") {
-                                model.discardRemoteEditSession(session)
-                            }
-                        }
-                    }
-                    .width(210)
-                }
-                .frame(height: 90)
-            }
-            .padding(.horizontal, 10)
-            .padding(.top, 8)
         }
     }
 }
