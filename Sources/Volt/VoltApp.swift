@@ -910,6 +910,16 @@ final class AppModel: ObservableObject {
         tabs.first { $0.id == selectedTabID }
     }
 
+    var connectedConnectionIDs: Set<UUID> {
+        Set(tabs.compactMap { tab in
+            tab.isConnected ? tab.connectionID : nil
+        })
+    }
+
+    func isConnectionConnected(_ id: UUID) -> Bool {
+        connectedConnectionIDs.contains(id)
+    }
+
     func newTab() {
         syncCurrentTab()
         let clonedCredential = credentialForCurrentTab().clone()
@@ -1071,8 +1081,10 @@ final class AppModel: ObservableObject {
             status = validationError
             return
         }
+        selectOrCreateTab(for: connection)
         if selectedConnectionID == connection.id, isConnected {
             showsConnectionEditor = false
+            syncCurrentTab()
             return
         }
         if selectedConnectionID != connection.id {
@@ -1098,6 +1110,7 @@ final class AppModel: ObservableObject {
     }
 
     func editConnection(_ connection: SavedConnection) {
+        selectOrCreateTab(for: connection)
         if selectedConnectionID != connection.id {
             guard confirmDiscardEditSessions(remoteEditSessions, action: "edit another connection") else { return }
             cleanupEditSessions(remoteEditSessions)
@@ -1174,24 +1187,31 @@ final class AppModel: ObservableObject {
     }
 
     func disconnectConnection(id: UUID? = nil) {
-        if id == nil || selectedConnectionID == id {
-            guard confirmDiscardEditSessions(remoteEditSessions, action: "disconnect") else { return }
-            cleanupEditSessions(remoteEditSessions)
-            selectedConnectionID = nil
-            connectionDraft = SavedConnection()
-            if let tabID = selectedTabID {
-                tabCredentials.removeValue(forKey: tabID)?.clear()
+        syncCurrentTab()
+        guard let targetConnectionID = id ?? selectedConnectionID else { return }
+        let targetTabIDs = tabs
+            .filter { $0.connectionID == targetConnectionID }
+            .map(\.id)
+        guard !targetTabIDs.isEmpty else { return }
+
+        let sessions = tabs
+            .filter { targetTabIDs.contains($0.id) }
+            .flatMap(\.remoteEditSessions)
+        guard confirmDiscardEditSessions(sessions, action: "disconnect") else { return }
+
+        for tabID in targetTabIDs {
+            if let index = tabs.firstIndex(where: { $0.id == tabID }) {
+                cleanupEditSessions(tabs[index].remoteEditSessions)
+                resetConnectionState(forTabAt: index, showEditor: tabID == selectedTabID)
             }
-            remoteItems = []
-            selectedRemoteIDs.removeAll()
-            remotePath = "/"
-            remoteEditSessions = []
-            isConnected = false
-            showsConnectionEditor = true
-            showsPasswordPrompt = false
-            status = "Disconnected"
-            syncCurrentTab()
+            tabCredentials.removeValue(forKey: tabID)?.clear()
         }
+
+        if let selectedTabID, targetTabIDs.contains(selectedTabID) {
+            restoreCurrentTab()
+        }
+        showsPasswordPrompt = false
+        status = "Disconnected"
     }
 
     func connectWithPassword(_ password: String) {
@@ -1299,17 +1319,29 @@ final class AppModel: ObservableObject {
                 throw error
             }
             await MainActor.run {
-                guard self.selectedConnectionID == connection.id, self.remotePath == path else { return }
-                self.remoteItems = result.items
-                // Cache chỉ items — warning count là trạng thái nhất thời của lần list này.
+                guard let operationTabID,
+                      let tabIndex = self.tabs.firstIndex(where: { $0.id == operationTabID }),
+                      self.tabs[tabIndex].connectionID == connection.id,
+                      self.tabs[tabIndex].remotePath == path
+                else { return }
+
                 self.remoteDirectoryCache[self.remoteCacheKey(connectionID: connection.id, path: path)] = result.items
-                self.isConnected = true
-                self.showsConnectionEditor = false
-                // Ưu tiên warning; không hiển thị/log chính filename bị chặn (chỉ số đếm).
-                self.status = result.skippedUnsafeCount > 0
+                let statusText = result.skippedUnsafeCount > 0
                     ? "\(result.skippedUnsafeCount) unsafe remote entries were hidden."
                     : finalStatus
-                self.syncCurrentTab()
+
+                if self.selectedTabID == operationTabID {
+                    self.remoteItems = result.items
+                    self.isConnected = true
+                    self.showsConnectionEditor = false
+                    self.status = statusText
+                    self.syncCurrentTab()
+                } else {
+                    self.tabs[tabIndex].remoteItems = result.items
+                    self.tabs[tabIndex].isConnected = true
+                    self.tabs[tabIndex].showsConnectionEditor = false
+                    self.tabs[tabIndex].title = connection.name
+                }
             }
         }
     }
@@ -2385,6 +2417,54 @@ final class AppModel: ObservableObject {
         credentialForCurrentTab().replace(with: sanitized)
     }
 
+    private func tabIDForConnection(_ id: UUID) -> BrowserTab.ID? {
+        tabs.first { $0.connectionID == id && $0.isConnected }?.id
+            ?? tabs.first { $0.connectionID == id }?.id
+    }
+
+    private func selectOrCreateTab(for connection: SavedConnection) {
+        syncCurrentTab()
+
+        if let tabID = tabIDForConnection(connection.id) {
+            if selectedTabID != tabID {
+                selectTab(tabID)
+            }
+            return
+        }
+
+        guard let selectedConnectionID,
+              selectedConnectionID != connection.id,
+              isConnected
+        else {
+            return
+        }
+
+        var tab = BrowserTab()
+        tab.title = connection.name
+        tab.localPath = localPath
+        tab.localItems = localItems
+        tabs.append(tab)
+        tabCredentials[tab.id] = SensitiveCredential()
+        selectTab(tab.id)
+    }
+
+    private func resetConnectionState(forTabAt index: Int, showEditor: Bool) {
+        tabs[index].connectionID = nil
+        tabs[index].connectionDraft = SavedConnection()
+        tabs[index].remotePath = "/"
+        tabs[index].remoteItems = []
+        tabs[index].selectedRemoteIDs = []
+        tabs[index].remoteEditSessions = []
+        tabs[index].isConnected = false
+        tabs[index].showsConnectionEditor = showEditor
+        tabs[index].title = tabTitle(forLocalPath: tabs[index].localPath)
+    }
+
+    private func tabTitle(forLocalPath path: String) -> String {
+        let title = URL(fileURLWithPath: path).lastPathComponent
+        return title.isEmpty ? "Local" : title
+    }
+
     nonisolated private func isAuthenticationFailure(_ error: Error) -> Bool {
         let message = error.localizedDescription.lowercased()
         return message.contains("authentication failed") || message.contains("password authentication") || message.contains("private key authentication")
@@ -2429,7 +2509,7 @@ final class AppModel: ObservableObject {
         if let connection = selectedConnection {
             tabs[index].title = connection.name
         } else {
-            tabs[index].title = URL(fileURLWithPath: localPath).lastPathComponent.isEmpty ? "Local" : URL(fileURLWithPath: localPath).lastPathComponent
+            tabs[index].title = tabTitle(forLocalPath: localPath)
         }
     }
 

@@ -192,6 +192,8 @@ struct SidebarView: View {
                     iconButton("plus", help: "New connection", action: model.newConnection)
 
                     ForEach(model.connections) { connection in
+                        let isSelected = model.selectedConnectionID == connection.id
+                        let isLive = model.isConnectionConnected(connection.id)
                         Button {
                             model.select(connection)
                         } label: {
@@ -200,13 +202,13 @@ struct SidebarView: View {
                                     .font(.system(size: 16, weight: .semibold))
                                     .frame(width: 40, height: 34)
                                 Circle()
-                                    .fill(model.selectedConnectionID == connection.id && model.isConnected ? Color.green : Color.gray.opacity(0.65))
+                                    .fill(isLive ? Color.green : Color.gray.opacity(0.65))
                                     .frame(width: 8, height: 8)
                                     .offset(x: -6, y: -5)
                             }
                             .background(
                                 RoundedRectangle(cornerRadius: 7)
-                                    .fill(model.selectedConnectionID == connection.id ? VoltTheme.selectedFill : Color.clear)
+                                    .fill(isSelected ? VoltTheme.selectedFill : Color.clear)
                             )
                         }
                         .buttonStyle(.plain)
@@ -294,7 +296,7 @@ struct SidebarView: View {
 
     private func serverRow(_ connection: SavedConnection) -> some View {
         let isSelected = model.selectedConnectionID == connection.id
-        let isLive = isSelected && model.isConnected
+        let isLive = model.isConnectionConnected(connection.id)
         return Button {
             model.select(connection)
         } label: {
@@ -319,7 +321,7 @@ struct SidebarView: View {
         .contextMenu {
             Button("Edit") { model.editConnection(connection) }
             Button("Disconnect") { model.disconnectConnection(id: connection.id) }
-                .disabled(model.selectedConnectionID != connection.id)
+                .disabled(!isLive)
             Divider()
             Button("Remove") { model.removeConnection(id: connection.id) }
         }
