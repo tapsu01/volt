@@ -2,6 +2,7 @@ import SwiftUI
 
 struct VoltTopToolbar: View {
     @ObservedObject var model: AppModel
+    var layout: AppLayoutContext
     @Binding var showsSidebar: Bool
     @Binding var searchText: String
     @Binding var appAppearance: AppAppearance
@@ -16,7 +17,9 @@ struct VoltTopToolbar: View {
                 Divider().frame(height: 28)
                 transferControls
                 Spacer(minLength: 12)
-                searchField
+                if layout.toolbarDensity == .expanded {
+                    searchField
+                }
                 appearanceToggle
                 viewControls
             }
@@ -68,10 +71,7 @@ struct VoltTopToolbar: View {
                     .frame(width: 10, height: 10)
                 Text(model.selectedConnection?.name ?? "No Server")
                     .lineLimit(1)
-                    .frame(maxWidth: 150, alignment: .leading)
-                Image(systemName: "chevron.down")
-                    .font(.caption2.weight(.bold))
-                    .foregroundStyle(VoltTheme.mutedText)
+                    .frame(maxWidth: layout.toolbarDensity == .expanded ? 150 : 92, alignment: .leading)
             }
             .font(.system(size: 13, weight: .medium))
             .padding(.horizontal, 10)
@@ -128,25 +128,29 @@ struct VoltTopToolbar: View {
                 }
             }
 
-            Divider()
-                .frame(height: 24)
+            if layout.toolbarDensity != .minimal {
+                Divider()
+                    .frame(height: 24)
+            }
 
-            HStack(alignment: .center, spacing: 13) {
-                toolbarIconButton("folder.badge.plus", help: "New folder") {
-                    if model.isConnected {
-                        model.makeRemoteFolder()
-                    } else {
-                        model.makeLocalFolder()
+            if layout.toolbarDensity != .minimal {
+                HStack(alignment: .center, spacing: 13) {
+                    toolbarIconButton("folder.badge.plus", help: "New folder") {
+                        if model.isConnected {
+                            model.makeRemoteFolder()
+                        } else {
+                            model.makeLocalFolder()
+                        }
                     }
-                }
-                toolbarIconButton("trash", help: "Delete selected item") {
-                    if model.selectedRemote != nil {
-                        model.deleteRemoteSelected()
-                    } else {
-                        model.deleteLocalSelected()
+                    toolbarIconButton("trash", help: "Delete selected item") {
+                        if model.selectedRemote != nil {
+                            model.deleteRemoteSelected()
+                        } else {
+                            model.deleteLocalSelected()
+                        }
                     }
+                    .disabled(model.selectedRemote == nil && model.selectedLocal == nil)
                 }
-                .disabled(model.selectedRemote == nil && model.selectedLocal == nil)
             }
         }
         .buttonStyle(.plain)
@@ -189,13 +193,32 @@ struct VoltTopToolbar: View {
             toolbarButton(model.showsInspector ? "info.circle.fill" : "info.circle", help: "Toggle Inspector") {
                 model.showsInspector.toggle()
             }
-            toolbarButton("list.bullet", help: "List view") {
-                model.localBrowserPreferences.viewMode = .list
-                model.remoteBrowserPreferences.viewMode = .list
-            }
-            toolbarButton("square.grid.2x2", help: "Icon view") {
-                model.localBrowserPreferences.viewMode = .icons
-                model.remoteBrowserPreferences.viewMode = .icons
+            if layout.toolbarDensity == .expanded {
+                toolbarButton("list.bullet", help: "List view") {
+                    model.localBrowserPreferences.viewMode = .list
+                    model.remoteBrowserPreferences.viewMode = .list
+                }
+                toolbarButton("square.grid.2x2", help: "Icon view") {
+                    model.localBrowserPreferences.viewMode = .icons
+                    model.remoteBrowserPreferences.viewMode = .icons
+                }
+            } else {
+                Menu {
+                    Button("List View") {
+                        model.localBrowserPreferences.viewMode = .list
+                        model.remoteBrowserPreferences.viewMode = .list
+                    }
+                    Button("Icon View") {
+                        model.localBrowserPreferences.viewMode = .icons
+                        model.remoteBrowserPreferences.viewMode = .icons
+                    }
+                } label: {
+                    Image(systemName: "ellipsis.circle")
+                        .font(.system(size: 15, weight: .semibold))
+                        .frame(width: 30, height: 30)
+                }
+                .menuStyle(.borderlessButton)
+                .help("More view options")
             }
         }
     }
@@ -241,11 +264,13 @@ struct VoltTopToolbar: View {
                 .font(.system(size: 16, weight: .semibold))
                 .foregroundStyle(.primary)
                 .frame(width: 19, height: 18)
-            Text(title)
-                .font(.system(size: 13, weight: .medium))
-                .foregroundStyle(.primary)
-                .lineLimit(1)
-                .fixedSize(horizontal: true, vertical: false)
+            if layout.toolbarDensity == .expanded {
+                Text(title)
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(.primary)
+                    .lineLimit(1)
+                    .fixedSize(horizontal: true, vertical: false)
+            }
         }
         .frame(height: 30, alignment: .center)
         .fixedSize(horizontal: true, vertical: false)

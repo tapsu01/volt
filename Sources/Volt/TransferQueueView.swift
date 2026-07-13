@@ -3,11 +3,16 @@ import SwiftUI
 
 struct TransferQueueView: View {
     @ObservedObject var model: AppModel
+    var layout: AppLayoutContext
 
     var body: some View {
         VStack(spacing: 0) {
             if model.showsTransfers {
-                expandedQueue
+                if layout.isQueueCompact {
+                    compactExpandedQueue
+                } else {
+                    expandedQueue
+                }
                 Divider()
             }
 
@@ -64,9 +69,50 @@ struct TransferQueueView: View {
         .padding(10)
     }
 
+    private var compactExpandedQueue: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text("Transfers")
+                    .font(.headline)
+                Spacer()
+                Button {
+                    model.showsTransfers = false
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+            }
+
+            if model.transfers.isEmpty {
+                Text("No transfers")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.vertical, 10)
+            } else {
+                ScrollView {
+                    LazyVStack(spacing: 6) {
+                        ForEach(model.transfers) { job in
+                            compactTransferRow(job)
+                        }
+                    }
+                }
+                .frame(maxHeight: 126)
+            }
+        }
+        .padding(10)
+    }
+
     private var compactBar: some View {
         HStack(spacing: 14) {
-            if let first = primaryTransfer {
+            if layout.isQueueCompact {
+                Image(systemName: model.isBusy ? "arrow.triangle.2.circlepath" : "checkmark.circle")
+                    .foregroundStyle(model.isBusy ? Color.accentColor : Color.secondary)
+                Text(model.status)
+                    .lineLimit(1)
+                    .foregroundStyle(VoltTheme.mutedText)
+            } else if let first = primaryTransfer {
                 transferChip(first)
                 if let second = secondaryTransfer {
                     Divider().frame(height: 26)
@@ -102,15 +148,17 @@ struct TransferQueueView: View {
 
             Spacer(minLength: 12)
 
-            if model.isBusy {
+            if model.isBusy && !layout.isQueueCompact {
                 ProgressView()
                     .controlSize(.small)
             }
 
-            Text(model.status)
-                .foregroundStyle(VoltTheme.mutedText)
-                .lineLimit(1)
-                .frame(maxWidth: 260, alignment: .trailing)
+            if !layout.isQueueCompact {
+                Text(model.status)
+                    .foregroundStyle(VoltTheme.mutedText)
+                    .lineLimit(1)
+                    .frame(maxWidth: 260, alignment: .trailing)
+            }
 
             Button {
                 model.showsTransfers.toggle()
@@ -129,6 +177,36 @@ struct TransferQueueView: View {
                 .fill(VoltTheme.hairline)
                 .frame(height: 1)
         }
+    }
+
+    private func compactTransferRow(_ job: TransferJob) -> some View {
+        HStack(spacing: 9) {
+            Image(systemName: job.direction == .upload ? "square.and.arrow.up" : "square.and.arrow.down")
+                .foregroundStyle(job.direction == .upload ? Color.accentColor : Color.green)
+                .frame(width: 18)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(URL(fileURLWithPath: job.source).lastPathComponent)
+                    .font(.caption.weight(.medium))
+                    .lineLimit(1)
+                Text("\(job.direction.rawValue) · \(job.state.rawValue)")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            Spacer(minLength: 8)
+            ProgressView(value: progress(for: job))
+                .frame(width: 86)
+            Text("\(Int(progress(for: job) * 100))%")
+                .font(.caption2.monospacedDigit())
+                .foregroundStyle(.secondary)
+                .frame(width: 34, alignment: .trailing)
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
+        .background(
+            RoundedRectangle(cornerRadius: 6)
+                .fill(VoltTheme.controlBackground)
+        )
     }
 
     private var primaryTransfer: TransferJob? {

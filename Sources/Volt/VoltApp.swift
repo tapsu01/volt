@@ -2122,7 +2122,6 @@ struct ContentView: View {
     @State private var showsSidebar = true
     @State private var searchText = ""
     @AppStorage("Volt.AppAppearance") private var appAppearanceRawValue = AppAppearance.light.rawValue
-    private let sidebarWidth: CGFloat = 240
 
     private var appAppearance: Binding<AppAppearance> {
         Binding(
@@ -2132,45 +2131,22 @@ struct ContentView: View {
     }
 
     var body: some View {
-        VStack(spacing: 0) {
-            HStack(spacing: 0) {
-                if showsSidebar {
-                    SidebarBrandHeader()
-                        .frame(width: sidebarWidth)
-                }
-                VoltTopToolbar(
-                    model: model,
-                    showsSidebar: $showsSidebar,
-                    searchText: $searchText,
-                    appAppearance: appAppearance
-                )
-            }
+        GeometryReader { proxy in
+            let layout = AppLayoutContext.make(
+                width: proxy.size.width,
+                inspectorOpen: model.showsInspector,
+                remoteConnected: model.isConnected,
+                queueExpanded: model.showsTransfers,
+                sidebarVisible: showsSidebar
+            )
 
-            HStack(spacing: 0) {
-                if showsSidebar {
-                    SidebarView(model: model)
-                        .frame(width: sidebarWidth)
-                }
-
-                VStack(spacing: 0) {
-                    if model.tabs.count > 1 {
-                        SessionTabBar(model: model)
-                            .frame(height: 34)
-                            .background(VoltTheme.toolbarBackground)
-                            .overlay(alignment: .bottom) {
-                                Rectangle()
-                                    .fill(VoltTheme.hairline)
-                                    .frame(height: 1)
-                            }
-                    }
-                    BrowserSplitView(model: model, searchText: searchText)
-                    RemoteEditSessionsView(model: model)
-                    TransferQueueView(model: model)
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .clipped()
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            MainLayoutView(
+                model: model,
+                layout: layout,
+                showsSidebar: $showsSidebar,
+                searchText: $searchText,
+                appAppearance: appAppearance
+            )
         }
         .background(VoltTheme.appBackground)
         .preferredColorScheme(appAppearance.wrappedValue.colorScheme)
@@ -2184,9 +2160,6 @@ struct ContentView: View {
                 .frame(width: 820)
                 .presentationSizing(.fitted)
         }
-        .inspector(isPresented: $model.showsInspector) {
-            InspectorView(model: model)
-        }
         .sheet(isPresented: $model.showsPasswordPrompt) {
             PasswordPromptView(model: model)
         }
@@ -2196,9 +2169,164 @@ struct ContentView: View {
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)) { _ in
             model.prepareForTermination()
         }
-        .frame(minWidth: 1120, minHeight: 720)
+        .frame(minWidth: 760, minHeight: 640)
     }
 }
+
+private struct MainLayoutView: View {
+    @ObservedObject var model: AppModel
+    var layout: AppLayoutContext
+    @Binding var showsSidebar: Bool
+    @Binding var searchText: String
+    @Binding var appAppearance: AppAppearance
+    @State private var activeBrowserPane: ActiveBrowserPane = .local
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 0) {
+                if layout.sidebarMode != .hidden {
+                    SidebarBrandHeader(layout: layout)
+                        .frame(width: layout.sidebarWidth)
+                }
+                VoltTopToolbar(
+                    model: model,
+                    layout: layout,
+                    showsSidebar: $showsSidebar,
+                    searchText: $searchText,
+                    appAppearance: $appAppearance
+                )
+            }
+
+            HStack(spacing: 0) {
+                if layout.sidebarMode != .hidden {
+                    SidebarView(model: model, layout: layout)
+                        .frame(width: layout.sidebarWidth)
+                }
+
+                ZStack(alignment: .trailing) {
+                    HStack(spacing: 0) {
+                        mainContent
+
+                        if layout.inspectorMode == .docked {
+                            Divider()
+                            InspectorView(model: model)
+                                .frame(width: layout.inspectorWidth)
+                        }
+                    }
+
+                    if layout.inspectorMode == .overlay {
+                        InspectorOverlay(model: model, width: layout.inspectorWidth)
+                            .transition(.move(edge: .trailing).combined(with: .opacity))
+                    }
+
+                    #if DEBUG
+                    LayoutDebugBadge(layout: layout)
+                        .padding(10)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
+                        .allowsHitTesting(false)
+                    #endif
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .clipped()
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+        .background(VoltTheme.appBackground)
+        .sheet(isPresented: inspectorSheetBinding) {
+            InspectorView(model: model)
+                .frame(width: layout.inspectorWidth, height: 560)
+        }
+        .animation(.easeInOut(duration: 0.16), value: layout.inspectorMode)
+        .animation(.easeInOut(duration: 0.16), value: layout.sidebarMode)
+        .onChange(of: layout.browserMode) { _, mode in
+            if mode == .singlePane, activeBrowserPane == .remote, !model.isConnected {
+                activeBrowserPane = .local
+            }
+        }
+    }
+
+    private var mainContent: some View {
+        VStack(spacing: 0) {
+            if model.tabs.count > 1 {
+                SessionTabBar(model: model)
+                    .frame(height: 34)
+                    .background(VoltTheme.toolbarBackground)
+                    .overlay(alignment: .bottom) {
+                        Rectangle()
+                            .fill(VoltTheme.hairline)
+                            .frame(height: 1)
+                    }
+            }
+            BrowserSplitView(
+                model: model,
+                layout: layout,
+                activePane: $activeBrowserPane,
+                searchText: searchText
+            )
+            RemoteEditSessionsView(model: model)
+            TransferQueueView(model: model, layout: layout)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private var inspectorSheetBinding: Binding<Bool> {
+        Binding(
+            get: { model.showsInspector && layout.inspectorMode == .sheet },
+            set: { isPresented in
+                if !isPresented {
+                    model.showsInspector = false
+                }
+            }
+        )
+    }
+}
+
+private struct InspectorOverlay: View {
+    @ObservedObject var model: AppModel
+    var width: CGFloat
+
+    var body: some View {
+        HStack(spacing: 0) {
+            Button {
+                model.showsInspector = false
+            } label: {
+                Color.black.opacity(0.001)
+            }
+            .buttonStyle(.plain)
+
+            InspectorView(model: model)
+                .frame(width: width)
+                .background(VoltTheme.appBackground)
+                .overlay(alignment: .leading) {
+                    Rectangle()
+                        .fill(VoltTheme.hairline)
+                        .frame(width: 1)
+                }
+        }
+    }
+}
+
+#if DEBUG
+private struct LayoutDebugBadge: View {
+    var layout: AppLayoutContext
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text("mode: \(String(describing: layout.mode))")
+            Text("dualPane: \(layout.isDualPane ? "true" : "false")")
+            Text("inspector: \(String(describing: layout.inspectorMode))")
+            Text("sidebar: \(String(describing: layout.sidebarMode))")
+            Text("width: \(Int(layout.width))")
+        }
+        .font(.system(size: 10, weight: .medium, design: .monospaced))
+        .foregroundStyle(.secondary)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
+        .background(.thinMaterial)
+        .clipShape(RoundedRectangle(cornerRadius: 6))
+    }
+}
+#endif
 
 private struct WindowConfigurator: NSViewRepresentable {
     var appAppearance: AppAppearance
@@ -2444,10 +2572,12 @@ struct ConnectionEditor: View {
                 }
                 .labelsHidden()
                 .frame(minWidth: 100, idealWidth: 160, maxWidth: 180)
-                Button(action: model.hideConnectionEditor) { Label("Cancel", systemImage: "xmark.circle") }
-                Button(action: model.saveDraft) { Label("Save", systemImage: "tray.and.arrow.down") }
                 Button(action: model.connectDraft) { Label("Connect", systemImage: "bolt.horizontal") }
+                    .buttonStyle(.borderedProminent)
+                    .tint(Color.accentColor)
                     .disabled(model.connectionDraft.host.isEmpty)
+                Button(action: model.saveDraft) { Label("Save", systemImage: "tray.and.arrow.down") }
+                Button(action: model.hideConnectionEditor) { Label("Cancel", systemImage: "xmark.circle") }
             }
 
             HStack(spacing: 12) {
@@ -2566,26 +2696,87 @@ struct ConnectionSummaryView: View {
 
 struct BrowserSplitView: View {
     @ObservedObject var model: AppModel
+    var layout: AppLayoutContext
+    @Binding var activePane: ActiveBrowserPane
     var searchText: String
 
     var body: some View {
-        GeometryReader { proxy in
-            let paneWidth = max(300, proxy.size.width / 2)
+        VStack(spacing: 0) {
+            if layout.browserMode == .singlePane {
+                browserPaneSwitcher
+            }
+
             HStack(spacing: 0) {
-                localPane
-                    .frame(width: paneWidth)
-                Divider()
-                if model.isConnected {
-                    remotePane
-                        .frame(width: paneWidth)
+                if layout.browserMode == .dualPane {
+                    localPane
+                        .frame(maxWidth: .infinity)
+                    Divider()
+                    if model.isConnected {
+                        remotePane
+                            .frame(maxWidth: .infinity)
+                    } else {
+                        disconnectedRemotePane
+                            .frame(maxWidth: .infinity)
+                    }
                 } else {
-                    disconnectedRemotePane
-                        .frame(width: paneWidth)
+                    activeSinglePane
+                        .frame(maxWidth: .infinity)
                 }
             }
-            .frame(width: proxy.size.width, height: proxy.size.height, alignment: .leading)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .background(VoltTheme.paneBackground)
+    }
+
+    private var browserPaneSwitcher: some View {
+        HStack(spacing: 10) {
+            Picker("Pane", selection: $activePane) {
+                ForEach(ActiveBrowserPane.allCases) { pane in
+                    Text(pane.rawValue).tag(pane)
+                }
+            }
+            .pickerStyle(.segmented)
+            .frame(width: 190)
+
+            if !model.isConnected {
+                Text("Remote is not connected")
+                    .font(.caption)
+                    .foregroundStyle(VoltTheme.mutedText)
+                    .lineLimit(1)
+            }
+
+            Spacer()
+
+            if activePane == .remote && !model.isConnected {
+                Button {
+                    model.showConnectionEditor()
+                } label: {
+                    Label("Connect", systemImage: "bolt.horizontal")
+                }
+                .buttonStyle(.borderedProminent)
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+        .background(VoltTheme.toolbarBackground)
+        .overlay(alignment: .bottom) {
+            Rectangle()
+                .fill(VoltTheme.hairline)
+                .frame(height: 1)
+        }
+    }
+
+    @ViewBuilder private var activeSinglePane: some View {
+        switch activePane {
+        case .local:
+            localPane
+        case .remote:
+            if model.isConnected {
+                remotePane
+            } else {
+                disconnectedRemotePane
+            }
+        }
     }
 
     private var disconnectedRemotePane: some View {

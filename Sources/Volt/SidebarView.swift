@@ -3,19 +3,31 @@ import AppKit
 import SwiftUI
 
 struct SidebarBrandHeader: View {
+    var layout: AppLayoutContext
+
     var body: some View {
-        HStack(spacing: 10) {
-            TrafficLightControls()
-                .padding(.leading, 24)
-            Spacer(minLength: 24)
-            Image(systemName: "bolt.fill")
-                .font(.system(size: 19, weight: .semibold))
-                .foregroundStyle(Color.accentColor)
-            Text("Volt")
-                .font(.system(size: 18, weight: .bold))
-            Spacer()
+        Group {
+            if layout.sidebarMode == .iconOnly {
+                HStack {
+                    Image(systemName: "bolt.fill")
+                        .font(.system(size: 19, weight: .semibold))
+                        .foregroundStyle(Color.accentColor)
+                }
+            } else {
+                HStack(spacing: 10) {
+                    TrafficLightControls()
+                        .padding(.leading, 24)
+                    Spacer(minLength: 24)
+                    Image(systemName: "bolt.fill")
+                        .font(.system(size: 19, weight: .semibold))
+                        .foregroundStyle(Color.accentColor)
+                    Text("Volt")
+                        .font(.system(size: 18, weight: .bold))
+                    Spacer()
+                }
+            }
         }
-        .frame(height: 48)
+        .frame(maxWidth: .infinity, minHeight: 48, maxHeight: 48)
         .background(VoltTheme.toolbarBackground)
         .overlay(alignment: .trailing) {
             Rectangle()
@@ -57,8 +69,26 @@ private struct TrafficLightControls: View {
 
 struct SidebarView: View {
     @ObservedObject var model: AppModel
+    var layout: AppLayoutContext
 
     var body: some View {
+        Group {
+            if layout.sidebarMode == .iconOnly {
+                iconOnlyBody
+            } else {
+                fullBody
+            }
+        }
+        .background(VoltTheme.sidebarBackground)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .overlay(alignment: .trailing) {
+            Rectangle()
+                .fill(VoltTheme.hairline)
+                .frame(width: 1)
+        }
+    }
+
+    private var fullBody: some View {
         VStack(spacing: 0) {
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
@@ -129,12 +159,85 @@ struct SidebarView: View {
             .padding(.horizontal, 14)
             .padding(.vertical, 12)
         }
-        .background(VoltTheme.sidebarBackground)
-        .overlay(alignment: .trailing) {
-            Rectangle()
-                .fill(VoltTheme.hairline)
-                .frame(width: 1)
+    }
+
+    private var iconOnlyBody: some View {
+        VStack(spacing: 10) {
+            ScrollView {
+                VStack(spacing: 10) {
+                    iconButton("display", help: "My Mac") {
+                        model.localPath = FileManager.default.homeDirectoryForCurrentUser.path
+                        model.selectedLocalID = nil
+                        model.refreshLocal()
+                    }
+                    iconButton("macwindow", help: "Desktop") {
+                        model.localPath = desktopPath
+                        model.selectedLocalID = nil
+                        model.refreshLocal()
+                    }
+                    iconButton("arrow.down.app.fill", help: "Downloads") {
+                        model.localPath = downloadsPath
+                        model.selectedLocalID = nil
+                        model.refreshLocal()
+                    }
+                    iconButton("doc.fill", help: "Documents") {
+                        model.localPath = documentsPath
+                        model.selectedLocalID = nil
+                        model.refreshLocal()
+                    }
+
+                    Divider()
+                        .padding(.vertical, 4)
+
+                    iconButton("plus", help: "New connection", action: model.newConnection)
+
+                    ForEach(model.connections) { connection in
+                        Button {
+                            model.select(connection)
+                        } label: {
+                            ZStack(alignment: .bottomTrailing) {
+                                Image(systemName: "server.rack")
+                                    .font(.system(size: 16, weight: .semibold))
+                                    .frame(width: 40, height: 34)
+                                Circle()
+                                    .fill(model.selectedConnectionID == connection.id && model.isConnected ? Color.green : Color.gray.opacity(0.65))
+                                    .frame(width: 8, height: 8)
+                                    .offset(x: -6, y: -5)
+                            }
+                            .background(
+                                RoundedRectangle(cornerRadius: 7)
+                                    .fill(model.selectedConnectionID == connection.id ? VoltTheme.selectedFill : Color.clear)
+                            )
+                        }
+                        .buttonStyle(.plain)
+                        .help(connection.name)
+                    }
+                }
+                .padding(.vertical, 12)
+            }
+
+            Spacer(minLength: 0)
+
+            VStack(spacing: 8) {
+                iconButton("clock", help: "Transfers") {
+                    model.showsTransfers.toggle()
+                }
+                iconButton("gearshape", help: "Connection settings", action: model.showConnectionEditor)
+            }
+            .padding(.bottom, 12)
         }
+    }
+
+    private func iconButton(_ systemImage: String, help: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: systemImage)
+                .font(.system(size: 16, weight: .semibold))
+                .foregroundStyle(Color.accentColor)
+                .frame(width: 40, height: 34)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(help)
     }
 
     private var desktopPath: String {
