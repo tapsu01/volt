@@ -18,7 +18,12 @@ struct TransferQueueView: View {
 
             compactBar
         }
-        .background(VoltTheme.toolbarBackground)
+        .background(VoltTheme.transferBackground)
+        .overlay(alignment: .top) {
+            Rectangle()
+                .fill(VoltTheme.hairline)
+                .frame(height: 1)
+        }
     }
 
     private var expandedQueue: some View {
@@ -26,6 +31,7 @@ struct TransferQueueView: View {
             HStack {
                 Text("Transfers")
                     .font(.headline)
+                    .foregroundStyle(.primary)
                 Spacer()
                 Button {
                     model.showsTransfers = false
@@ -65,8 +71,17 @@ struct TransferQueueView: View {
                 }.width(70)
             }
             .frame(height: 140)
+            .background(VoltTheme.paneBackground)
+            .clipShape(RoundedRectangle(cornerRadius: 7))
+            .overlay(
+                RoundedRectangle(cornerRadius: 7)
+                    .stroke(VoltTheme.hairline)
+            )
         }
-        .padding(10)
+        .padding(.horizontal, 12)
+        .padding(.top, 10)
+        .padding(.bottom, 12)
+        .background(VoltTheme.transferPanelBackground)
     }
 
     private var compactExpandedQueue: some View {
@@ -102,6 +117,7 @@ struct TransferQueueView: View {
             }
         }
         .padding(10)
+        .background(VoltTheme.transferPanelBackground)
     }
 
     private var compactBar: some View {
@@ -172,10 +188,16 @@ struct TransferQueueView: View {
         .font(.caption)
         .padding(.horizontal, 14)
         .frame(height: 48)
+        .background(VoltTheme.transferBackground)
         .overlay(alignment: .top) {
             Rectangle()
                 .fill(VoltTheme.hairline)
                 .frame(height: 1)
+        }
+        .overlay(alignment: .leading) {
+            Rectangle()
+                .fill(Color.accentColor.opacity(model.transfers.isEmpty ? 0.0 : 0.75))
+                .frame(width: 3)
         }
     }
 

@@ -26,6 +26,14 @@ enum VoltTheme {
         light: .white,
         dark: NSColor(calibratedRed: 0.16, green: 0.17, blue: 0.18, alpha: 1)
     )
+    static let transferBackground = dynamicColor(
+        light: NSColor(calibratedRed: 0.955, green: 0.965, blue: 0.978, alpha: 1),
+        dark: NSColor(calibratedRed: 0.115, green: 0.12, blue: 0.13, alpha: 1)
+    )
+    static let transferPanelBackground = dynamicColor(
+        light: NSColor(calibratedRed: 0.985, green: 0.988, blue: 0.993, alpha: 1),
+        dark: NSColor(calibratedRed: 0.14, green: 0.145, blue: 0.155, alpha: 1)
+    )
     static let selectedFill = Color.accentColor.opacity(0.12)
     static let rowStripe = dynamicColor(
         light: NSColor(calibratedRed: 0.965, green: 0.978, blue: 0.995, alpha: 1),
