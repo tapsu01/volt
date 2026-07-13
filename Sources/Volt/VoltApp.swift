@@ -1056,6 +1056,7 @@ final class AppModel: ObservableObject {
     }
 
     func hideConnectionEditor() {
+        clearConnectionPasswordInput()
         showsConnectionEditor = false
         syncCurrentTab()
     }
@@ -1120,6 +1121,7 @@ final class AppModel: ObservableObject {
     }
 
     func saveDraft() {
+        clearConnectionPasswordInput()
         if let index = connections.firstIndex(where: { $0.id == connectionDraft.id }) {
             connections[index] = connectionDraft
         } else {
@@ -1202,7 +1204,7 @@ final class AppModel: ObservableObject {
 
     func cancelPasswordPrompt() {
         showsPasswordPrompt = false
-        connectionPassword = ""
+        clearConnectionPasswordInput()
         credentialForCurrentTab().clear()
         syncCurrentTab()
     }
@@ -2018,6 +2020,7 @@ final class AppModel: ObservableObject {
             if !connection.privateKeyPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 args.append(contentsOf: ["-i", connection.privateKeyPath])
             }
+            args.append("--")
             args.append("\(connection.username)@\(connection.host)")
             
             let quotedSrc = "'" + item.path.replacingOccurrences(of: "'", with: "'\\''") + "'"
@@ -2381,6 +2384,10 @@ final class AppModel: ObservableObject {
     private func capturePasswordInput() {
         let sanitized = connectionPassword.trimmingCharacters(in: .newlines)
         credentialForCurrentTab().replace(with: sanitized)
+        clearConnectionPasswordInput()
+    }
+
+    func clearConnectionPasswordInput() {
         connectionPassword = ""
     }
 
@@ -3023,6 +3030,9 @@ struct ConnectionEditor: View {
             }
         }
         .padding(12)
+        .onDisappear {
+            model.clearConnectionPasswordInput()
+        }
     }
 }
 
@@ -3054,6 +3064,9 @@ struct PasswordPromptView: View {
         }
         .padding(20)
         .frame(width: 420)
+        .onDisappear {
+            model.clearConnectionPasswordInput()
+        }
     }
 }
 
