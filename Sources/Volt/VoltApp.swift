@@ -832,7 +832,6 @@ final class AppModel: ObservableObject {
     @Published var selectedTabID: BrowserTab.ID?
     @Published var selectedConnectionID: UUID?
     @Published var connectionDraft = SavedConnection()
-    @Published var connectionPassword = ""
 
     @Published var localPath = FileManager.default.homeDirectoryForCurrentUser.path
     @Published var remotePath = "/"
@@ -1056,7 +1055,6 @@ final class AppModel: ObservableObject {
     }
 
     func hideConnectionEditor() {
-        clearConnectionPasswordInput()
         showsConnectionEditor = false
         syncCurrentTab()
     }
@@ -1081,7 +1079,6 @@ final class AppModel: ObservableObject {
 
         selectedConnectionID = connection.id
         connectionDraft = connection
-        connectionPassword = ""
         credentialForCurrentTab().clear()
         remotePath = connection.remotePath
         isConnected = false
@@ -1103,7 +1100,6 @@ final class AppModel: ObservableObject {
         isSuppressingSidebarSelection = true
         selectedConnectionID = connection.id
         connectionDraft = connection
-        connectionPassword = ""
         credentialForCurrentTab().clear()
         remotePath = connection.remotePath
         showsConnectionEditor = true
@@ -1121,7 +1117,6 @@ final class AppModel: ObservableObject {
     }
 
     func saveDraft() {
-        clearConnectionPasswordInput()
         if let index = connections.firstIndex(where: { $0.id == connectionDraft.id }) {
             connections[index] = connectionDraft
         } else {
@@ -1138,13 +1133,13 @@ final class AppModel: ObservableObject {
         syncCurrentTab()
     }
 
-    func connectDraft() {
+    func connectDraft(password: String) {
         if let validationError = validate(connectionDraft) {
             status = validationError
             return
         }
         remotePath = connectionDraft.remotePath.isEmpty ? "/" : connectionDraft.remotePath
-        capturePasswordInput()
+        capturePasswordInput(password)
         saveDraft()
         showsConnectionEditor = false
         syncCurrentTab()
@@ -1155,7 +1150,6 @@ final class AppModel: ObservableObject {
         guard confirmDiscardEditSessions(remoteEditSessions, action: "create a new connection") else { return }
         cleanupEditSessions(remoteEditSessions)
         connectionDraft = SavedConnection()
-        connectionPassword = ""
         credentialForCurrentTab().clear()
         selectedConnectionID = nil
         isConnected = false
@@ -1179,7 +1173,6 @@ final class AppModel: ObservableObject {
             cleanupEditSessions(remoteEditSessions)
             selectedConnectionID = nil
             connectionDraft = SavedConnection()
-            connectionPassword = ""
             if let tabID = selectedTabID {
                 tabCredentials.removeValue(forKey: tabID)?.clear()
             }
@@ -1195,8 +1188,8 @@ final class AppModel: ObservableObject {
         }
     }
 
-    func connectWithPassword() {
-        capturePasswordInput()
+    func connectWithPassword(_ password: String) {
+        capturePasswordInput(password)
         showsPasswordPrompt = false
         syncCurrentTab()
         refreshRemote()
@@ -1204,7 +1197,6 @@ final class AppModel: ObservableObject {
 
     func cancelPasswordPrompt() {
         showsPasswordPrompt = false
-        clearConnectionPasswordInput()
         credentialForCurrentTab().clear()
         syncCurrentTab()
     }
@@ -2325,7 +2317,6 @@ final class AppModel: ObservableObject {
         for control in transferControls.values { control.cancel() }
         for credential in tabCredentials.values { credential.clear() }
         tabCredentials.removeAll()
-        connectionPassword = ""
         cleanupEditSessions(tabs.flatMap(\.remoteEditSessions) + remoteEditSessions)
         AppPaths.cleanupEditFiles(olderThan: 0)
     }
@@ -2381,14 +2372,9 @@ final class AppModel: ObservableObject {
         return credential
     }
 
-    private func capturePasswordInput() {
-        let sanitized = connectionPassword.trimmingCharacters(in: .newlines)
+    private func capturePasswordInput(_ password: String) {
+        let sanitized = password.trimmingCharacters(in: .newlines)
         credentialForCurrentTab().replace(with: sanitized)
-        clearConnectionPasswordInput()
-    }
-
-    func clearConnectionPasswordInput() {
-        connectionPassword = ""
     }
 
     nonisolated private func isAuthenticationFailure(_ error: Error) -> Bool {
@@ -2445,7 +2431,6 @@ final class AppModel: ObservableObject {
         isSuppressingSidebarSelection = true
         selectedConnectionID = tab.connectionID
         connectionDraft = tab.connectionDraft
-        connectionPassword = ""
         localPath = tab.localPath
         remotePath = tab.remotePath
         localItems = tab.localItems
@@ -2955,8 +2940,80 @@ struct HostKeyVerificationView: View {
     }
 }
 
+@MainActor
+final class SecurePasswordFieldController: ObservableObject {
+    fileprivate weak var textField: NSSecureTextField?
+    fileprivate var onSubmit: ((String) -> Void)?
+
+    func submit() {
+        guard let textField else {
+            onSubmit?("")
+            return
+        }
+        let password = textField.stringValue
+        textField.stringValue = ""
+        onSubmit?(password)
+    }
+
+    func clear() {
+        textField?.stringValue = ""
+    }
+}
+
+private struct SecurePasswordField: NSViewRepresentable {
+    @ObservedObject var controller: SecurePasswordFieldController
+    var placeholder: String
+    var onSubmit: (String) -> Void
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(controller: controller)
+    }
+
+    func makeNSView(context: Context) -> NSSecureTextField {
+        let textField = NSSecureTextField(frame: .zero)
+        textField.placeholderString = placeholder
+        textField.isBezeled = true
+        textField.bezelStyle = .roundedBezel
+        textField.drawsBackground = true
+        textField.target = context.coordinator
+        textField.action = #selector(Coordinator.submit)
+        controller.textField = textField
+        controller.onSubmit = onSubmit
+        return textField
+    }
+
+    func updateNSView(_ nsView: NSSecureTextField, context: Context) {
+        nsView.placeholderString = placeholder
+        nsView.target = context.coordinator
+        nsView.action = #selector(Coordinator.submit)
+        controller.textField = nsView
+        controller.onSubmit = onSubmit
+    }
+
+    static func dismantleNSView(_ nsView: NSSecureTextField, coordinator: Coordinator) {
+        nsView.stringValue = ""
+        if coordinator.controller.textField === nsView {
+            coordinator.controller.textField = nil
+        }
+    }
+
+    @MainActor
+    final class Coordinator: NSObject {
+        fileprivate let controller: SecurePasswordFieldController
+
+        init(controller: SecurePasswordFieldController) {
+            self.controller = controller
+        }
+
+        @objc func submit() {
+            controller.submit()
+        }
+    }
+}
+
 struct ConnectionEditor: View {
     @ObservedObject var model: AppModel
+    @StateObject private var passwordController = SecurePasswordFieldController()
 
     var body: some View {
         VStack(spacing: 10) {
@@ -2980,17 +3037,31 @@ struct ConnectionEditor: View {
                 }
                 .labelsHidden()
                 .frame(minWidth: 100, idealWidth: 160, maxWidth: 180)
-                Button(action: model.connectDraft) { Label("Connect", systemImage: "bolt.horizontal") }
+                Button(action: passwordController.submit) { Label("Connect", systemImage: "bolt.horizontal") }
                     .buttonStyle(.borderedProminent)
                     .tint(Color.accentColor)
                     .disabled(model.connectionDraft.host.isEmpty)
-                Button(action: model.saveDraft) { Label("Save", systemImage: "tray.and.arrow.down") }
-                Button(action: model.hideConnectionEditor) { Label("Cancel", systemImage: "xmark.circle") }
+                Button {
+                    passwordController.clear()
+                    model.saveDraft()
+                } label: {
+                    Label("Save", systemImage: "tray.and.arrow.down")
+                }
+                Button {
+                    passwordController.clear()
+                    model.hideConnectionEditor()
+                } label: {
+                    Label("Cancel", systemImage: "xmark.circle")
+                }
             }
 
             HStack(spacing: 12) {
-                SecureField("Password or key passphrase (not saved)", text: $model.connectionPassword)
-                    .textFieldStyle(.roundedBorder)
+                SecurePasswordField(
+                    controller: passwordController,
+                    placeholder: "Password or key passphrase (not saved)"
+                ) { password in
+                    model.connectDraft(password: password)
+                }
                     .frame(minWidth: 150, maxWidth: .infinity)
                 HStack(spacing: 6) {
                     TextField("Private key", text: $model.connectionDraft.privateKeyPath)
@@ -3031,13 +3102,14 @@ struct ConnectionEditor: View {
         }
         .padding(12)
         .onDisappear {
-            model.clearConnectionPasswordInput()
+            passwordController.clear()
         }
     }
 }
 
 struct PasswordPromptView: View {
     @ObservedObject var model: AppModel
+    @StateObject private var passwordController = SecurePasswordFieldController()
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -3047,16 +3119,18 @@ struct PasswordPromptView: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
-            SecureField("Password", text: $model.connectionPassword)
-                .textFieldStyle(.roundedBorder)
+            SecurePasswordField(controller: passwordController, placeholder: "Password") { password in
+                model.connectWithPassword(password)
+            }
             HStack {
                 Spacer()
                 Button("Cancel") {
+                    passwordController.clear()
                     model.cancelPasswordPrompt()
                 }
                 .keyboardShortcut(.cancelAction)
                 Button("Connect") {
-                    model.connectWithPassword()
+                    passwordController.submit()
                 }
                 .keyboardShortcut(.defaultAction)
                 .buttonStyle(.borderedProminent)
@@ -3065,7 +3139,7 @@ struct PasswordPromptView: View {
         .padding(20)
         .frame(width: 420)
         .onDisappear {
-            model.clearConnectionPasswordInput()
+            passwordController.clear()
         }
     }
 }
