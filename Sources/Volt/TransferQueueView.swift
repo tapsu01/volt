@@ -4,10 +4,13 @@ import SwiftUI
 struct TransferQueueView: View {
     @ObservedObject var model: AppModel
     var layout: AppLayoutContext
+    @AppStorage("Volt.TransferQueueHeight") private var expandedHeight: Double = 210
+    @State private var dragStartHeight: CGFloat?
 
     var body: some View {
         VStack(spacing: 0) {
             if model.showsTransfers {
+                resizeHandle
                 if layout.isQueueCompact {
                     compactExpandedQueue
                 } else {
@@ -24,6 +27,38 @@ struct TransferQueueView: View {
                 .fill(VoltTheme.hairline)
                 .frame(height: 1)
         }
+    }
+
+    private var queueHeight: CGFloat {
+        min(420, max(150, CGFloat(expandedHeight)))
+    }
+
+    private var tableHeight: CGFloat {
+        max(90, queueHeight - 70)
+    }
+
+    private var resizeHandle: some View {
+        ZStack {
+            Rectangle()
+                .fill(VoltTheme.transferPanelBackground)
+            Capsule()
+                .fill(VoltTheme.hairline)
+                .frame(width: 46, height: 4)
+        }
+        .frame(height: 10)
+        .contentShape(Rectangle())
+        .gesture(
+            DragGesture(minimumDistance: 1)
+                .onChanged { value in
+                    let start = dragStartHeight ?? queueHeight
+                    dragStartHeight = start
+                    expandedHeight = Double(min(420, max(150, start - value.translation.height)))
+                }
+                .onEnded { _ in
+                    dragStartHeight = nil
+                }
+        )
+        .help("Drag to resize transfers")
     }
 
     private var expandedQueue: some View {
@@ -70,7 +105,7 @@ struct TransferQueueView: View {
                     .disabled(job.state != .queued && job.state != .running)
                 }.width(70)
             }
-            .frame(height: 140)
+            .frame(height: tableHeight)
             .background(VoltTheme.paneBackground)
             .clipShape(RoundedRectangle(cornerRadius: 7))
             .overlay(
@@ -79,8 +114,9 @@ struct TransferQueueView: View {
             )
         }
         .padding(.horizontal, 12)
-        .padding(.top, 10)
+        .padding(.top, 4)
         .padding(.bottom, 12)
+        .frame(height: queueHeight)
         .background(VoltTheme.transferPanelBackground)
     }
 

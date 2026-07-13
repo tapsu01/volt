@@ -654,7 +654,7 @@ final class SFTPClient: @unchecked Sendable {
                     name: name,
                     path: itemPath,
                     isDirectory: isDirectory,
-                    size: rawSize >= 0 ? rawSize : nil,
+                    size: !isDirectory && rawSize >= 0 ? rawSize : nil,
                     modified: rawModified > 0 ? Date(timeIntervalSince1970: TimeInterval(rawModified)) : nil,
                     kind: isDirectory ? "Folder" : (UTType(filenameExtension: (name as NSString).pathExtension)?.localizedDescription ?? "File"),
                     owner: String(volt_sftp_item_uid(items, Int32(index))),
@@ -895,48 +895,51 @@ final class AppModel: ObservableObject {
         } else {
             guard let connection = selectedConnection else { return }
             let credential = credentialForCurrentTab().clone()
-            let runner = CommandRunner()
-            let executable = "/usr/bin/ssh"
-            guard credential.isEmpty else { return }
-            
+
             do {
-                let controlDir = try SFTPClient.controlSocketDir()
-                let knownHostsPath = try AppPaths.knownHostsURL().path
-
-                var args = [
-                    "-oBatchMode=yes",
-                    "-oStrictHostKeyChecking=yes",
-                    "-oUserKnownHostsFile=\(knownHostsPath)",
-                    "-oGlobalKnownHostsFile=/dev/null",
-                    "-oControlMaster=auto",
-                    "-oControlPath=\(controlDir)/volt_%h_%p_%r",
-                    "-oControlPersist=5m",
-                    "-p", "\(connection.port)"
-                ]
-                if !connection.privateKeyPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    args.append(contentsOf: ["-i", connection.privateKeyPath])
-                }
-                args.append("\(connection.username)@\(connection.host)")
-                
-                let quotedPath = "'" + item.path.replacingOccurrences(of: "'", with: "'\\''") + "'"
-                args.append("du -sk \(quotedPath)")
-
-                let result = try runner.run(executable, arguments: args, stdin: "")
-                if result.status == 0,
-                   let sizeStr = result.stdout.split(separator: "\t").first,
-                   let sizeKB = Int64(sizeStr) {
-                    let sizeBytes = sizeKB * 1024
-                    await MainActor.run {
-                        if let index = self.remoteItems.firstIndex(where: { $0.id == item.id }) {
-                            self.remoteItems[index].size = sizeBytes
-                            self.syncCurrentTab()
-                        }
+                let sizeBytes = try await remoteRecursiveSize(
+                    connection: connection,
+                    credential: credential,
+                    item: item
+                )
+                await MainActor.run {
+                    if let index = self.remoteItems.firstIndex(where: { $0.id == item.id }) {
+                        self.remoteItems[index].size = sizeBytes
+                        self.syncCurrentTab()
                     }
                 }
             } catch {
                 // Ignore failure
             }
         }
+    }
+
+    private func remoteRecursiveSize(
+        connection: SavedConnection,
+        credential: SensitiveCredential,
+        item: FileItem
+    ) async throws -> Int64 {
+        if !item.isDirectory {
+            return item.size ?? 0
+        }
+        return try await remoteRecursiveSize(connection: connection, credential: credential, path: item.path)
+    }
+
+    private func remoteRecursiveSize(
+        connection: SavedConnection,
+        credential: SensitiveCredential,
+        path: String
+    ) async throws -> Int64 {
+        let result = try await sftp.list(connection: connection, credential: credential, path: path)
+        var total: Int64 = 0
+        for child in result.items {
+            if child.isDirectory {
+                total += try await remoteRecursiveSize(connection: connection, credential: credential, path: child.path)
+            } else if child.isRegularFile {
+                total += child.size ?? 0
+            }
+        }
+        return total
     }
 
     func closeCurrentTab() {
@@ -1187,7 +1190,7 @@ final class AppModel: ObservableObject {
                         name: fileURL.lastPathComponent,
                         path: fileURL.path,
                         isDirectory: isDirectory,
-                        size: values.fileSize.map(Int64.init),
+                        size: isDirectory ? nil : values.fileSize.map(Int64.init),
                         modified: values.contentModificationDate,
                         kind: isDirectory ? "Folder" : (values.contentType?.localizedDescription ?? "File"),
                         owner: attributes?[.ownerAccountName] as? String,
