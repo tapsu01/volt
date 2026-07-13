@@ -4033,6 +4033,13 @@ struct FilePane<ToolbarContent: View, ContextMenuContent: View, BackgroundContex
         var rightWidth: CGFloat
     }
 
+    private struct ListLayout {
+        var tableWidth: CGFloat
+        var contentWidth: CGFloat
+        var nameWidth: CGFloat
+        var metadataWidths: [FileBrowserColumn: CGFloat]
+    }
+
     var title: String
     @Binding var path: String
     var submitPath: () -> Void
@@ -4048,6 +4055,11 @@ struct FilePane<ToolbarContent: View, ContextMenuContent: View, BackgroundContex
     @State private var anchorSelectionID: FileItem.ID?
     @State private var columnResizeDraft: ColumnResizeDraft?
 
+    private let listColumnSpacing: CGFloat = 12
+    private let listHorizontalInset: CGFloat = 20
+    private let listHeaderHeight: CGFloat = 38
+    private let listMaximumNameColumnShare: CGFloat = 0.48
+
     private var displayedItems: [FileItem] {
         let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
         return items
@@ -4060,10 +4072,6 @@ struct FilePane<ToolbarContent: View, ContextMenuContent: View, BackgroundContex
         VStack(spacing: 0) {
             paneHeader
 
-            if preferences.viewMode == .list {
-                listHeader
-                Divider()
-            }
             browserContent
                 .background(Color.clear)
                 .contentShape(Rectangle())
@@ -4194,16 +4202,24 @@ struct FilePane<ToolbarContent: View, ContextMenuContent: View, BackgroundContex
         switch preferences.viewMode {
         case .list:
             GeometryReader { proxy in
-                ScrollView {
-                    LazyVStack(spacing: 2) {
-                        ForEach(Array(displayedItems.enumerated()), id: \.element.id) { index, item in
-                            listRow(item, index: index, availableWidth: max(0, proxy.size.width - 20))
+                let layout = listLayout(availableWidth: proxy.size.width)
+                ScrollView(.horizontal) {
+                    VStack(spacing: 0) {
+                        listHeaderContent(layout: layout)
+                        Divider()
+                        ScrollView {
+                            LazyVStack(spacing: 2) {
+                                ForEach(Array(displayedItems.enumerated()), id: \.element.id) { index, item in
+                                    listRow(item, index: index, layout: layout)
+                                }
+                            }
+                            .frame(width: layout.tableWidth, alignment: .leading)
+                            .padding(.vertical, 6)
                         }
                     }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 6)
+                    .frame(width: layout.tableWidth, height: proxy.size.height, alignment: .topLeading)
                 }
+                .frame(width: proxy.size.width, height: proxy.size.height, alignment: .topLeading)
             }
         case .icons, .thumbnails:
             ScrollView {
@@ -4216,20 +4232,13 @@ struct FilePane<ToolbarContent: View, ContextMenuContent: View, BackgroundContex
         }
     }
 
-    @ViewBuilder private var listHeader: some View {
-        GeometryReader { proxy in
-            listHeaderContent(availableWidth: max(0, proxy.size.width - 40))
-        }
-        .frame(height: 38)
-    }
-
-    @ViewBuilder private func listHeaderContent(availableWidth: CGFloat) -> some View {
+    @ViewBuilder private func listHeaderContent(layout: ListLayout) -> some View {
         let visibleColumns = preferences.visibleColumns
-        HStack(spacing: 12) {
+        HStack(spacing: listColumnSpacing) {
             resizableHeader(
                 title: "Name",
                 field: .name,
-                width: displayWidth(for: .name, visibleColumns: visibleColumns, availableWidth: availableWidth),
+                width: layoutWidth(for: .name, layout: layout),
                 onResizeDelta: visibleColumns.first.map { firstColumn in
                     { delta in
                         resizeBoundary(left: .name, right: .metadata(firstColumn), delta: delta)
@@ -4242,7 +4251,7 @@ struct FilePane<ToolbarContent: View, ContextMenuContent: View, BackgroundContex
                 resizableHeader(
                     title: column.rawValue,
                     field: sortField(for: column),
-                    width: displayWidth(for: .metadata(column), visibleColumns: visibleColumns, availableWidth: availableWidth),
+                    width: layoutWidth(for: .metadata(column), layout: layout),
                     onResizeDelta: nextColumn.map { nextColumn in
                         { delta in
                             resizeBoundary(left: .metadata(column), right: .metadata(nextColumn), delta: delta)
@@ -4253,17 +4262,18 @@ struct FilePane<ToolbarContent: View, ContextMenuContent: View, BackgroundContex
             }
             Spacer(minLength: 0)
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
+        .frame(width: layout.contentWidth, alignment: .leading)
         .font(.system(size: 12, weight: .semibold))
         .foregroundStyle(.secondary)
-        .padding(.horizontal, 20)
+        .padding(.horizontal, listHorizontalInset)
         .padding(.vertical, 8)
+        .frame(width: layout.tableWidth, height: listHeaderHeight, alignment: .leading)
         .contentShape(Rectangle()).contextMenu { columnMenu }
     }
 
-    @ViewBuilder private func listRow(_ item: FileItem, index: Int, availableWidth: CGFloat) -> some View {
+    @ViewBuilder private func listRow(_ item: FileItem, index: Int, layout: ListLayout) -> some View {
         let visibleColumns = preferences.visibleColumns
-        HStack(spacing: 12) {
+        HStack(spacing: listColumnSpacing) {
             HStack(spacing: 9) {
                 Image(systemName: item.isDirectory ? "folder.fill" : "doc")
                     .foregroundStyle(item.isDirectory ? Color.accentColor : Color.secondary)
@@ -4271,17 +4281,18 @@ struct FilePane<ToolbarContent: View, ContextMenuContent: View, BackgroundContex
                 Text(item.name)
                     .lineLimit(1)
             }
-            .frame(width: displayWidth(for: .name, visibleColumns: visibleColumns, availableWidth: max(0, availableWidth - 20)), alignment: .leading)
+            .frame(width: layoutWidth(for: .name, layout: layout), alignment: .leading)
             ForEach(visibleColumns) { column in
                 Text(text(for: column, item: item)).foregroundStyle(isSelected(item) ? Color.primary.opacity(0.9) : Color.secondary)
-                    .frame(width: displayWidth(for: .metadata(column), visibleColumns: visibleColumns, availableWidth: max(0, availableWidth - 20)), alignment: .leading).lineLimit(1)
+                    .frame(width: layoutWidth(for: .metadata(column), layout: layout), alignment: .leading).lineLimit(1)
             }
             Spacer(minLength: 0)
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
+        .frame(width: layout.contentWidth, alignment: .leading)
         .font(.system(size: preferences.textSize))
-        .padding(.horizontal, 10)
+        .padding(.horizontal, listHorizontalInset)
         .padding(.vertical, 7)
+        .frame(width: layout.tableWidth, alignment: .leading)
         .background(RoundedRectangle(cornerRadius: 6).fill(isSelected(item) ? VoltTheme.selectedFill : (preferences.showRowColors && index.isMultiple(of: 2) ? Color.primary.opacity(0.035) : Color.clear)))
         .background { RightClickSelectionView { selectForContextMenu(item) } }
         .foregroundStyle(Color.primary).clipShape(RoundedRectangle(cornerRadius: 6)).contentShape(Rectangle())
@@ -4429,25 +4440,66 @@ struct FilePane<ToolbarContent: View, ContextMenuContent: View, BackgroundContex
         }
     }
 
-    private func displayWidth(for column: ListColumn, visibleColumns: [FileBrowserColumn], availableWidth: CGFloat) -> CGFloat {
-        let baseWidth = width(for: column)
-        guard trailingColumn(for: visibleColumns) == column else { return baseWidth }
-        let extraWidth = max(0, availableWidth - naturalColumnsWidth(for: visibleColumns))
-        return baseWidth + extraWidth
-    }
-
-    private func trailingColumn(for visibleColumns: [FileBrowserColumn]) -> ListColumn {
-        if let lastColumn = visibleColumns.last {
-            return .metadata(lastColumn)
+    private func listLayout(availableWidth: CGFloat) -> ListLayout {
+        let visibleColumns = preferences.visibleColumns
+        let availableContentWidth = max(0, availableWidth - (listHorizontalInset * 2))
+        let baseNameWidth = width(for: .name)
+        let metadataWidths = Dictionary(
+            uniqueKeysWithValues: visibleColumns.map { column in
+                (column, width(for: .metadata(column)))
+            }
+        )
+        let metadataWidth = visibleColumns.reduce(CGFloat(0)) { partial, column in
+            partial + (metadataWidths[column] ?? width(for: .metadata(column)))
         }
-        return .name
+        let spacing = CGFloat(max(0, visibleColumns.count)) * listColumnSpacing
+        let preferredNameWidth: CGFloat
+        if visibleColumns.isEmpty {
+            preferredNameWidth = baseNameWidth
+        } else {
+            let responsiveMaximumNameWidth = max(
+                minWidth(for: .name),
+                availableContentWidth * listMaximumNameColumnShare
+            )
+            preferredNameWidth = min(baseNameWidth, responsiveMaximumNameWidth)
+        }
+        let preferredContentWidth = preferredNameWidth + metadataWidth + spacing
+        let nameOverflow = max(0, preferredContentWidth - availableContentWidth)
+        let nameWidth = max(minWidth(for: .name), preferredNameWidth - nameOverflow)
+        let compactContentWidth = nameWidth + metadataWidth + spacing
+        let extraWidth = max(0, availableContentWidth - compactContentWidth)
+        let stretchedMetadataWidths = metadataWidthsForLayout(
+            metadataWidths,
+            visibleColumns: visibleColumns,
+            extraWidth: extraWidth
+        )
+        let contentWidth = compactContentWidth + extraWidth
+        return ListLayout(
+            tableWidth: contentWidth + (listHorizontalInset * 2),
+            contentWidth: contentWidth,
+            nameWidth: visibleColumns.isEmpty ? nameWidth + extraWidth : nameWidth,
+            metadataWidths: stretchedMetadataWidths
+        )
     }
 
-    private func naturalColumnsWidth(for visibleColumns: [FileBrowserColumn]) -> CGFloat {
-        let columns = [ListColumn.name] + visibleColumns.map { ListColumn.metadata($0) }
-        let columnWidths = columns.reduce(CGFloat(0)) { $0 + width(for: $1) }
-        let spacing = CGFloat(max(0, columns.count - 1)) * 12
-        return columnWidths + spacing
+    private func metadataWidthsForLayout(
+        _ metadataWidths: [FileBrowserColumn: CGFloat],
+        visibleColumns: [FileBrowserColumn],
+        extraWidth: CGFloat
+    ) -> [FileBrowserColumn: CGFloat] {
+        guard extraWidth > 0, let trailingColumn = visibleColumns.last else { return metadataWidths }
+        var stretchedWidths = metadataWidths
+        stretchedWidths[trailingColumn, default: width(for: .metadata(trailingColumn))] += extraWidth
+        return stretchedWidths
+    }
+
+    private func layoutWidth(for column: ListColumn, layout: ListLayout) -> CGFloat {
+        switch column {
+        case .name:
+            layout.nameWidth
+        case .metadata(let metadataColumn):
+            layout.metadataWidths[metadataColumn] ?? width(for: column)
+        }
     }
 
     private func setWidth(_ width: CGFloat, for column: ListColumn) {
