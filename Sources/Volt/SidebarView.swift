@@ -167,22 +167,22 @@ struct SidebarView: View {
                 VStack(spacing: 10) {
                     iconButton("display", help: "My Mac") {
                         model.localPath = FileManager.default.homeDirectoryForCurrentUser.path
-                        model.selectedLocalID = nil
+                        model.selectedLocalIDs.removeAll()
                         model.refreshLocal()
                     }
                     iconButton("macwindow", help: "Desktop") {
                         model.localPath = desktopPath
-                        model.selectedLocalID = nil
+                        model.selectedLocalIDs.removeAll()
                         model.refreshLocal()
                     }
                     iconButton("arrow.down.app.fill", help: "Downloads") {
                         model.localPath = downloadsPath
-                        model.selectedLocalID = nil
+                        model.selectedLocalIDs.removeAll()
                         model.refreshLocal()
                     }
                     iconButton("doc.fill", help: "Documents") {
                         model.localPath = documentsPath
-                        model.selectedLocalID = nil
+                        model.selectedLocalIDs.removeAll()
                         model.refreshLocal()
                     }
 
@@ -283,7 +283,7 @@ struct SidebarView: View {
     private func favoriteRow(_ title: String, systemImage: String, path: String) -> some View {
         Button {
             model.localPath = path
-            model.selectedLocalID = nil
+            model.selectedLocalIDs.removeAll()
             model.refreshLocal()
         } label: {
             sidebarRowContent(title: title, subtitle: nil, systemImage: systemImage, tint: .accentColor)

@@ -81,6 +81,11 @@ struct FileItem: Identifiable, Hashable {
         guard let permissions else { return "--" }
         return String(format: "%03o", permissions & 0o777)
     }
+
+    var isRegularFile: Bool {
+        guard let permissions else { return !isDirectory }
+        return (permissions & 0o170000) == 0o100000
+    }
 }
 
 /// Kết quả của một lần liệt kê thư mục remote: danh sách entry hợp lệ và số entry bị bỏ vì không an
@@ -88,6 +93,16 @@ struct FileItem: Identifiable, Hashable {
 struct RemoteListingResult {
     let items: [FileItem]
     let skippedUnsafeCount: Int
+}
+
+struct FolderDownloadSummary {
+    var downloadedFiles = 0
+    var skippedItems = 0
+}
+
+struct FolderUploadSummary {
+    var uploadedFiles = 0
+    var skippedItems = 0
 }
 
 enum FileBrowserViewMode: String, Codable, CaseIterable, Identifiable {
@@ -238,8 +253,8 @@ struct BrowserTab: Identifiable, Equatable {
     var remotePath: String = "/"
     var localItems: [FileItem] = []
     var remoteItems: [FileItem] = []
-    var selectedLocalID: FileItem.ID?
-    var selectedRemoteID: FileItem.ID?
+    var selectedLocalIDs: Set<FileItem.ID> = []
+    var selectedRemoteIDs: Set<FileItem.ID> = []
     var remoteEditSessions: [RemoteEditSession] = []
     var isConnected = false
     var showsConnectionEditor = false
@@ -781,8 +796,8 @@ final class AppModel: ObservableObject {
     @Published var remotePath = "/"
     @Published var localItems: [FileItem] = []
     @Published var remoteItems: [FileItem] = []
-    @Published var selectedLocalID: FileItem.ID?
-    @Published var selectedRemoteID: FileItem.ID?
+    @Published var selectedLocalIDs: Set<FileItem.ID> = []
+    @Published var selectedRemoteIDs: Set<FileItem.ID> = []
     @Published var localBrowserPreferences = FileBrowserPreferences.load(key: "Volt.LocalBrowserPreferences") {
         didSet { localBrowserPreferences.save(key: "Volt.LocalBrowserPreferences") }
     }
@@ -829,11 +844,19 @@ final class AppModel: ObservableObject {
     }
 
     var selectedLocal: FileItem? {
-        localItems.first { $0.id == selectedLocalID }
+        localItems.first { selectedLocalIDs.contains($0.id) }
     }
 
     var selectedRemote: FileItem? {
-        remoteItems.first { $0.id == selectedRemoteID }
+        remoteItems.first { selectedRemoteIDs.contains($0.id) }
+    }
+
+    var selectedLocalItems: [FileItem] {
+        localItems.filter { selectedLocalIDs.contains($0.id) }
+    }
+
+    var selectedRemoteItems: [FileItem] {
+        remoteItems.filter { selectedRemoteIDs.contains($0.id) }
     }
 
     var selectedTab: BrowserTab? {
@@ -949,8 +972,8 @@ final class AppModel: ObservableObject {
             remotePath: tab.remotePath,
             localItems: tab.localItems,
             remoteItems: tab.remoteItems,
-            selectedLocalID: tab.selectedLocalID,
-            selectedRemoteID: tab.selectedRemoteID,
+            selectedLocalIDs: tab.selectedLocalIDs,
+            selectedRemoteIDs: tab.selectedRemoteIDs,
             remoteEditSessions: [],
             isConnected: tab.isConnected,
             showsConnectionEditor: tab.showsConnectionEditor,
@@ -1093,7 +1116,7 @@ final class AppModel: ObservableObject {
         showsPasswordPrompt = false
         remoteItems = []
         remoteEditSessions = []
-        selectedRemoteID = nil
+        selectedRemoteIDs.removeAll()
         remotePath = "/"
         syncCurrentTab()
     }
@@ -1114,7 +1137,7 @@ final class AppModel: ObservableObject {
                 tabCredentials.removeValue(forKey: tabID)?.clear()
             }
             remoteItems = []
-            selectedRemoteID = nil
+            selectedRemoteIDs.removeAll()
             remotePath = "/"
             remoteEditSessions = []
             isConnected = false
@@ -1190,7 +1213,7 @@ final class AppModel: ObservableObject {
             return
         }
         localPath = url.path
-        selectedLocalID = nil
+        selectedLocalIDs.removeAll()
         refreshLocal()
     }
 
@@ -1201,7 +1224,7 @@ final class AppModel: ObservableObject {
     func submitRemotePath() {
         let trimmedPath = remotePath.trimmingCharacters(in: .whitespacesAndNewlines)
         remotePath = trimmedPath.isEmpty ? "/" : "/" + trimmedPath.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-        selectedRemoteID = nil
+        selectedRemoteIDs.removeAll()
         syncCurrentTab()
         refreshRemote()
     }
@@ -1252,7 +1275,7 @@ final class AppModel: ObservableObject {
             return
         }
         localPath = item.path
-        selectedLocalID = nil
+        selectedLocalIDs.removeAll()
         refreshLocal()
         syncCurrentTab()
     }
@@ -1260,7 +1283,7 @@ final class AppModel: ObservableObject {
     func openRemote(_ item: FileItem) {
         guard item.isDirectory else { return }
         remotePath = item.path
-        selectedRemoteID = nil
+        selectedRemoteIDs.removeAll()
         if let connection = selectedConnection,
            let cachedItems = remoteDirectoryCache[remoteCacheKey(connectionID: connection.id, path: item.path)] {
             remoteItems = cachedItems
@@ -1314,9 +1337,13 @@ final class AppModel: ObservableObject {
     }
 
     func uploadSelected() {
-        guard selectedConnection != nil, let item = selectedLocal else { return }
-        let destination = joinRemote(remotePath, item.name)
-        upload(localPath: item.path, remotePath: destination, refreshWhenDone: true)
+        guard selectedConnection != nil else { return }
+        let items = selectedLocalItems
+        guard !items.isEmpty else { return }
+        for item in items {
+            let destination = joinRemote(remotePath, item.name)
+            upload(item: item, remotePath: destination, refreshWhenDone: item.id == items.last?.id)
+        }
     }
 
     func uploadFromPicker() {
@@ -1327,7 +1354,8 @@ final class AppModel: ObservableObject {
         panel.allowsMultipleSelection = true
         if panel.runModal() == .OK {
             for url in panel.urls {
-                upload(localPath: url.path, remotePath: joinRemote(remotePath, url.lastPathComponent), refreshWhenDone: true)
+                let item = localFileItem(for: url)
+                upload(item: item, remotePath: joinRemote(remotePath, url.lastPathComponent), refreshWhenDone: url == panel.urls.last)
             }
         }
     }
@@ -1372,6 +1400,14 @@ final class AppModel: ObservableObject {
         syncCurrentTab()
     }
 
+    private func upload(item: FileItem, remotePath: String, refreshWhenDone: Bool) {
+        if item.isDirectory {
+            uploadFolder(item: item, remotePath: remotePath, refreshWhenDone: refreshWhenDone)
+        } else {
+            upload(localPath: item.path, remotePath: remotePath, refreshWhenDone: refreshWhenDone)
+        }
+    }
+
     private func upload(localPath: String, remotePath: String, refreshWhenDone: Bool) {
         guard let connection = selectedConnection else { return }
         let credential = credentialForCurrentTab().clone()
@@ -1393,27 +1429,179 @@ final class AppModel: ObservableObject {
         }
     }
 
-    func downloadSelected() {
-        guard selectedConnection != nil, let item = selectedRemote else { return }
-        guard let destination = safeLocalDestination(base: URL(fileURLWithPath: localPath), name: item.name) else {
-            status = "Refused unsafe remote filename."
-            return
+    private func uploadFolder(item: FileItem, remotePath: String, refreshWhenDone: Bool) {
+        guard let connection = selectedConnection else { return }
+        let credential = credentialForCurrentTab().clone()
+        let transferID = enqueue(direction: .upload, source: item.path, destination: remotePath)
+        guard let control = transferControls[transferID] else { return }
+        runBusy("Uploading folder", transferID: transferID) {
+            let summary = try await self.transferLimiter.withPermit {
+                guard !control.isCancelled else { throw AppError.commandFailed("Transfer cancelled.") }
+                await MainActor.run { self.markTransfer(transferID, .running, "Preparing folder") }
+                return try await self.uploadLocalFolder(
+                    connection: connection,
+                    credential: credential,
+                    localURL: URL(fileURLWithPath: item.path, isDirectory: true),
+                    remotePath: remotePath,
+                    control: control,
+                    transferID: transferID
+                )
+            }
+            await MainActor.run {
+                let fileText = "\(summary.uploadedFiles) file\(summary.uploadedFiles == 1 ? "" : "s")"
+                let skippedText = summary.skippedItems > 0 ? ", skipped \(summary.skippedItems)" : ""
+                self.markTransfer(transferID, .done, "Uploaded \(fileText)\(skippedText)")
+                if refreshWhenDone {
+                    self.refreshRemote()
+                }
+            }
         }
-        download(remotePath: item.path, localPath: destination.path, refreshWhenDone: true)
+    }
+
+    private func uploadLocalFolder(
+        connection: SavedConnection,
+        credential: SensitiveCredential,
+        localURL: URL,
+        remotePath: String,
+        control: TransferControl,
+        transferID: UUID
+    ) async throws -> FolderUploadSummary {
+        guard !control.isCancelled else { throw AppError.commandFailed("Transfer cancelled.") }
+        await MainActor.run {
+            self.markTransfer(transferID, .running, "Creating \(localURL.lastPathComponent)")
+        }
+        _ = try await sftp.makeDirectory(connection: connection, credential: credential, path: remotePath)
+
+        let keys: Set<URLResourceKey> = [.isDirectoryKey, .isRegularFileKey, .isSymbolicLinkKey]
+        let children = try FileManager.default.contentsOfDirectory(
+            at: localURL,
+            includingPropertiesForKeys: Array(keys),
+            options: [.skipsHiddenFiles]
+        )
+
+        var summary = FolderUploadSummary()
+        for childURL in children {
+            guard !control.isCancelled else { throw AppError.commandFailed("Transfer cancelled.") }
+            let values = try childURL.resourceValues(forKeys: keys)
+            let childRemotePath = joinRemote(remotePath, childURL.lastPathComponent)
+
+            if values.isDirectory == true {
+                let childSummary = try await uploadLocalFolder(
+                    connection: connection,
+                    credential: credential,
+                    localURL: childURL,
+                    remotePath: childRemotePath,
+                    control: control,
+                    transferID: transferID
+                )
+                summary.uploadedFiles += childSummary.uploadedFiles
+                summary.skippedItems += childSummary.skippedItems
+            } else if values.isRegularFile == true {
+                await MainActor.run {
+                    self.markTransfer(transferID, .running, "Uploading \(childURL.lastPathComponent)")
+                }
+                _ = try await sftp.upload(
+                    connection: connection,
+                    credential: credential,
+                    localPath: childURL.path,
+                    remotePath: childRemotePath,
+                    control: control
+                )
+                summary.uploadedFiles += 1
+            } else {
+                summary.skippedItems += 1
+            }
+        }
+        return summary
+    }
+
+    private func localFileItem(for url: URL) -> FileItem {
+        let values = try? url.resourceValues(forKeys: [.isDirectoryKey, .fileSizeKey, .contentModificationDateKey, .contentTypeKey, .isHiddenKey])
+        let attributes = try? FileManager.default.attributesOfItem(atPath: url.path)
+        let isDirectory = values?.isDirectory == true
+        return FileItem(
+            name: url.lastPathComponent,
+            path: url.path,
+            isDirectory: isDirectory,
+            size: values?.fileSize.map(Int64.init),
+            modified: values?.contentModificationDate,
+            kind: isDirectory ? "Folder" : (values?.contentType?.localizedDescription ?? "File"),
+            owner: attributes?[.ownerAccountName] as? String,
+            group: attributes?[.groupOwnerAccountName] as? String,
+            permissions: (attributes?[.posixPermissions] as? NSNumber)?.uint32Value,
+            isHidden: values?.isHidden == true || url.lastPathComponent.hasPrefix(".")
+        )
+    }
+
+    func downloadSelected() {
+        guard selectedConnection != nil else { return }
+        let items = selectedRemoteItems
+        guard !items.isEmpty else { return }
+        for item in items {
+            guard let destination = safeLocalDestination(base: URL(fileURLWithPath: localPath), name: item.name) else {
+                status = "Refused unsafe remote filename."
+                continue
+            }
+            download(item: item, localPath: destination.path, refreshWhenDone: item.id == items.last?.id)
+        }
     }
 
     func downloadSelectedToFolder() {
-        guard let item = selectedRemote else { return }
+        let items = selectedRemoteItems
+        guard !items.isEmpty else { return }
         let panel = NSOpenPanel()
         panel.canChooseDirectories = true
         panel.canChooseFiles = false
         panel.allowsMultipleSelection = false
         if panel.runModal() == .OK, let folder = panel.url {
-            guard let destination = safeLocalDestination(base: folder, name: item.name) else {
-                status = "Refused unsafe remote filename."
-                return
+            for item in items {
+                guard let destination = safeLocalDestination(base: folder, name: item.name) else {
+                    status = "Refused unsafe remote filename."
+                    continue
+                }
+                download(item: item, localPath: destination.path, refreshWhenDone: false)
             }
-            download(remotePath: item.path, localPath: destination.path, refreshWhenDone: false)
+        }
+    }
+
+    private func download(item: FileItem, localPath: String, refreshWhenDone: Bool) {
+        if item.isDirectory {
+            downloadFolder(item: item, localPath: localPath, refreshWhenDone: refreshWhenDone)
+        } else {
+            download(remotePath: item.path, localPath: localPath, refreshWhenDone: refreshWhenDone)
+        }
+    }
+
+    private func downloadFolder(item: FileItem, localPath: String, refreshWhenDone: Bool) {
+        guard let connection = selectedConnection else { return }
+        guard let destination = resolveDirectoryDownloadConflict(at: localPath) else {
+            status = "Download cancelled"
+            return
+        }
+        let credential = credentialForCurrentTab().clone()
+        let transferID = enqueue(direction: .download, source: item.path, destination: destination)
+        guard let control = transferControls[transferID] else { return }
+        runBusy("Downloading folder", transferID: transferID) {
+            let summary = try await self.transferLimiter.withPermit {
+                guard !control.isCancelled else { throw AppError.commandFailed("Transfer cancelled.") }
+                await MainActor.run { self.markTransfer(transferID, .running, "Preparing folder") }
+                return try await self.downloadRemoteFolder(
+                    connection: connection,
+                    credential: credential,
+                    remotePath: item.path,
+                    localURL: URL(fileURLWithPath: destination, isDirectory: true),
+                    control: control,
+                    transferID: transferID
+                )
+            }
+            await MainActor.run {
+                let fileText = "\(summary.downloadedFiles) file\(summary.downloadedFiles == 1 ? "" : "s")"
+                let skippedText = summary.skippedItems > 0 ? ", skipped \(summary.skippedItems)" : ""
+                self.markTransfer(transferID, .done, "Downloaded \(fileText)\(skippedText)")
+                if refreshWhenDone {
+                    self.refreshLocal()
+                }
+            }
         }
     }
 
@@ -1442,6 +1630,73 @@ final class AppModel: ObservableObject {
         }
     }
 
+    private func downloadRemoteFolder(
+        connection: SavedConnection,
+        credential: SensitiveCredential,
+        remotePath: String,
+        localURL: URL,
+        control: TransferControl,
+        transferID: UUID
+    ) async throws -> FolderDownloadSummary {
+        guard !control.isCancelled else { throw AppError.commandFailed("Transfer cancelled.") }
+        try FileManager.default.createDirectory(at: localURL, withIntermediateDirectories: true)
+        await MainActor.run {
+            self.markTransfer(transferID, .running, "Listing \(URL(fileURLWithPath: remotePath).lastPathComponent)")
+        }
+
+        var summary = FolderDownloadSummary()
+        let result = try await sftp.list(connection: connection, credential: credential, path: remotePath)
+        for child in result.items {
+            guard !control.isCancelled else { throw AppError.commandFailed("Transfer cancelled.") }
+            guard let childURL = safeLocalDestination(base: localURL, name: child.name) else {
+                throw AppError.commandFailed("Refused unsafe remote filename: \(child.name)")
+            }
+
+            if child.isDirectory {
+                let childSummary = try await downloadRemoteFolder(
+                    connection: connection,
+                    credential: credential,
+                    remotePath: child.path,
+                    localURL: childURL,
+                    control: control,
+                    transferID: transferID
+                )
+                summary.downloadedFiles += childSummary.downloadedFiles
+                summary.skippedItems += childSummary.skippedItems
+            } else {
+                guard child.isRegularFile else {
+                    summary.skippedItems += 1
+                    await MainActor.run {
+                        self.markTransfer(transferID, .running, "Skipped unsupported item \(child.name)")
+                    }
+                    continue
+                }
+                let fileDestination = availableDownloadPathIfNeeded(for: childURL.path)
+                await MainActor.run {
+                    self.markTransfer(transferID, .running, "Downloading \(child.name)")
+                }
+                do {
+                    try await sftp.download(
+                        connection: connection,
+                        credential: credential,
+                        remotePath: child.path,
+                        localPath: fileDestination,
+                        policy: .createNew,
+                        control: control
+                    )
+                    summary.downloadedFiles += 1
+                } catch {
+                    guard !control.isCancelled else { throw error }
+                    summary.skippedItems += 1
+                    await MainActor.run {
+                        self.markTransfer(transferID, .running, "Skipped \(child.name): \(error.localizedDescription)")
+                    }
+                }
+            }
+        }
+        return summary
+    }
+
     private func resolveDownloadConflict(at path: String) -> (path: String, policy: DownloadPublishPolicy)? {
         guard FileManager.default.fileExists(atPath: path) else { return (path, .createNew) }
         let alert = NSAlert()
@@ -1459,6 +1714,37 @@ final class AppModel: ObservableObject {
         default:
             return nil
         }
+    }
+
+    private func resolveDirectoryDownloadConflict(at path: String) -> String? {
+        guard FileManager.default.fileExists(atPath: path) else { return path }
+
+        var isDirectory: ObjCBool = false
+        FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory)
+
+        let alert = NSAlert()
+        alert.messageText = "A \(isDirectory.boolValue ? "folder" : "file") named \"\(URL(fileURLWithPath: path).lastPathComponent)\" already exists."
+        alert.informativeText = isDirectory.boolValue
+            ? "Choose whether to merge into the existing folder or keep both folders."
+            : "A folder cannot replace this file. Choose a new folder name or cancel."
+        if isDirectory.boolValue {
+            alert.addButton(withTitle: "Merge")
+        }
+        alert.addButton(withTitle: "Keep Both")
+        alert.addButton(withTitle: "Cancel")
+
+        switch alert.runModal() {
+        case .alertFirstButtonReturn where isDirectory.boolValue:
+            return path
+        case isDirectory.boolValue ? .alertSecondButtonReturn : .alertFirstButtonReturn:
+            return availableDownloadPath(for: path)
+        default:
+            return nil
+        }
+    }
+
+    private func availableDownloadPathIfNeeded(for path: String) -> String {
+        FileManager.default.fileExists(atPath: path) ? availableDownloadPath(for: path) : path
     }
 
     private func availableDownloadPath(for path: String) -> String {
@@ -1540,7 +1826,7 @@ final class AppModel: ObservableObject {
         var newTab = currentSessionTab(title: item.name)
         newTab.localPath = item.path
         newTab.localItems = []
-        newTab.selectedLocalID = nil
+        newTab.selectedLocalIDs.removeAll()
         tabs.append(newTab)
         tabCredentials[newTab.id] = credentialForCurrentTab().clone()
         selectTab(newTab.id)
@@ -1565,7 +1851,7 @@ final class AppModel: ObservableObject {
         let newPath = URL(fileURLWithPath: localPath).appendingPathComponent(newName).path
         do {
             try FileManager.default.moveItem(atPath: item.path, toPath: newPath)
-            selectedLocalID = nil
+            selectedLocalIDs.removeAll()
             refreshLocal()
         } catch {
             status = error.localizedDescription
@@ -1585,7 +1871,7 @@ final class AppModel: ObservableObject {
         newTab.remoteItems = selectedConnection.flatMap {
             remoteDirectoryCache[remoteCacheKey(connectionID: $0.id, path: item.path)]
         } ?? []
-        newTab.selectedRemoteID = nil
+        newTab.selectedRemoteIDs.removeAll()
         tabs.append(newTab)
         tabCredentials[newTab.id] = credentialForCurrentTab().clone()
         selectTab(newTab.id)
@@ -1639,7 +1925,7 @@ final class AppModel: ObservableObject {
         runBusy("Moving remote item") {
             try await self.sftp.rename(connection: connection, credential: credential, from: item.path, to: newPath)
             await MainActor.run {
-                self.selectedRemoteID = nil
+                self.selectedRemoteIDs.removeAll()
                 self.refreshRemote()
             }
         }
@@ -1656,7 +1942,7 @@ final class AppModel: ObservableObject {
         guard alert.runModal() == .alertFirstButtonReturn else { return }
         do {
             try FileManager.default.removeItem(atPath: item.path)
-            selectedLocalID = nil
+            selectedLocalIDs.removeAll()
             refreshLocal()
         } catch {
             status = error.localizedDescription
@@ -1676,7 +1962,7 @@ final class AppModel: ObservableObject {
         runBusy("Deleting remote item") {
             try await self.sftp.remove(connection: connection, credential: credential, path: item.path, isDirectory: item.isDirectory)
             await MainActor.run {
-                self.selectedRemoteID = nil
+                self.selectedRemoteIDs.removeAll()
                 self.refreshRemote()
             }
         }
@@ -1703,7 +1989,7 @@ final class AppModel: ObservableObject {
         do {
             let destination = URL(fileURLWithPath: item.path).deletingLastPathComponent().appendingPathComponent(newName)
             try FileManager.default.moveItem(atPath: item.path, toPath: destination.path)
-            selectedLocalID = nil
+            selectedLocalIDs.removeAll()
             refreshLocal()
         } catch {
             status = error.localizedDescription
@@ -1719,7 +2005,7 @@ final class AppModel: ObservableObject {
         runBusy("Renaming remote item") {
             try await self.sftp.rename(connection: connection, credential: credential, from: item.path, to: destination)
             await MainActor.run {
-                self.selectedRemoteID = nil
+                self.selectedRemoteIDs.removeAll()
                 self.refreshRemote()
             }
         }
@@ -1997,8 +2283,8 @@ final class AppModel: ObservableObject {
             remotePath: remotePath,
             localItems: localItems,
             remoteItems: remoteItems,
-            selectedLocalID: selectedLocalID,
-            selectedRemoteID: selectedRemoteID,
+            selectedLocalIDs: selectedLocalIDs,
+            selectedRemoteIDs: selectedRemoteIDs,
             remoteEditSessions: remoteEditSessions,
             isConnected: isConnected,
             showsConnectionEditor: showsConnectionEditor,
@@ -2018,8 +2304,8 @@ final class AppModel: ObservableObject {
         tabs[index].remotePath = remotePath
         tabs[index].localItems = localItems
         tabs[index].remoteItems = remoteItems
-        tabs[index].selectedLocalID = selectedLocalID
-        tabs[index].selectedRemoteID = selectedRemoteID
+        tabs[index].selectedLocalIDs = selectedLocalIDs
+        tabs[index].selectedRemoteIDs = selectedRemoteIDs
         tabs[index].remoteEditSessions = remoteEditSessions
         tabs[index].isConnected = isConnected
         tabs[index].showsConnectionEditor = showsConnectionEditor
@@ -2042,8 +2328,8 @@ final class AppModel: ObservableObject {
         remotePath = tab.remotePath
         localItems = tab.localItems
         remoteItems = tab.remoteItems
-        selectedLocalID = tab.selectedLocalID
-        selectedRemoteID = tab.selectedRemoteID
+        selectedLocalIDs = tab.selectedLocalIDs
+        selectedRemoteIDs = tab.selectedRemoteIDs
         remoteEditSessions = tab.remoteEditSessions
         isConnected = tab.isConnected
         showsConnectionEditor = tab.showsConnectionEditor
@@ -2852,7 +3138,7 @@ struct BrowserSplitView: View {
                 path: $model.localPath,
                 submitPath: model.submitLocalPath,
                 items: model.localItems,
-                selection: $model.selectedLocalID,
+                selection: $model.selectedLocalIDs,
                 preferences: $model.localBrowserPreferences,
                 isRemote: false,
                 searchText: searchText,
@@ -2862,17 +3148,17 @@ struct BrowserSplitView: View {
                     Button(action: model.refreshLocal) { Image(systemName: "arrow.clockwise") }.help("Refresh")
                     Button(action: model.makeLocalFolder) { Image(systemName: "folder.badge.plus") }.help("New folder")
                     Button(action: model.uploadSelected) { Image(systemName: "arrow.right.circle") }.help("Upload")
-                        .disabled(model.selectedLocal == nil || model.selectedConnection == nil)
+                        .disabled(model.selectedLocalItems.isEmpty || model.selectedConnection == nil)
                     Button(action: model.editLocalSelected) { Image(systemName: "pencil") }.help("Edit file")
-                        .disabled(model.selectedLocal?.isDirectory != false)
+                        .disabled(model.selectedLocalItems.count != 1 || model.selectedLocal?.isDirectory != false)
                     Menu {
                         Button("New File", action: model.makeLocalFile)
                         Button("Open With...", action: model.openLocalSelectedWithApp)
-                            .disabled(model.selectedLocal?.isDirectory != false)
+                            .disabled(model.selectedLocalItems.count != 1 || model.selectedLocal?.isDirectory != false)
                         Button("Rename", action: model.renameLocalSelected)
-                            .disabled(model.selectedLocal == nil)
+                            .disabled(model.selectedLocalItems.count != 1)
                         Button("Delete", action: model.deleteLocalSelected)
-                            .disabled(model.selectedLocal == nil)
+                            .disabled(model.selectedLocalItems.isEmpty)
                     } label: {
                         Image(systemName: "ellipsis.circle")
                     }
@@ -2881,45 +3167,48 @@ struct BrowserSplitView: View {
                 open: model.openLocal,
                 contextMenu: { item in
                     let name = item.name
-                    Button("Upload \"\(name)\"") {
-                        model.selectedLocalID = item.id
+                    let isContextSelection = model.selectedLocalIDs.contains(item.id) && model.selectedLocalIDs.count > 1
+                    Button(isContextSelection ? "Upload Selected (\(model.selectedLocalIDs.count))" : "Upload \"\(name)\"") {
+                        if !model.selectedLocalIDs.contains(item.id) {
+                            model.selectedLocalIDs = [item.id]
+                        }
                         model.uploadSelected()
                     }
                     .disabled(model.selectedConnection == nil)
                     Button("Get Info") {
-                        model.selectedLocalID = item.id
+                        model.selectedLocalIDs = [item.id]
                         model.getInfoLocalSelected()
                     }
                     Divider()
                     Button("Open") {
-                        model.selectedLocalID = item.id
+                        model.selectedLocalIDs = [item.id]
                         model.editLocalSelected()
                     }
                     .disabled(item.isDirectory)
                     Button("Open With...") {
-                        model.selectedLocalID = item.id
+                        model.selectedLocalIDs = [item.id]
                         model.openLocalSelectedWithApp()
                     }
                     .disabled(item.isDirectory)
                     Button("Copy Path") {
-                        model.selectedLocalID = item.id
+                        model.selectedLocalIDs = [item.id]
                         model.copyLocalPath()
                     }
                     Divider()
                     Button("Delete...") {
-                        model.selectedLocalID = item.id
+                        model.selectedLocalIDs = [item.id]
                         model.deleteLocalSelected()
                     }
                     Button("Move...") {
-                        model.selectedLocalID = item.id
+                        model.selectedLocalIDs = [item.id]
                         model.moveLocalSelected()
                     }
                     Button("Duplicate") {
-                        model.selectedLocalID = item.id
+                        model.selectedLocalIDs = [item.id]
                         model.duplicateLocalSelected()
                     }
                     Button("Rename") {
-                        model.selectedLocalID = item.id
+                        model.selectedLocalIDs = [item.id]
                         model.renameLocalSelected()
                     }
                     Divider()
@@ -2929,7 +3218,7 @@ struct BrowserSplitView: View {
                     if item.isDirectory {
                         Divider()
                         Button("Open in New Tab") {
-                            model.selectedLocalID = item.id
+                            model.selectedLocalIDs = [item.id]
                             model.openInNewTabLocal()
                         }
                     }
@@ -2948,7 +3237,7 @@ struct BrowserSplitView: View {
                 path: $model.remotePath,
                 submitPath: model.submitRemotePath,
                 items: model.remoteItems,
-                selection: $model.selectedRemoteID,
+                selection: $model.selectedRemoteIDs,
                 preferences: $model.remoteBrowserPreferences,
                 isRemote: true,
                 searchText: searchText,
@@ -2959,20 +3248,20 @@ struct BrowserSplitView: View {
                     Button(action: model.uploadFromPicker) { Image(systemName: "square.and.arrow.up") }.help("Upload files or folders")
                         .disabled(model.selectedConnection == nil)
                     Button(action: model.downloadSelected) { Image(systemName: "arrow.left.circle") }.help("Download")
-                        .disabled(model.selectedRemote == nil)
+                        .disabled(model.selectedRemoteItems.isEmpty)
                     Button(action: model.editRemoteSelected) { Image(systemName: "pencil") }.help("Edit remote file")
-                        .disabled(model.selectedRemote?.isDirectory != false)
+                        .disabled(model.selectedRemoteItems.count != 1 || model.selectedRemote?.isDirectory != false)
                     Menu {
                         Button("Download To...", action: model.downloadSelectedToFolder)
-                            .disabled(model.selectedRemote == nil)
+                            .disabled(model.selectedRemoteItems.isEmpty)
                         Button("Open With...", action: model.openRemoteSelectedWithApp)
-                            .disabled(model.selectedRemote?.isDirectory != false)
+                            .disabled(model.selectedRemoteItems.count != 1 || model.selectedRemote?.isDirectory != false)
                         Button("New File", action: model.makeRemoteFile)
                             .disabled(model.selectedConnection == nil)
                         Button("Rename", action: model.renameRemoteSelected)
-                            .disabled(model.selectedRemote == nil)
+                            .disabled(model.selectedRemoteItems.count != 1)
                         Button("Delete", action: model.deleteRemoteSelected)
-                            .disabled(model.selectedRemote == nil)
+                            .disabled(model.selectedRemoteItems.isEmpty)
                     } label: {
                         Image(systemName: "ellipsis.circle")
                     }
@@ -2981,48 +3270,53 @@ struct BrowserSplitView: View {
                 open: model.openRemote,
                 contextMenu: { item in
                     let name = item.name
-                    Button("Download \"\(name)\"") {
-                        model.selectedRemoteID = item.id
+                    let isContextSelection = model.selectedRemoteIDs.contains(item.id) && model.selectedRemoteIDs.count > 1
+                    Button(isContextSelection ? "Download Selected (\(model.selectedRemoteIDs.count))" : "Download \"\(name)\"") {
+                        if !model.selectedRemoteIDs.contains(item.id) {
+                            model.selectedRemoteIDs = [item.id]
+                        }
                         model.downloadSelected()
                     }
-                    Button("Download To...") {
-                        model.selectedRemoteID = item.id
+                    Button(isContextSelection ? "Download Selected To..." : "Download To...") {
+                        if !model.selectedRemoteIDs.contains(item.id) {
+                            model.selectedRemoteIDs = [item.id]
+                        }
                         model.downloadSelectedToFolder()
                     }
                     Button("Get Info") {
-                        model.selectedRemoteID = item.id
+                        model.selectedRemoteIDs = [item.id]
                         model.getInfoRemoteSelected()
                     }
                     Divider()
                     Button("Open") {
-                        model.selectedRemoteID = item.id
+                        model.selectedRemoteIDs = [item.id]
                         model.editRemoteSelected()
                     }
                     .disabled(item.isDirectory)
                     Button("Open With...") {
-                        model.selectedRemoteID = item.id
+                        model.selectedRemoteIDs = [item.id]
                         model.openRemoteSelectedWithApp()
                     }
                     .disabled(item.isDirectory)
                     Button("Copy Path") {
-                        model.selectedRemoteID = item.id
+                        model.selectedRemoteIDs = [item.id]
                         model.copyRemotePath()
                     }
                     Divider()
                     Button("Delete...") {
-                        model.selectedRemoteID = item.id
+                        model.selectedRemoteIDs = [item.id]
                         model.deleteRemoteSelected()
                     }
                     Button("Move...") {
-                        model.selectedRemoteID = item.id
+                        model.selectedRemoteIDs = [item.id]
                         model.moveRemoteSelected()
                     }
                     Button("Duplicate") {
-                        model.selectedRemoteID = item.id
+                        model.selectedRemoteIDs = [item.id]
                         model.duplicateRemoteSelected()
                     }
                     Button("Rename") {
-                        model.selectedRemoteID = item.id
+                        model.selectedRemoteIDs = [item.id]
                         model.renameRemoteSelected()
                     }
                     Divider()
@@ -3034,7 +3328,7 @@ struct BrowserSplitView: View {
                     if item.isDirectory {
                         Divider()
                         Button("Open in New Tab") {
-                            model.selectedRemoteID = item.id
+                            model.selectedRemoteIDs = [item.id]
                             model.openInNewTabRemote()
                         }
                     }
@@ -3055,7 +3349,7 @@ struct FilePane<ToolbarContent: View, ContextMenuContent: View, BackgroundContex
     @Binding var path: String
     var submitPath: () -> Void
     var items: [FileItem]
-    @Binding var selection: FileItem.ID?
+    @Binding var selection: Set<FileItem.ID>
     @Binding var preferences: FileBrowserPreferences
     var isRemote: Bool
     var searchText: String
@@ -3063,6 +3357,7 @@ struct FilePane<ToolbarContent: View, ContextMenuContent: View, BackgroundContex
     var open: (FileItem) -> Void
     @ViewBuilder var contextMenu: (FileItem) -> ContextMenuContent
     @ViewBuilder var backgroundContextMenu: () -> BackgroundContextMenuContent
+    @State private var anchorSelectionID: FileItem.ID?
 
     private var displayedItems: [FileItem] {
         let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -3199,8 +3494,9 @@ struct FilePane<ToolbarContent: View, ContextMenuContent: View, BackgroundContex
 
     private var itemCountText: String {
         let total = displayedItems.count
-        if let selected = selection, displayedItems.contains(where: { $0.id == selected }) {
-            return "1 of \(total) selected"
+        let selectedCount = selection.filter { id in displayedItems.contains { $0.id == id } }.count
+        if selectedCount > 0 {
+            return "\(selectedCount) of \(total) selected"
         }
         return "\(total) items"
     }
@@ -3249,18 +3545,18 @@ struct FilePane<ToolbarContent: View, ContextMenuContent: View, BackgroundContex
             }
             .frame(minWidth: 120, maxWidth: .infinity, alignment: .leading)
             ForEach(preferences.visibleColumns) { column in
-                Text(text(for: column, item: item)).foregroundStyle(selection == item.id ? Color.primary.opacity(0.9) : Color.secondary)
+                Text(text(for: column, item: item)).foregroundStyle(isSelected(item) ? Color.primary.opacity(0.9) : Color.secondary)
                     .frame(width: column.width, alignment: .leading).lineLimit(1)
             }
         }
         .font(.system(size: preferences.textSize))
         .padding(.horizontal, 10)
         .padding(.vertical, 7)
-        .background(RoundedRectangle(cornerRadius: 6).fill(selection == item.id ? VoltTheme.selectedFill : (preferences.showRowColors && index.isMultiple(of: 2) ? Color.primary.opacity(0.035) : Color.clear)))
-        .background { RightClickSelectionView { selection = item.id } }
+        .background(RoundedRectangle(cornerRadius: 6).fill(isSelected(item) ? VoltTheme.selectedFill : (preferences.showRowColors && index.isMultiple(of: 2) ? Color.primary.opacity(0.035) : Color.clear)))
+        .background { RightClickSelectionView { selectForContextMenu(item) } }
         .foregroundStyle(Color.primary).clipShape(RoundedRectangle(cornerRadius: 6)).contentShape(Rectangle())
-        .onTapGesture(count: 2) { selection = item.id; open(item) }
-        .simultaneousGesture(TapGesture().onEnded { selection = item.id })
+        .onTapGesture(count: 2) { select(item, modifiers: NSEvent.modifierFlags); open(item) }
+        .simultaneousGesture(TapGesture().onEnded { select(item, modifiers: NSEvent.modifierFlags) })
         .contextMenu { contextMenu(item) }
     }
 
@@ -3275,9 +3571,10 @@ struct FilePane<ToolbarContent: View, ContextMenuContent: View, BackgroundContex
             Text(item.name).font(.system(size: preferences.textSize)).lineLimit(2).multilineTextAlignment(.center)
         }
         .frame(maxWidth: .infinity, minHeight: 100).padding(8)
-        .background(selection == item.id ? Color.accentColor.opacity(0.35) : Color.clear).clipShape(RoundedRectangle(cornerRadius: 8)).contentShape(Rectangle())
-        .onTapGesture(count: 2) { selection = item.id; open(item) }
-        .simultaneousGesture(TapGesture().onEnded { selection = item.id }).contextMenu { contextMenu(item) }
+        .background(isSelected(item) ? Color.accentColor.opacity(0.35) : Color.clear).clipShape(RoundedRectangle(cornerRadius: 8)).contentShape(Rectangle())
+        .onTapGesture(count: 2) { select(item, modifiers: NSEvent.modifierFlags); open(item) }
+        .simultaneousGesture(TapGesture().onEnded { select(item, modifiers: NSEvent.modifierFlags) })
+        .contextMenu { contextMenu(item) }
     }
 
     private var columnBrowser: some View {
@@ -3291,15 +3588,17 @@ struct FilePane<ToolbarContent: View, ContextMenuContent: View, BackgroundContex
                             if item.isDirectory { Image(systemName: "chevron.right").foregroundStyle(.secondary) }
                         }
                         .font(.system(size: preferences.textSize)).padding(.horizontal, 10).padding(.vertical, 7)
-                        .background(selection == item.id ? Color.accentColor : Color.clear).foregroundStyle(selection == item.id ? Color.white : Color.primary)
-                        .contentShape(Rectangle()).onTapGesture { selection = item.id }
-                        .onTapGesture(count: 2) { selection = item.id; open(item) }.contextMenu { contextMenu(item) }
+                        .background(isSelected(item) ? Color.accentColor : Color.clear).foregroundStyle(isSelected(item) ? Color.white : Color.primary)
+                        .contentShape(Rectangle())
+                        .onTapGesture(count: 2) { select(item, modifiers: NSEvent.modifierFlags); open(item) }
+                        .simultaneousGesture(TapGesture().onEnded { select(item, modifiers: NSEvent.modifierFlags) })
+                        .contextMenu { contextMenu(item) }
                     }
                 }.padding(6)
             }.frame(minWidth: 220, idealWidth: 280, maxWidth: 340)
             Divider()
             VStack(spacing: 12) {
-                if let item = displayedItems.first(where: { $0.id == selection }) {
+                if let item = displayedItems.first(where: { selection.contains($0.id) }) {
                     FileThumbnailView(item: item, isRemote: isRemote).frame(width: 128, height: 100)
                     Text(item.name).font(.headline).multilineTextAlignment(.center)
                     Text(item.kind).foregroundStyle(.secondary)
@@ -3362,6 +3661,40 @@ struct FilePane<ToolbarContent: View, ContextMenuContent: View, BackgroundContex
 
     private func sortField(for column: FileBrowserColumn) -> FileBrowserSortField {
         switch column { case .size: .size; case .date: .date; case .kind: .kind; case .owner: .owner; case .group: .group; case .permissions: .permissions }
+    }
+
+    private func isSelected(_ item: FileItem) -> Bool {
+        selection.contains(item.id)
+    }
+
+    private func selectForContextMenu(_ item: FileItem) {
+        if !selection.contains(item.id) {
+            selection = [item.id]
+            anchorSelectionID = item.id
+        }
+    }
+
+    private func select(_ item: FileItem, modifiers: NSEvent.ModifierFlags) {
+        if modifiers.contains(.shift), let anchorSelectionID,
+           let anchorIndex = displayedItems.firstIndex(where: { $0.id == anchorSelectionID }),
+           let itemIndex = displayedItems.firstIndex(where: { $0.id == item.id }) {
+            let bounds = min(anchorIndex, itemIndex)...max(anchorIndex, itemIndex)
+            selection = Set(displayedItems[bounds].map(\.id))
+            return
+        }
+
+        if modifiers.contains(.command) {
+            if selection.contains(item.id) {
+                selection.remove(item.id)
+            } else {
+                selection.insert(item.id)
+                anchorSelectionID = item.id
+            }
+            return
+        }
+
+        selection = [item.id]
+        anchorSelectionID = item.id
     }
 
     private func sortsBefore(_ lhs: FileItem, _ rhs: FileItem) -> Bool {
