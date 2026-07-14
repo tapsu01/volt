@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="logo.png" alt="Volt" width="104">
+  <img src="Support/VoltIcon.png" alt="Volt" width="104">
 </p>
 
 <h1 align="center">Volt</h1>
@@ -142,11 +142,11 @@ Notarization requires a Developer ID Application certificate and a configured
 Each saved connection can select a permission preset used for newly uploaded or
 created remote files and folders.
 
-| Preset | Files | Folders | Intended use |
-| --- | --- | --- | --- |
-| Web | `0644` | `0755` | Publicly readable web assets |
-| Private | `0600` | `0700` | Owner-only files and directories |
-| Team | `0660` | `0770` | Shared group workflows |
+| Preset  | Files  | Folders | Intended use                     |
+| ------- | ------ | ------- | -------------------------------- |
+| Web     | `0644` | `0755`  | Publicly readable web assets     |
+| Private | `0600` | `0700`  | Owner-only files and directories |
+| Team    | `0660` | `0770`  | Shared group workflows           |
 
 Volt reports a warning when a transfer or create operation succeeds but the
 server refuses the requested permission change.
