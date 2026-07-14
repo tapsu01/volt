@@ -19,17 +19,9 @@ configuration files.
 
 ## Preview
 
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="Support/Screenshots/volt-dark.png">
-    <source media="(prefers-color-scheme: light)" srcset="Support/Screenshots/volt-light.png">
-    <img src="Support/Screenshots/volt-light.png" alt="Volt dual-pane SFTP file manager interface">
-  </picture>
-</p>
-
-<p align="center">
-  <sub>Volt adapts cleanly to light and dark macOS appearances.</sub>
-</p>
+| Light | Dark |
+| --- | --- |
+| <img src="Support/Screenshots/volt-light.png" alt="Volt in light appearance"> | <img src="Support/Screenshots/volt-dark.png" alt="Volt in dark appearance"> |
 
 ## Contents
 
@@ -43,6 +35,7 @@ configuration files.
 - [Development](#development)
 - [Project Layout](#project-layout)
 - [Project Status](#project-status)
+- [Security](#security)
 - [License](#license)
 
 ## Highlights
@@ -97,8 +90,8 @@ architecture.
 Clone the repository, build a release app bundle, and open it:
 
 ```bash
-git clone https://github.com/<your-account>/Volt.git
-cd Volt
+git clone https://github.com/tapsu01/volt.git
+cd volt
 ./Scripts/package-app.sh
 open build/Volt.app
 ```
@@ -187,7 +180,13 @@ SSH key or agent authentication is recommended for long-lived server access.
 
 ## Development
 
-Run Swift tests:
+Build the app during development:
+
+```bash
+VOLT_LIBSSH2_PREFIX="$(brew --prefix libssh2)" swift build
+```
+
+Run Swift unit tests when using a full Xcode toolchain with XCTest available:
 
 ```bash
 swift test
@@ -236,9 +235,14 @@ The SSH terminal panel is available for key or agent based sessions. SFTP
 password operations are supported, but password-based interactive SSH terminal
 sessions are intentionally not used.
 
+## Security
+
+Please report suspected vulnerabilities privately. See
+[`SECURITY.md`](SECURITY.md) for the current reporting process.
+
 ## License
 
-A project license has not been added yet.
+Volt is released under the MIT License. See [`LICENSE`](LICENSE).
 
 Third-party dependency notices are available in
 [`Support/THIRD_PARTY_NOTICES.txt`](Support/THIRD_PARTY_NOTICES.txt).

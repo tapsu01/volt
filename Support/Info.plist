@@ -7,7 +7,7 @@
     <key>CFBundleExecutable</key>
     <string>Volt</string>
     <key>CFBundleIdentifier</key>
-    <string>local.volt.app</string>
+    <string>io.github.tapsu01.volt</string>
     <key>CFBundleName</key>
     <string>Volt</string>
     <key>CFBundleDisplayName</key>
