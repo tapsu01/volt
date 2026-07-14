@@ -17,23 +17,18 @@ struct SidebarBrandHeader: View {
                 HStack(spacing: 10) {
                     TrafficLightControls()
                         .padding(.leading, 24)
-                    Spacer(minLength: 24)
+                    Spacer(minLength: 12)
                     Image(systemName: "bolt.fill")
                         .font(.system(size: 19, weight: .semibold))
                         .foregroundStyle(Color.accentColor)
                     Text("Volt")
                         .font(.system(size: 18, weight: .bold))
-                    Spacer()
+                    Spacer(minLength: 12)
                 }
             }
         }
         .frame(maxWidth: .infinity, minHeight: 48, maxHeight: 48)
         .background(VoltTheme.toolbarBackground)
-        .overlay(alignment: .trailing) {
-            Rectangle()
-                .fill(VoltTheme.hairline)
-                .frame(width: 1)
-        }
         .overlay(alignment: .bottom) {
             Rectangle()
                 .fill(VoltTheme.hairline)
@@ -81,11 +76,6 @@ struct SidebarView: View {
         }
         .background(VoltTheme.sidebarBackground)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .overlay(alignment: .trailing) {
-            Rectangle()
-                .fill(VoltTheme.hairline)
-                .frame(width: 1)
-        }
     }
 
     private var fullBody: some View {
@@ -137,6 +127,7 @@ struct SidebarView: View {
                 }
                 .padding(.horizontal, 14)
                 .padding(.top, 18)
+                .frame(width: layout.sidebarWidth, alignment: .leading)
             }
             Spacer(minLength: 0)
 
@@ -158,6 +149,7 @@ struct SidebarView: View {
             .buttonStyle(.plain)
             .padding(.horizontal, 14)
             .padding(.vertical, 12)
+            .frame(width: layout.sidebarWidth, alignment: .leading)
         }
     }
 

@@ -3307,12 +3307,22 @@ private struct MainLayoutView: View {
     @State private var activeBrowserPane: ActiveBrowserPane = .local
 
     var body: some View {
-        VStack(spacing: 0) {
-            HStack(spacing: 0) {
-                if layout.sidebarMode != .hidden {
+        HStack(spacing: 0) {
+            if layout.sidebarMode != .hidden {
+                VStack(spacing: 0) {
                     SidebarBrandHeader(layout: layout)
-                        .frame(width: layout.sidebarWidth)
+                        .frame(height: 48)
+                    SidebarView(model: model, layout: layout)
                 }
+                .frame(width: layout.sidebarWidth)
+                .overlay(alignment: .trailing) {
+                    Rectangle()
+                        .fill(VoltTheme.hairline)
+                        .frame(width: 1)
+                }
+            }
+
+            VStack(spacing: 0) {
                 VoltTopToolbar(
                     model: model,
                     layout: layout,
@@ -3320,13 +3330,6 @@ private struct MainLayoutView: View {
                     searchText: $searchText,
                     appAppearance: $appAppearance
                 )
-            }
-
-            HStack(spacing: 0) {
-                if layout.sidebarMode != .hidden {
-                    SidebarView(model: model, layout: layout)
-                        .frame(width: layout.sidebarWidth)
-                }
 
                 ZStack(alignment: .trailing) {
                     HStack(spacing: 0) {

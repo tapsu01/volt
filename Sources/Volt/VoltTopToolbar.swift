@@ -8,29 +8,30 @@ struct VoltTopToolbar: View {
     @Binding var appAppearance: AppAppearance
 
     var body: some View {
-        VStack(spacing: 0) {
-            HStack(spacing: 12) {
-                sidebarToggle
-                connectionMenu
-                Divider().frame(height: 28)
-                navigationControls
-                Divider().frame(height: 28)
-                transferControls
-                Spacer(minLength: 12)
-                if layout.toolbarDensity == .expanded {
-                    searchField
-                }
-                appearanceToggle
-                viewControls
+        HStack(spacing: 12) {
+            sidebarToggle
+            connectionMenu
+            Divider().frame(height: 28)
+            navigationControls
+            Divider().frame(height: 28)
+            transferControls
+            Spacer(minLength: 12)
+            if layout.toolbarDensity == .expanded {
+                searchField
             }
-            .padding(.leading, 18)
-            .padding(.trailing, 14)
-            .frame(height: 48)
-            .clipped()
-
-            Divider()
+            appearanceToggle
+            viewControls
         }
+        .padding(.leading, 18)
+        .padding(.trailing, 14)
+        .frame(height: 48)
+        .clipped()
         .background(VoltTheme.toolbarBackground)
+        .overlay(alignment: .bottom) {
+            Rectangle()
+                .fill(VoltTheme.hairline)
+                .frame(height: 1)
+        }
     }
 
     private var sidebarToggle: some View {
