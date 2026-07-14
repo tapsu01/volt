@@ -10,7 +10,7 @@ enum AppLayoutMetrics {
     static let disconnectedRemoteSinglePaneBreakpoint: CGFloat = 1250
 
     static let fullSidebarWidth: CGFloat = 240
-    static let iconSidebarWidth: CGFloat = 64
+    static let iconSidebarWidth: CGFloat = VoltWindowChrome.trafficLightSafeInset
     static let dockedInspectorWidth: CGFloat = 280
 
     static func overlayInspectorWidth(for width: CGFloat) -> CGFloat {

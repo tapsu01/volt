@@ -22,9 +22,9 @@ struct VoltTopToolbar: View {
             appearanceToggle
             viewControls
         }
-        .padding(.leading, 18)
+        .padding(.leading, leadingPadding)
         .padding(.trailing, 14)
-        .frame(height: 48)
+        .frame(height: VoltWindowChrome.toolbarHeight)
         .clipped()
         .background(VoltTheme.toolbarBackground)
         .overlay(alignment: .bottom) {
@@ -32,6 +32,10 @@ struct VoltTopToolbar: View {
                 .fill(VoltTheme.hairline)
                 .frame(height: 1)
         }
+    }
+
+    private var leadingPadding: CGFloat {
+        layout.sidebarMode == .hidden ? VoltWindowChrome.trafficLightSafeInset : 18
     }
 
     private var sidebarToggle: some View {

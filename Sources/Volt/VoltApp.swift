@@ -3360,6 +3360,11 @@ private struct MainLayoutView: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .background(VoltTheme.appBackground)
+        .overlay(alignment: .topLeading) {
+            TrafficLightControls()
+                .padding(.leading, VoltWindowChrome.trafficLightLeadingPadding)
+                .frame(height: VoltWindowChrome.toolbarHeight, alignment: .center)
+        }
         .sheet(isPresented: inspectorSheetBinding) {
             InspectorView(model: model)
                 .frame(width: layout.inspectorWidth, height: 560)
@@ -3405,6 +3410,31 @@ private struct MainLayoutView: View {
                 }
             }
         )
+    }
+}
+
+private struct TrafficLightControls: View {
+    var body: some View {
+        HStack(spacing: 10) {
+            trafficButton(color: Color(red: 1.0, green: 0.35, blue: 0.31), action: {
+                NSApp.keyWindow?.performClose(nil)
+            })
+            trafficButton(color: Color(red: 1.0, green: 0.73, blue: 0.20), action: {
+                NSApp.keyWindow?.miniaturize(nil)
+            })
+            trafficButton(color: Color(red: 0.21, green: 0.80, blue: 0.31), action: {
+                NSApp.keyWindow?.zoom(nil)
+            })
+        }
+    }
+
+    private func trafficButton(color: Color, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Circle()
+                .fill(color)
+                .frame(width: 12, height: 12)
+        }
+        .buttonStyle(.plain)
     }
 }
 

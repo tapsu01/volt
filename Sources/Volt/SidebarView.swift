@@ -8,16 +8,10 @@ struct SidebarBrandHeader: View {
     var body: some View {
         Group {
             if layout.sidebarMode == .iconOnly {
-                HStack {
-                    Image(systemName: "bolt.fill")
-                        .font(.system(size: 19, weight: .semibold))
-                        .foregroundStyle(Color.accentColor)
-                }
+                Color.clear
             } else {
                 HStack(spacing: 10) {
-                    TrafficLightControls()
-                        .padding(.leading, 24)
-                    Spacer(minLength: 12)
+                    Spacer()
                     Image(systemName: "bolt.fill")
                         .font(.system(size: 19, weight: .semibold))
                         .foregroundStyle(Color.accentColor)
@@ -25,40 +19,16 @@ struct SidebarBrandHeader: View {
                         .font(.system(size: 18, weight: .bold))
                     Spacer(minLength: 12)
                 }
+                .padding(.leading, VoltWindowChrome.trafficLightSafeInset)
             }
         }
-        .frame(maxWidth: .infinity, minHeight: 48, maxHeight: 48)
+        .frame(maxWidth: .infinity, minHeight: VoltWindowChrome.toolbarHeight, maxHeight: VoltWindowChrome.toolbarHeight)
         .background(VoltTheme.toolbarBackground)
         .overlay(alignment: .bottom) {
             Rectangle()
                 .fill(VoltTheme.hairline)
                 .frame(height: 1)
         }
-    }
-}
-
-private struct TrafficLightControls: View {
-    var body: some View {
-        HStack(spacing: 10) {
-            trafficButton(color: Color(red: 1.0, green: 0.35, blue: 0.31), action: {
-                NSApp.keyWindow?.performClose(nil)
-            })
-            trafficButton(color: Color(red: 1.0, green: 0.73, blue: 0.20), action: {
-                NSApp.keyWindow?.miniaturize(nil)
-            })
-            trafficButton(color: Color(red: 0.21, green: 0.80, blue: 0.31), action: {
-                NSApp.keyWindow?.zoom(nil)
-            })
-        }
-    }
-
-    private func trafficButton(color: Color, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            Circle()
-                .fill(color)
-                .frame(width: 12, height: 12)
-        }
-        .buttonStyle(.plain)
     }
 }
 
