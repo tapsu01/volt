@@ -1289,6 +1289,10 @@ final class AppModel: ObservableObject {
     private var isSuppressingSidebarSelection = false
     private var isSelectingConnection = false
 
+    var hasCompletedTransfers: Bool {
+        transfers.contains { $0.state == .done || $0.state == .failed || $0.state == .cancelled }
+    }
+
     init() {
         selectedTabID = tabs.first?.id
         AppPaths.migrateFromSandboxContainerIfNeeded()
@@ -1914,6 +1918,28 @@ final class AppModel: ObservableObject {
         guard alert.runModal() == .alertFirstButtonReturn else { return }
         remoteEditSessions.removeAll { $0.id == session.id }
         cleanupEditSessions([session])
+        syncCurrentTab()
+    }
+
+    func clearCompletedTransfers() {
+        let completedIDs = Set(transfers.filter { $0.state == .done || $0.state == .failed || $0.state == .cancelled }.map(\.id))
+        guard !completedIDs.isEmpty else { return }
+        transfers.removeAll { completedIDs.contains($0.id) }
+        for id in completedIDs {
+            transferControls.removeValue(forKey: id)
+        }
+        status = "Completed transfers cleared"
+    }
+
+    func clearRemoteEdits() {
+        guard !remoteEditSessions.isEmpty else { return }
+        guard confirmDiscardEditSessions(remoteEditSessions, action: "clear remote edits") else { return }
+        cleanupEditSessions(remoteEditSessions)
+        remoteEditSessions = []
+        if transferPanelTab == .remoteEdits {
+            transferPanelTab = .transfers
+        }
+        status = "Remote edits cleared"
         syncCurrentTab()
     }
 

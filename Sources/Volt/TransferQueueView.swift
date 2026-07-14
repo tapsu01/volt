@@ -109,6 +109,7 @@ struct TransferQueueView: View {
             HStack {
                 panelTabs
                 Spacer()
+                panelClearButton
                 Button {
                     model.showsTransfers = false
                 } label: {
@@ -146,6 +147,7 @@ struct TransferQueueView: View {
             HStack {
                 panelTabs
                 Spacer()
+                panelClearButton
                 Button {
                     model.showsTransfers = false
                 } label: {
@@ -193,6 +195,29 @@ struct TransferQueueView: View {
         .pickerStyle(.segmented)
         .labelsHidden()
         .frame(maxWidth: 360)
+    }
+
+    @ViewBuilder private var panelClearButton: some View {
+        switch selectedTab {
+        case .transfers:
+            Button(action: model.clearCompletedTransfers) {
+                Label("Clear", systemImage: "trash")
+            }
+            .labelStyle(.titleAndIcon)
+            .buttonStyle(.plain)
+            .disabled(!model.hasCompletedTransfers)
+            .help("Clear completed, failed, and cancelled transfers")
+        case .remoteEdits:
+            Button(action: model.clearRemoteEdits) {
+                Label("Clear", systemImage: "trash")
+            }
+            .labelStyle(.titleAndIcon)
+            .buttonStyle(.plain)
+            .disabled(model.remoteEditSessions.isEmpty)
+            .help("Discard all open remote edits")
+        case .terminal:
+            EmptyView()
+        }
     }
 
     @ViewBuilder private var expandedPanelContent: some View {
