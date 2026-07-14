@@ -659,7 +659,7 @@ int volt_sftp_list(const char *host, int port, const char *username, const char 
     return 0;
 }
 
-int volt_sftp_upload(const char *host, int port, const char *username, const char *password, const char *private_key_path, const char *known_hosts_path, const char *local_path, const char *remote_path, uint32_t mode, VoltSFTPProgressCallback progress, void *progress_context, char *error, size_t error_len) {
+int volt_sftp_upload(const char *host, int port, const char *username, const char *password, const char *private_key_path, const char *known_hosts_path, const char *local_path, const char *remote_path, uint32_t mode, int overwrite, VoltSFTPProgressCallback progress, void *progress_context, char *error, size_t error_len) {
     VoltSession session;
     if (open_session(host, port, username, password, private_key_path, known_hosts_path, &session, error, error_len) != 0) return -1;
     FILE *input = fopen(local_path, "rb");
@@ -744,7 +744,9 @@ int volt_sftp_upload(const char *host, int port, const char *username, const cha
         return -1;
     }
 
-    long rename_flags = LIBSSH2_SFTP_RENAME_OVERWRITE | LIBSSH2_SFTP_RENAME_ATOMIC | LIBSSH2_SFTP_RENAME_NATIVE;
+    long rename_flags = overwrite
+        ? (LIBSSH2_SFTP_RENAME_OVERWRITE | LIBSSH2_SFTP_RENAME_ATOMIC | LIBSSH2_SFTP_RENAME_NATIVE)
+        : (LIBSSH2_SFTP_RENAME_ATOMIC | LIBSSH2_SFTP_RENAME_NATIVE);
     int rename_result = libssh2_sftp_rename_ex(
         session.sftp,
         temp_path,
@@ -760,7 +762,7 @@ int volt_sftp_upload(const char *host, int port, const char *username, const cha
             (unsigned int)strlen(temp_path),
             remote_path,
             (unsigned int)strlen(remote_path),
-            LIBSSH2_SFTP_RENAME_OVERWRITE
+            overwrite ? LIBSSH2_SFTP_RENAME_OVERWRITE : 0
         );
     }
     if (rename_result != 0) {

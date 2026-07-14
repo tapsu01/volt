@@ -725,6 +725,29 @@ enum DownloadPublishPolicy: Sendable {
     case createNew
 }
 
+enum UploadPublishPolicy: Sendable {
+    case replace
+    case createNew
+}
+
+private enum UploadConflictBatchPolicy {
+    case replace
+    case keepBoth
+    case skip
+}
+
+private enum UploadConflictChoice {
+    case replace
+    case keepBoth
+    case skip
+    case cancel
+}
+
+private enum UploadConflictResolution {
+    case upload(path: String, policy: UploadPublishPolicy)
+    case skip
+}
+
 final class SecureStorage {
     private static let legacyKey = "connections"
 
@@ -1034,12 +1057,12 @@ final class SFTPClient: @unchecked Sendable {
         }.value
     }
 
-    func upload(connection: SavedConnection, credential: SensitiveCredential, localPath: String, remotePath: String, control: TransferControl) async throws -> String? {
+    func upload(connection: SavedConnection, credential: SensitiveCredential, localPath: String, remotePath: String, policy: UploadPublishPolicy, control: TransferControl) async throws -> String? {
         try await Task.detached {
             let context = Unmanaged.passRetained(control).toOpaque()
             defer { Unmanaged<TransferControl>.fromOpaque(context).release() }
             return try self.call(connection: connection, credential: credential) { host, port, username, password, keyPath, knownHostsPath, error, errorLength in
-                volt_sftp_upload(host, port, username, password, keyPath, knownHostsPath, localPath, remotePath, connection.effectivePermissionPreset.fileMode, transferProgressCallback, context, error, errorLength)
+                volt_sftp_upload(host, port, username, password, keyPath, knownHostsPath, localPath, remotePath, connection.effectivePermissionPreset.fileMode, policy == .replace ? 1 : 0, transferProgressCallback, context, error, errorLength)
             }
         }.value
     }
@@ -1284,6 +1307,8 @@ final class AppModel: ObservableObject {
     private let sftp = SFTPClient()
     private let transferLimiter = TransferLimiter(limit: TransferTuning.maxConcurrentTransfers)
     private var transferControls: [UUID: TransferControl] = [:]
+    private var uploadConflictBatchPolicy: UploadConflictBatchPolicy?
+    private var reservedUploadPaths: Set<String> = []
     private var activeOperationCount = 0
     private var isRestoringTab = false
     private var isSuppressingSidebarSelection = false
@@ -1861,6 +1886,8 @@ final class AppModel: ObservableObject {
         guard selectedConnection != nil else { return }
         let items = selectedLocalItems
         guard !items.isEmpty else { return }
+        uploadConflictBatchPolicy = nil
+        reservedUploadPaths.removeAll()
         for item in items {
             let destination = joinRemote(remotePath, item.name)
             upload(item: item, remotePath: destination, refreshWhenDone: item.id == items.last?.id)
@@ -1874,6 +1901,8 @@ final class AppModel: ObservableObject {
         panel.canChooseFiles = true
         panel.allowsMultipleSelection = true
         if panel.runModal() == .OK {
+            uploadConflictBatchPolicy = nil
+            reservedUploadPaths.removeAll()
             for url in panel.urls {
                 let item = localFileItem(for: url)
                 upload(item: item, remotePath: joinRemote(remotePath, url.lastPathComponent), refreshWhenDone: url == panel.urls.last)
@@ -1895,6 +1924,7 @@ final class AppModel: ObservableObject {
                     credential: credential,
                     localPath: session.localPath,
                     remotePath: session.remotePath,
+                    policy: .replace,
                     control: control
                 )
             }
@@ -1957,10 +1987,27 @@ final class AppModel: ObservableObject {
         let transferID = enqueue(direction: .upload, source: localPath, destination: remotePath)
         guard let control = transferControls[transferID] else { return }
         runBusy("Uploading", transferID: transferID) {
+            let resolution = try await self.resolveUploadConflict(
+                connection: connection,
+                credential: credential,
+                remotePath: remotePath
+            )
+            guard case let .upload(destination, policy) = resolution else {
+                await MainActor.run {
+                    self.markTransfer(transferID, .cancelled, "Skipped")
+                    if refreshWhenDone {
+                        self.refreshRemote()
+                    }
+                }
+                return
+            }
             let warning = try await self.transferLimiter.withPermit {
                 guard !control.isCancelled else { throw AppError.commandFailed("Transfer cancelled.") }
-                await MainActor.run { self.markTransfer(transferID, .running, "") }
-                return try await self.sftp.upload(connection: connection, credential: credential, localPath: localPath, remotePath: remotePath, control: control)
+                await MainActor.run {
+                    self.updateTransferDestination(transferID, destination)
+                    self.markTransfer(transferID, .running, "")
+                }
+                return try await self.sftp.upload(connection: connection, credential: credential, localPath: localPath, remotePath: destination, policy: policy, control: control)
             }
             await MainActor.run {
                 self.markTransfer(transferID, .done, warning ?? "Uploaded")
@@ -2010,10 +2057,16 @@ final class AppModel: ObservableObject {
         transferID: UUID
     ) async throws -> FolderUploadSummary {
         guard !control.isCancelled else { throw AppError.commandFailed("Transfer cancelled.") }
+        guard let uploadRemotePath = try await resolveUploadFolderConflict(
+            connection: connection,
+            credential: credential,
+            remotePath: remotePath
+        ) else {
+            return FolderUploadSummary(uploadedFiles: 0, skippedItems: 1)
+        }
         await MainActor.run {
             self.markTransfer(transferID, .running, "Creating \(localURL.lastPathComponent)")
         }
-        _ = try await sftp.makeDirectory(connection: connection, credential: credential, path: remotePath)
 
         let keys: Set<URLResourceKey> = [.isDirectoryKey, .isRegularFileKey, .isSymbolicLinkKey]
         let children = try FileManager.default.contentsOfDirectory(
@@ -2026,7 +2079,7 @@ final class AppModel: ObservableObject {
         for childURL in children {
             guard !control.isCancelled else { throw AppError.commandFailed("Transfer cancelled.") }
             let values = try childURL.resourceValues(forKeys: keys)
-            let childRemotePath = joinRemote(remotePath, childURL.lastPathComponent)
+            let childRemotePath = joinRemote(uploadRemotePath, childURL.lastPathComponent)
 
             if values.isDirectory == true {
                 let childSummary = try await uploadLocalFolder(
@@ -2043,11 +2096,21 @@ final class AppModel: ObservableObject {
                 await MainActor.run {
                     self.markTransfer(transferID, .running, "Uploading \(childURL.lastPathComponent)")
                 }
+                let resolution = try await resolveUploadConflict(
+                    connection: connection,
+                    credential: credential,
+                    remotePath: childRemotePath
+                )
+                guard case let .upload(destination, policy) = resolution else {
+                    summary.skippedItems += 1
+                    continue
+                }
                 _ = try await sftp.upload(
                     connection: connection,
                     credential: credential,
                     localPath: childURL.path,
-                    remotePath: childRemotePath,
+                    remotePath: destination,
+                    policy: policy,
                     control: control
                 )
                 summary.uploadedFiles += 1
@@ -2371,6 +2434,294 @@ final class AppModel: ObservableObject {
         }
 
         return summary
+    }
+
+    private func resolveUploadConflict(
+        connection: SavedConnection,
+        credential: SensitiveCredential,
+        remotePath: String
+    ) async throws -> UploadConflictResolution {
+        let remotePathIsReserved = reservedUploadPaths.contains(remotePath)
+        let remotePathExists: Bool
+        if remotePathIsReserved {
+            remotePathExists = true
+        } else {
+            remotePathExists = try await remoteEntry(at: remotePath, connection: connection, credential: credential) != nil
+        }
+        guard remotePathExists else {
+            reservedUploadPaths.insert(remotePath)
+            return .upload(path: remotePath, policy: .createNew)
+        }
+
+        if let uploadConflictBatchPolicy {
+            return try await uploadResolution(for: uploadConflictBatchPolicy, remotePath: remotePath, connection: connection, credential: credential)
+        }
+
+        let promptResult = promptUploadConflict(remotePath: remotePath)
+        if let batchPolicy = promptResult.applyToAllPolicy {
+            uploadConflictBatchPolicy = batchPolicy
+        }
+
+        switch promptResult.choice {
+        case .replace:
+            return .upload(path: remotePath, policy: .replace)
+        case .keepBoth:
+            let destination = try await availableRemoteUploadPath(for: remotePath, connection: connection, credential: credential)
+            reservedUploadPaths.insert(destination)
+            return .upload(path: destination, policy: .createNew)
+        case .skip:
+            return .skip
+        case .cancel:
+            throw AppError.commandFailed("Upload cancelled.")
+        }
+    }
+
+    private func resolveUploadFolderConflict(
+        connection: SavedConnection,
+        credential: SensitiveCredential,
+        remotePath: String
+    ) async throws -> String? {
+        let existingEntry: FileItem?
+        if reservedUploadPaths.contains(remotePath) {
+            existingEntry = FileItem(name: URL(fileURLWithPath: remotePath).lastPathComponent, path: remotePath, isDirectory: true)
+        } else {
+            existingEntry = try await remoteEntry(at: remotePath, connection: connection, credential: credential)
+        }
+
+        guard let existingEntry else {
+            _ = try await sftp.makeDirectory(connection: connection, credential: credential, path: remotePath)
+            reservedUploadPaths.insert(remotePath)
+            return remotePath
+        }
+
+        if let uploadConflictBatchPolicy {
+            return try await folderUploadResolution(
+                for: uploadConflictBatchPolicy,
+                existingEntry: existingEntry,
+                remotePath: remotePath,
+                connection: connection,
+                credential: credential
+            )
+        }
+
+        guard existingEntry.isDirectory else {
+            let promptResult = promptFolderUploadBlockedByFile(remotePath: remotePath)
+            if let batchPolicy = promptResult.applyToAllPolicy {
+                uploadConflictBatchPolicy = batchPolicy
+            }
+            switch promptResult.choice {
+            case .keepBoth:
+                let destination = try await availableRemoteUploadPath(for: remotePath, connection: connection, credential: credential)
+                _ = try await sftp.makeDirectory(connection: connection, credential: credential, path: destination)
+                reservedUploadPaths.insert(destination)
+                return destination
+            case .skip:
+                return nil
+            case .cancel:
+                throw AppError.commandFailed("Upload cancelled.")
+            case .replace:
+                throw AppError.commandFailed("A file named \"\(existingEntry.name)\" already exists on the server.")
+            }
+        }
+
+        let promptResult = promptUploadConflict(
+            remotePath: remotePath,
+            primaryActionTitle: "Merge"
+        )
+        if let batchPolicy = promptResult.applyToAllPolicy {
+            uploadConflictBatchPolicy = batchPolicy
+        }
+
+        switch promptResult.choice {
+        case .replace:
+            guard existingEntry.isDirectory else {
+                throw AppError.commandFailed("A file named \"\(existingEntry.name)\" already exists on the server.")
+            }
+            return remotePath
+        case .keepBoth:
+            let destination = try await availableRemoteUploadPath(for: remotePath, connection: connection, credential: credential)
+            _ = try await sftp.makeDirectory(connection: connection, credential: credential, path: destination)
+            reservedUploadPaths.insert(destination)
+            return destination
+        case .skip:
+            return nil
+        case .cancel:
+            throw AppError.commandFailed("Upload cancelled.")
+        }
+    }
+
+    private func folderUploadResolution(
+        for policy: UploadConflictBatchPolicy,
+        existingEntry: FileItem,
+        remotePath: String,
+        connection: SavedConnection,
+        credential: SensitiveCredential
+    ) async throws -> String? {
+        switch policy {
+        case .replace:
+            guard existingEntry.isDirectory else {
+                throw AppError.commandFailed("A file named \"\(existingEntry.name)\" already exists on the server.")
+            }
+            return remotePath
+        case .keepBoth:
+            let destination = try await availableRemoteUploadPath(for: remotePath, connection: connection, credential: credential)
+            _ = try await sftp.makeDirectory(connection: connection, credential: credential, path: destination)
+            reservedUploadPaths.insert(destination)
+            return destination
+        case .skip:
+            return nil
+        }
+    }
+
+    private func uploadResolution(
+        for policy: UploadConflictBatchPolicy,
+        remotePath: String,
+        connection: SavedConnection,
+        credential: SensitiveCredential
+    ) async throws -> UploadConflictResolution {
+        switch policy {
+        case .replace:
+            return .upload(path: remotePath, policy: .replace)
+        case .keepBoth:
+            let destination = try await availableRemoteUploadPath(for: remotePath, connection: connection, credential: credential)
+            reservedUploadPaths.insert(destination)
+            return .upload(path: destination, policy: .createNew)
+        case .skip:
+            return .skip
+        }
+    }
+
+    private func promptUploadConflict(
+        remotePath: String,
+        primaryActionTitle: String = "Replace"
+    ) -> (choice: UploadConflictChoice, applyToAllPolicy: UploadConflictBatchPolicy?) {
+        let name = URL(fileURLWithPath: remotePath).lastPathComponent
+        let alert = NSAlert()
+        alert.messageText = "An item named \"\(name)\" already exists on the server."
+        alert.informativeText = "Choose what Volt should do before uploading."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: primaryActionTitle)
+        alert.addButton(withTitle: "Keep Both")
+        alert.addButton(withTitle: "Skip")
+        alert.addButton(withTitle: "Cancel")
+
+        let checkbox = NSButton(checkboxWithTitle: "Apply to all upload conflicts", target: nil, action: nil)
+        checkbox.state = .off
+        alert.accessoryView = checkbox
+
+        let choice: UploadConflictChoice
+        switch alert.runModal() {
+        case .alertFirstButtonReturn:
+            choice = .replace
+        case .alertSecondButtonReturn:
+            choice = .keepBoth
+        case .alertThirdButtonReturn:
+            choice = .skip
+        default:
+            choice = .cancel
+        }
+
+        let applyToAllPolicy: UploadConflictBatchPolicy?
+        if checkbox.state == .on {
+            switch choice {
+            case .replace:
+                applyToAllPolicy = .replace
+            case .keepBoth:
+                applyToAllPolicy = .keepBoth
+            case .skip:
+                applyToAllPolicy = .skip
+            case .cancel:
+                applyToAllPolicy = nil
+            }
+        } else {
+            applyToAllPolicy = nil
+        }
+
+        return (choice, applyToAllPolicy)
+    }
+
+    private func promptFolderUploadBlockedByFile(remotePath: String) -> (choice: UploadConflictChoice, applyToAllPolicy: UploadConflictBatchPolicy?) {
+        let name = URL(fileURLWithPath: remotePath).lastPathComponent
+        let alert = NSAlert()
+        alert.messageText = "A file named \"\(name)\" already exists on the server."
+        alert.informativeText = "A folder cannot be merged into that file. Choose a new folder name or skip it."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Keep Both")
+        alert.addButton(withTitle: "Skip")
+        alert.addButton(withTitle: "Cancel")
+
+        let checkbox = NSButton(checkboxWithTitle: "Apply to all upload conflicts", target: nil, action: nil)
+        checkbox.state = .off
+        alert.accessoryView = checkbox
+
+        let choice: UploadConflictChoice
+        switch alert.runModal() {
+        case .alertFirstButtonReturn:
+            choice = .keepBoth
+        case .alertSecondButtonReturn:
+            choice = .skip
+        default:
+            choice = .cancel
+        }
+
+        let applyToAllPolicy: UploadConflictBatchPolicy?
+        if checkbox.state == .on {
+            switch choice {
+            case .keepBoth:
+                applyToAllPolicy = .keepBoth
+            case .skip:
+                applyToAllPolicy = .skip
+            default:
+                applyToAllPolicy = nil
+            }
+        } else {
+            applyToAllPolicy = nil
+        }
+
+        return (choice, applyToAllPolicy)
+    }
+
+    private func remoteEntry(
+        at path: String,
+        connection: SavedConnection,
+        credential: SensitiveCredential
+    ) async throws -> FileItem? {
+        guard let parent = remoteParentPath(path) else { return nil }
+        let name = URL(fileURLWithPath: path).lastPathComponent
+
+        if selectedConnectionID == connection.id && parent == remotePath {
+            return remoteItems.first { $0.name == name }
+        }
+
+        if let cachedItems = remoteDirectoryCache[remoteCacheKey(connectionID: connection.id, path: parent)] {
+            return cachedItems.first { $0.name == name }
+        }
+
+        let result = try await sftp.list(connection: connection, credential: credential, path: parent)
+        remoteDirectoryCache[remoteCacheKey(connectionID: connection.id, path: parent)] = result.items
+        return result.items.first { $0.name == name }
+    }
+
+    private func availableRemoteUploadPath(
+        for path: String,
+        connection: SavedConnection,
+        credential: SensitiveCredential
+    ) async throws -> String {
+        guard let parent = remoteParentPath(path) else { return path }
+        let name = URL(fileURLWithPath: path).lastPathComponent
+        let fileExtension = (name as NSString).pathExtension
+        let baseName = fileExtension.isEmpty ? name : (name as NSString).deletingPathExtension
+
+        var index = 2
+        while true {
+            let candidateName = fileExtension.isEmpty ? "\(baseName) \(index)" : "\(baseName) \(index).\(fileExtension)"
+            let candidate = joinRemote(parent, candidateName)
+            if !reservedUploadPaths.contains(candidate),
+               try await remoteEntry(at: candidate, connection: connection, credential: credential) == nil {
+                return candidate
+            }
+            index += 1
+        }
     }
 
     private func resolveDownloadConflict(at path: String) -> (path: String, policy: DownloadPublishPolicy)? {
@@ -2876,6 +3227,12 @@ final class AppModel: ObservableObject {
         if transferred > 0 && transfers[index].progressStartedAt == nil {
             transfers[index].progressStartedAt = Date()
         }
+    }
+
+    private func updateTransferDestination(_ id: UUID, _ destination: String) {
+        guard let index = transfers.firstIndex(where: { $0.id == id }) else { return }
+        transfers[index].destination = destination
+        transfers[index].updatedAt = Date()
     }
 
     func cancelTransfer(_ id: UUID) {
