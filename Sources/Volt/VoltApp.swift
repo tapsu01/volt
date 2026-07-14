@@ -1270,6 +1270,7 @@ final class AppModel: ObservableObject {
     @Published var showsInspector = false
     @Published var showsTransfers = false
     @Published var transferPanelTab: TransferPanelTab = .transfers
+    @Published var recentsCleared = false
     @Published var showsPasswordPrompt = false
     @Published var showsHostKeyPrompt = false
     @Published var pendingHostKeyFingerprint = ""
@@ -1647,6 +1648,18 @@ final class AppModel: ObservableObject {
         syncCurrentTab()
     }
 
+    func clearRecents() {
+        recentsCleared = true
+        status = "Recents cleared"
+    }
+
+    func openLocalPath(_ path: String) {
+        localPath = path
+        selectedLocalIDs.removeAll()
+        noteRecentActivity()
+        refreshLocal()
+    }
+
     func removeConnection(id: UUID) {
         if selectedConnectionID == id {
             guard confirmDiscardEditSessions(remoteEditSessions, action: "remove this connection") else { return }
@@ -1699,6 +1712,7 @@ final class AppModel: ObservableObject {
         }
         localPath = url.path
         selectedLocalIDs.removeAll()
+        noteRecentActivity()
         refreshLocal()
     }
 
@@ -1710,6 +1724,7 @@ final class AppModel: ObservableObject {
         let trimmedPath = remotePath.trimmingCharacters(in: .whitespacesAndNewlines)
         remotePath = trimmedPath.isEmpty ? "/" : "/" + trimmedPath.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
         selectedRemoteIDs.removeAll()
+        noteRecentActivity()
         syncCurrentTab()
         refreshRemote()
     }
@@ -1773,6 +1788,7 @@ final class AppModel: ObservableObject {
         }
         localPath = item.path
         selectedLocalIDs.removeAll()
+        noteRecentActivity()
         refreshLocal()
         syncCurrentTab()
     }
@@ -1781,6 +1797,7 @@ final class AppModel: ObservableObject {
         guard item.isDirectory else { return }
         remotePath = item.path
         selectedRemoteIDs.removeAll()
+        noteRecentActivity()
         if let connection = selectedConnection,
            let cachedItems = remoteDirectoryCache[remoteCacheKey(connectionID: connection.id, path: item.path)] {
             remoteItems = cachedItems
@@ -1792,6 +1809,7 @@ final class AppModel: ObservableObject {
     func localUp() {
         let parent = URL(fileURLWithPath: localPath).deletingLastPathComponent().path
         localPath = parent.isEmpty ? "/" : parent
+        noteRecentActivity()
         refreshLocal()
         syncCurrentTab()
     }
@@ -1800,6 +1818,7 @@ final class AppModel: ObservableObject {
         guard remotePath != "/" else { return }
         let parent = URL(fileURLWithPath: remotePath).deletingLastPathComponent().path
         remotePath = parent.isEmpty ? "/" : parent
+        noteRecentActivity()
         syncCurrentTab()
         refreshRemote()
     }
@@ -1811,6 +1830,7 @@ final class AppModel: ObservableObject {
         panel.allowsMultipleSelection = false
         if panel.runModal() == .OK, let url = panel.url {
             localPath = url.path
+            noteRecentActivity()
             refreshLocal()
             syncCurrentTab()
         }
@@ -2800,6 +2820,7 @@ final class AppModel: ObservableObject {
         transferControls[job.id] = control
         transfers.insert(job, at: 0)
         showsTransfers = true
+        noteRecentActivity()
         return job.id
     }
 
@@ -2989,6 +3010,12 @@ final class AppModel: ObservableObject {
 
     private func saveConnections() {
         SecureStorage.save(connections)
+    }
+
+    private func noteRecentActivity() {
+        if recentsCleared {
+            recentsCleared = false
+        }
     }
 
     private func shouldPromptForPassword(_ connection: SavedConnection) -> Bool {

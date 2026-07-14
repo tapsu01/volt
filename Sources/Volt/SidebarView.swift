@@ -85,13 +85,30 @@ struct SidebarView: View {
                         }
                     }
 
-                    sidebarSection("RECENT") {
-                        recentRow(title: URL(fileURLWithPath: model.localPath).lastPathComponent.isEmpty ? model.localPath : URL(fileURLWithPath: model.localPath).lastPathComponent, subtitle: model.localPath, systemImage: "folder.fill")
-                        if model.isConnected {
-                            recentRow(title: model.remotePath == "/" ? "/" : URL(fileURLWithPath: model.remotePath).lastPathComponent, subtitle: model.remotePath, systemImage: "externaldrive.fill")
+                    sidebarSection("RECENT", trailing: {
+                        Button(action: model.clearRecents) {
+                            Image(systemName: "xmark.circle")
+                                .font(.system(size: 13, weight: .semibold))
+                                .frame(width: 22, height: 22)
                         }
-                        ForEach(Array(model.transfers.prefix(3))) { transfer in
-                            recentRow(title: URL(fileURLWithPath: transfer.destination).lastPathComponent, subtitle: transfer.direction.rawValue, systemImage: transfer.direction == .upload ? "arrow.up.doc.fill" : "arrow.down.doc.fill")
+                        .buttonStyle(.plain)
+                        .disabled(model.recentsCleared)
+                        .help("Clear recents")
+                    }) {
+                        if model.recentsCleared {
+                            Text("No recent items")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 6)
+                        } else {
+                            recentRow(title: URL(fileURLWithPath: model.localPath).lastPathComponent.isEmpty ? model.localPath : URL(fileURLWithPath: model.localPath).lastPathComponent, subtitle: model.localPath, systemImage: "folder.fill")
+                            if model.isConnected {
+                                recentRow(title: model.remotePath == "/" ? "/" : URL(fileURLWithPath: model.remotePath).lastPathComponent, subtitle: model.remotePath, systemImage: "externaldrive.fill")
+                            }
+                            ForEach(Array(model.transfers.prefix(3))) { transfer in
+                                recentRow(title: URL(fileURLWithPath: transfer.destination).lastPathComponent, subtitle: transfer.direction.rawValue, systemImage: transfer.direction == .upload ? "arrow.up.doc.fill" : "arrow.down.doc.fill")
+                            }
                         }
                     }
                 }
@@ -128,24 +145,16 @@ struct SidebarView: View {
             ScrollView {
                 VStack(spacing: 10) {
                     iconButton("display", help: "My Mac") {
-                        model.localPath = FileManager.default.homeDirectoryForCurrentUser.path
-                        model.selectedLocalIDs.removeAll()
-                        model.refreshLocal()
+                        model.openLocalPath(FileManager.default.homeDirectoryForCurrentUser.path)
                     }
                     iconButton("macwindow", help: "Desktop") {
-                        model.localPath = desktopPath
-                        model.selectedLocalIDs.removeAll()
-                        model.refreshLocal()
+                        model.openLocalPath(desktopPath)
                     }
                     iconButton("arrow.down.app.fill", help: "Downloads") {
-                        model.localPath = downloadsPath
-                        model.selectedLocalIDs.removeAll()
-                        model.refreshLocal()
+                        model.openLocalPath(downloadsPath)
                     }
                     iconButton("doc.fill", help: "Documents") {
-                        model.localPath = documentsPath
-                        model.selectedLocalIDs.removeAll()
-                        model.refreshLocal()
+                        model.openLocalPath(documentsPath)
                     }
 
                     Divider()
@@ -246,9 +255,7 @@ struct SidebarView: View {
 
     private func favoriteRow(_ title: String, systemImage: String, path: String) -> some View {
         Button {
-            model.localPath = path
-            model.selectedLocalIDs.removeAll()
-            model.refreshLocal()
+            model.openLocalPath(path)
         } label: {
             sidebarRowContent(title: title, subtitle: nil, systemImage: systemImage, tint: .accentColor)
         }

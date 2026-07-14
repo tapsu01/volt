@@ -17,8 +17,23 @@ files over SFTP. It provides the familiar dual-pane workflow of a desktop file
 manager while keeping credentials out of shell command arguments and project
 configuration files.
 
+## Preview
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="Support/Screenshots/volt-dark.png">
+    <source media="(prefers-color-scheme: light)" srcset="Support/Screenshots/volt-light.png">
+    <img src="Support/Screenshots/volt-light.png" alt="Volt dual-pane SFTP file manager interface">
+  </picture>
+</p>
+
+<p align="center">
+  <sub>Volt adapts cleanly to light and dark macOS appearances.</sub>
+</p>
+
 ## Contents
 
+- [Preview](#preview)
 - [Highlights](#highlights)
 - [Requirements](#requirements)
 - [Quick Start](#quick-start)
