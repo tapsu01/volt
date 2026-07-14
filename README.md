@@ -12,6 +12,15 @@
   <strong>Dual-pane browsing</strong> &middot; <strong>Secure host-key pinning</strong> &middot; <strong>Transfer queue</strong> &middot; <strong>Remote editing</strong>
 </p>
 
+<p align="center">
+  <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-blue.svg"></a>
+  <img alt="Swift 6" src="https://img.shields.io/badge/Swift-6-orange.svg">
+  <img alt="macOS 15+" src="https://img.shields.io/badge/macOS-15%2B-black.svg">
+  <img alt="SFTP" src="https://img.shields.io/badge/protocol-SFTP-0A84FF.svg">
+  <img alt="Security: host-key pinning" src="https://img.shields.io/badge/security-host--key%20pinning-brightgreen.svg">
+  <a href="https://github.com/tapsu01/volt/releases"><img alt="GitHub release" src="https://img.shields.io/github/v/release/tapsu01/volt?include_prereleases"></a>
+</p>
+
 Volt is a focused macOS file-transfer app for working with local and remote
 files over SFTP. It provides the familiar dual-pane workflow of a desktop file
 manager while keeping credentials out of shell command arguments and project
