@@ -109,6 +109,12 @@ struct FolderDownloadFile: Sendable {
     var size: UInt64
 }
 
+struct BatchDownloadResult: Sendable {
+    var index: Int
+    var didDownload: Bool
+    var errorMessage: String?
+}
+
 struct FolderDownloadPlan: Sendable {
     var files: [FolderDownloadFile] = []
     var directories: [String] = []
@@ -142,6 +148,8 @@ struct FolderUploadSummary {
 private enum TransferTuning {
     static let maxConcurrentTransfers = 4
     static let maxConcurrentFolderDownloads = 4
+    static let parallelDownloadThreshold: UInt64 = 16 * 1024 * 1024
+    static let maxParallelFileDownloadSessions = 4
 }
 
 enum FileBrowserViewMode: String, Codable, CaseIterable, Identifiable {
@@ -249,6 +257,7 @@ struct TransferJob: Identifiable {
     var transferredBytes: UInt64 = 0
     var totalBytes: UInt64 = 0
     var startedAt: Date?
+    var progressStartedAt: Date?
     var updatedAt: Date?
 }
 
@@ -799,6 +808,45 @@ private func transferProgressCallback(
     return control.report(transferred: transferred, total: total) ? 1 : 0
 }
 
+final class BatchTransferControl: @unchecked Sendable {
+    private let lock = NSLock()
+    private weak var parent: TransferControl?
+    private var lastProgressUpdate: [Int: TimeInterval] = [:]
+    private let progressHandler: @Sendable (Int, UInt64, UInt64) -> Void
+
+    init(parent: TransferControl, progressHandler: @escaping @Sendable (Int, UInt64, UInt64) -> Void) {
+        self.parent = parent
+        self.progressHandler = progressHandler
+    }
+
+    func report(index: Int, transferred: UInt64, total: UInt64) -> Bool {
+        let now = Date.timeIntervalSinceReferenceDate
+        lock.lock()
+        let previous = lastProgressUpdate[index] ?? 0
+        let shouldReport = now - previous >= 0.1 || (total > 0 && transferred >= total)
+        if shouldReport {
+            lastProgressUpdate[index] = now
+        }
+        let shouldCancel = parent?.isCancelled == true
+        lock.unlock()
+        if shouldReport {
+            progressHandler(index, transferred, total)
+        }
+        return shouldCancel
+    }
+}
+
+private func transferBatchProgressCallback(
+    _ index: Int32,
+    _ transferred: UInt64,
+    _ total: UInt64,
+    _ context: UnsafeMutableRawPointer?
+) -> Int32 {
+    guard let context else { return 0 }
+    let control = Unmanaged<BatchTransferControl>.fromOpaque(context).takeUnretainedValue()
+    return control.report(index: Int(index), transferred: transferred, total: total) ? 1 : 0
+}
+
 enum AppPaths {
     static var defaultLocalDirectory: URL {
         FileManager.default.homeDirectoryForCurrentUser
@@ -1001,7 +1049,100 @@ final class SFTPClient: @unchecked Sendable {
             let context = Unmanaged.passRetained(control).toOpaque()
             defer { Unmanaged<TransferControl>.fromOpaque(context).release() }
             _ = try self.call(connection: connection, credential: credential) { host, port, username, password, keyPath, knownHostsPath, error, errorLength in
-                volt_sftp_download(host, port, username, password, keyPath, knownHostsPath, remotePath, localPath, policy == .replace ? 1 : 0, transferProgressCallback, context, error, errorLength)
+                volt_sftp_download_parallel(
+                    host,
+                    port,
+                    username,
+                    password,
+                    keyPath,
+                    knownHostsPath,
+                    remotePath,
+                    localPath,
+                    policy == .replace ? 1 : 0,
+                    Int32(TransferTuning.maxParallelFileDownloadSessions),
+                    TransferTuning.parallelDownloadThreshold,
+                    transferProgressCallback,
+                    context,
+                    error,
+                    errorLength
+                )
+            }
+        }.value
+    }
+
+    func downloadBatch(
+        connection: SavedConnection,
+        credential: SensitiveCredential,
+        files: [FolderDownloadFile],
+        parentControl: TransferControl,
+        progress: @escaping @Sendable (Int, UInt64, UInt64) -> Void
+    ) async throws -> [BatchDownloadResult] {
+        guard !files.isEmpty else { return [] }
+        return try await Task.detached {
+            var remotePointers: [UnsafeMutablePointer<CChar>] = []
+            var localPointers: [UnsafeMutablePointer<CChar>] = []
+            defer {
+                for pointer in remotePointers { free(pointer) }
+                for pointer in localPointers { free(pointer) }
+            }
+
+            remotePointers.reserveCapacity(files.count)
+            localPointers.reserveCapacity(files.count)
+            for file in files {
+                guard let remotePointer = strdup(file.remotePath) else {
+                    throw AppError.commandFailed("Out of memory.")
+                }
+                guard let localPointer = strdup(file.localPath) else {
+                    free(remotePointer)
+                    throw AppError.commandFailed("Out of memory.")
+                }
+                remotePointers.append(remotePointer)
+                localPointers.append(localPointer)
+            }
+
+            let requests = files.indices.map { index in
+                VoltSFTPDownloadRequest(
+                    remote_path: UnsafePointer(remotePointers[index]),
+                    local_path: UnsafePointer(localPointers[index]),
+                    overwrite: 0
+                )
+            }
+            var results = (0..<files.count).map { _ in VoltSFTPDownloadResult() }
+            let batchControl = BatchTransferControl(parent: parentControl, progressHandler: progress)
+            let context = Unmanaged.passRetained(batchControl).toOpaque()
+            defer { Unmanaged<BatchTransferControl>.fromOpaque(context).release() }
+
+            _ = try self.call(connection: connection, credential: credential) { host, port, username, password, keyPath, knownHostsPath, error, errorLength in
+                requests.withUnsafeBufferPointer { requestBuffer in
+                    results.withUnsafeMutableBufferPointer { resultBuffer in
+                        volt_sftp_download_batch(
+                            host,
+                            port,
+                            username,
+                            password,
+                            keyPath,
+                            knownHostsPath,
+                            requestBuffer.baseAddress!,
+                            resultBuffer.baseAddress!,
+                            Int32(files.count),
+                            transferBatchProgressCallback,
+                            context,
+                            error,
+                            errorLength
+                        )
+                    }
+                }
+            }
+
+            return files.indices.map { index in
+                let status = volt_sftp_download_result_status(results, Int32(index))
+                let messagePointer = volt_sftp_download_result_error(results, Int32(index))
+                let message = messagePointer.map { String(cString: $0) } ?? "Download failed."
+                return BatchDownloadResult(
+                    index: index,
+                    didDownload: status == 0,
+                    errorMessage: status == 0 ? nil : message
+                )
             }
         }.value
     }
@@ -2067,55 +2208,118 @@ final class AppModel: ObservableObject {
 
         let folderLimiter = TransferLimiter(limit: TransferTuning.maxConcurrentFolderDownloads)
         var summary = FolderDownloadSummary(downloadedFiles: 0, skippedItems: plan.skippedItems)
+        let largeFiles = plan.files.filter { $0.size >= TransferTuning.parallelDownloadThreshold }
+        let smallFiles = plan.files.filter { $0.size < TransferTuning.parallelDownloadThreshold }
 
-        try await withThrowingTaskGroup(of: Bool.self) { group in
-            for file in plan.files {
+        for file in largeFiles {
+            let didDownload = try await self.transferLimiter.withPermit {
+                guard !parentControl.isCancelled else { throw AppError.commandFailed("Transfer cancelled.") }
+                let childControl = TransferControl(parent: parentControl) { transferred, _ in
+                    Task {
+                        let aggregate = await progress.update(fileID: file.id, transferred: transferred)
+                        await MainActor.run {
+                            self.updateTransferProgress(transferID, transferred: aggregate.transferred, total: aggregate.total)
+                        }
+                    }
+                }
+                await MainActor.run {
+                    self.markTransfer(transferID, .running, "Downloading \(file.name)")
+                }
+                do {
+                    try await self.sftp.download(
+                        connection: connection,
+                        credential: credential,
+                        remotePath: file.remotePath,
+                        localPath: file.localPath,
+                        policy: .createNew,
+                        control: childControl
+                    )
+                    let aggregate = await progress.update(fileID: file.id, transferred: file.size)
+                    await MainActor.run {
+                        self.updateTransferProgress(transferID, transferred: aggregate.transferred, total: aggregate.total)
+                    }
+                    return true
+                } catch {
+                    guard !parentControl.isCancelled else { throw error }
+                    await MainActor.run {
+                        self.markTransfer(transferID, .running, "Skipped \(file.name): \(error.localizedDescription)")
+                    }
+                    return false
+                }
+            }
+            if didDownload {
+                summary.downloadedFiles += 1
+            } else {
+                summary.skippedItems += 1
+            }
+        }
+
+        let workerCount = min(TransferTuning.maxConcurrentFolderDownloads, max(1, smallFiles.count))
+        var batches = Array(repeating: [FolderDownloadFile](), count: workerCount)
+        for (index, file) in smallFiles.enumerated() {
+            batches[index % workerCount].append(file)
+        }
+
+        try await withThrowingTaskGroup(of: ([FolderDownloadFile], [BatchDownloadResult]).self) { group in
+            for batchFiles in batches where !batchFiles.isEmpty {
                 group.addTask {
                     try await folderLimiter.withPermit {
                         try await self.transferLimiter.withPermit {
                             guard !parentControl.isCancelled else { throw AppError.commandFailed("Transfer cancelled.") }
-                            let childControl = TransferControl(parent: parentControl) { transferred, _ in
-                                Task {
-                                    let aggregate = await progress.update(fileID: file.id, transferred: transferred)
-                                    await MainActor.run {
-                                        self.updateTransferProgress(transferID, transferred: aggregate.transferred, total: aggregate.total)
-                                    }
-                                }
-                            }
                             await MainActor.run {
-                                self.markTransfer(transferID, .running, "Downloading \(file.name)")
+                                let firstName = batchFiles.first?.name ?? "batch"
+                                self.markTransfer(transferID, .running, "Downloading \(firstName)")
                             }
                             do {
-                                try await self.sftp.download(
+                                let results = try await self.sftp.downloadBatch(
                                     connection: connection,
                                     credential: credential,
-                                    remotePath: file.remotePath,
-                                    localPath: file.localPath,
-                                    policy: .createNew,
-                                    control: childControl
-                                )
-                                let aggregate = await progress.update(fileID: file.id, transferred: file.size)
-                                await MainActor.run {
-                                    self.updateTransferProgress(transferID, transferred: aggregate.transferred, total: aggregate.total)
+                                    files: batchFiles,
+                                    parentControl: parentControl
+                                ) { index, transferred, _ in
+                                    guard batchFiles.indices.contains(index) else { return }
+                                    let file = batchFiles[index]
+                                    Task {
+                                        let aggregate = await progress.update(fileID: file.id, transferred: transferred)
+                                        await MainActor.run {
+                                            self.updateTransferProgress(transferID, transferred: aggregate.transferred, total: aggregate.total)
+                                        }
+                                    }
                                 }
-                                return true
+                                return (batchFiles, results)
                             } catch {
                                 guard !parentControl.isCancelled else { throw error }
-                                await MainActor.run {
-                                    self.markTransfer(transferID, .running, "Skipped \(file.name): \(error.localizedDescription)")
+                                let results = batchFiles.indices.map { index in
+                                    BatchDownloadResult(
+                                        index: index,
+                                        didDownload: false,
+                                        errorMessage: error.localizedDescription
+                                    )
                                 }
-                                return false
+                                return (batchFiles, results)
                             }
                         }
                     }
                 }
             }
 
-            for try await didDownload in group {
-                if didDownload {
-                    summary.downloadedFiles += 1
-                } else {
-                    summary.skippedItems += 1
+            for try await (batchFiles, results) in group {
+                for result in results {
+                    guard batchFiles.indices.contains(result.index) else { continue }
+                    let file = batchFiles[result.index]
+                    if result.didDownload {
+                        summary.downloadedFiles += 1
+                        let aggregate = await progress.update(fileID: file.id, transferred: file.size)
+                        await MainActor.run {
+                            self.updateTransferProgress(transferID, transferred: aggregate.transferred, total: aggregate.total)
+                        }
+                    } else {
+                        summary.skippedItems += 1
+                        let message = result.errorMessage ?? "Download failed."
+                        await MainActor.run {
+                            self.markTransfer(transferID, .running, "Skipped \(file.name): \(message)")
+                        }
+                    }
                 }
             }
         }
@@ -2621,6 +2825,9 @@ final class AppModel: ObservableObject {
         transfers[index].updatedAt = Date()
         if transferred > 0 && transfers[index].startedAt == nil {
             transfers[index].startedAt = Date()
+        }
+        if transferred > 0 && transfers[index].progressStartedAt == nil {
+            transfers[index].progressStartedAt = Date()
         }
     }
 

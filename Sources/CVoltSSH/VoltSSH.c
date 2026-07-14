@@ -547,6 +547,14 @@ static void close_session(VoltSession *session) {
     if (session->sock >= 0) close(session->sock);
 }
 
+static void close_parallel_worker_session(VoltSession *session, LIBSSH2_SFTP_HANDLE *file) {
+    if (session->session) libssh2_session_set_blocking(session->session, 0);
+    if (file) libssh2_sftp_close(file);
+    if (session->sftp) libssh2_sftp_shutdown(session->sftp);
+    if (session->session) libssh2_session_free(session->session);
+    if (session->sock >= 0) close(session->sock);
+}
+
 static int join_path(const char *base, const char *name, char *out, size_t out_len) {
     int length = strcmp(base, "/") == 0
         ? snprintf(out, out_len, "/%s", name)
@@ -769,13 +777,10 @@ int volt_sftp_upload(const char *host, int port, const char *username, const cha
     return 0;
 }
 
-int volt_sftp_download(const char *host, int port, const char *username, const char *password, const char *private_key_path, const char *known_hosts_path, const char *remote_path, const char *local_path, int overwrite, VoltSFTPProgressCallback progress, void *progress_context, char *error, size_t error_len) {
-    VoltSession session;
-    if (open_session(host, port, username, password, private_key_path, known_hosts_path, &session, error, error_len) != 0) return -1;
-    LIBSSH2_SFTP_HANDLE *file = libssh2_sftp_open(session.sftp, remote_path, LIBSSH2_FXF_READ, 0);
+static int download_file_with_session(VoltSession *session, const char *remote_path, const char *local_path, int overwrite, VoltSFTPProgressCallback progress, void *progress_context, char *error, size_t error_len) {
+    LIBSSH2_SFTP_HANDLE *file = libssh2_sftp_open(session->sftp, remote_path, LIBSSH2_FXF_READ, 0);
     if (!file) {
-        set_session_error(session.session, error, error_len, "Could not open remote file for reading.");
-        close_session(&session);
+        set_session_error(session->session, error, error_len, "Could not open remote file for reading.");
         return -1;
     }
     LIBSSH2_SFTP_ATTRIBUTES remote_attrs;
@@ -789,7 +794,6 @@ int volt_sftp_download(const char *host, int port, const char *username, const c
     if (temp_path_length < 0 || (size_t)temp_path_length >= sizeof(temp_path)) {
         libssh2_sftp_close(file);
         set_error(error, error_len, "Local download path is too long.");
-        close_session(&session);
         return -1;
     }
     int output_fd = mkstemp(temp_path);
@@ -799,7 +803,6 @@ int volt_sftp_download(const char *host, int port, const char *username, const c
         unlink(temp_path);
         libssh2_sftp_close(file);
         set_error(error, error_len, strerror(errno));
-        close_session(&session);
         return -1;
     }
     if (fchmod(output_fd, S_IRUSR | S_IWUSR) != 0) {
@@ -807,7 +810,6 @@ int volt_sftp_download(const char *host, int port, const char *username, const c
         unlink(temp_path);
         libssh2_sftp_close(file);
         set_error(error, error_len, "Could not secure the downloaded file permissions.");
-        close_session(&session);
         return -1;
     }
     char buffer[VOLT_SFTP_TRANSFER_BUFFER_SIZE];
@@ -819,7 +821,6 @@ int volt_sftp_download(const char *host, int port, const char *username, const c
                 unlink(temp_path);
                 libssh2_sftp_close(file);
                 set_error(error, error_len, "Could not write the downloaded file.");
-                close_session(&session);
                 return -1;
             }
             transferred += (uint64_t)n;
@@ -828,7 +829,6 @@ int volt_sftp_download(const char *host, int port, const char *username, const c
                 unlink(temp_path);
                 libssh2_sftp_close(file);
                 set_error(error, error_len, "Transfer cancelled.");
-                close_session(&session);
                 return -1;
             }
         }
@@ -837,8 +837,7 @@ int volt_sftp_download(const char *host, int port, const char *username, const c
             fclose(output);
             unlink(temp_path);
             libssh2_sftp_close(file);
-            set_session_error(session.session, error, error_len, "SFTP read failed.");
-            close_session(&session);
+            set_session_error(session->session, error, error_len, "SFTP read failed.");
             return -1;
         }
     }
@@ -848,7 +847,6 @@ int volt_sftp_download(const char *host, int port, const char *username, const c
         unlink(temp_path);
         libssh2_sftp_close(file);
         set_error(error, error_len, "Could not finalize the downloaded file.");
-        close_session(&session);
         return -1;
     }
     int publish_result = volt_publish_download(temp_path, local_path, overwrite);
@@ -856,12 +854,370 @@ int volt_sftp_download(const char *host, int port, const char *username, const c
         unlink(temp_path);
         libssh2_sftp_close(file);
         set_error(error, error_len, strerror(errno));
-        close_session(&session);
         return -1;
     }
     libssh2_sftp_close(file);
+    return 0;
+}
+
+int volt_sftp_download(const char *host, int port, const char *username, const char *password, const char *private_key_path, const char *known_hosts_path, const char *remote_path, const char *local_path, int overwrite, VoltSFTPProgressCallback progress, void *progress_context, char *error, size_t error_len) {
+    VoltSession session;
+    if (open_session(host, port, username, password, private_key_path, known_hosts_path, &session, error, error_len) != 0) return -1;
+    int result = download_file_with_session(&session, remote_path, local_path, overwrite, progress, progress_context, error, error_len);
+    close_session(&session);
+    return result;
+}
+
+typedef struct VoltBatchProgressContext {
+    int index;
+    VoltSFTPBatchProgressCallback progress;
+    void *progress_context;
+} VoltBatchProgressContext;
+
+static int batch_progress_adapter(uint64_t transferred, uint64_t total, void *context) {
+    VoltBatchProgressContext *batch_context = (VoltBatchProgressContext *)context;
+    if (!batch_context || !batch_context->progress) return 0;
+    return batch_context->progress(batch_context->index, transferred, total, batch_context->progress_context);
+}
+
+typedef struct VoltParallelDownloadShared {
+    const char *host;
+    int port;
+    const char *username;
+    const char *password;
+    const char *private_key_path;
+    const char *known_hosts_path;
+    const char *remote_path;
+    int output_fd;
+    uint64_t total_size;
+    int worker_count;
+    int cancelled;
+    uint64_t *transferred_by_worker;
+    VoltSFTPProgressCallback progress;
+    void *progress_context;
+    pthread_mutex_t mutex;
+} VoltParallelDownloadShared;
+
+typedef struct VoltParallelDownloadWorker {
+    VoltParallelDownloadShared *shared;
+    int index;
+    uint64_t offset;
+    uint64_t length;
+    int status;
+    char error[4096];
+} VoltParallelDownloadWorker;
+
+static int parallel_download_is_cancelled(VoltParallelDownloadShared *shared) {
+    pthread_mutex_lock(&shared->mutex);
+    int cancelled = shared->cancelled;
+    pthread_mutex_unlock(&shared->mutex);
+    return cancelled;
+}
+
+static void parallel_download_cancel(VoltParallelDownloadShared *shared) {
+    pthread_mutex_lock(&shared->mutex);
+    shared->cancelled = 1;
+    pthread_mutex_unlock(&shared->mutex);
+}
+
+static int parallel_download_report(VoltParallelDownloadShared *shared, int index, uint64_t worker_transferred) {
+    pthread_mutex_lock(&shared->mutex);
+    shared->transferred_by_worker[index] = worker_transferred;
+    uint64_t total_transferred = 0;
+    for (int i = 0; i < shared->worker_count; i++) {
+        total_transferred += shared->transferred_by_worker[i];
+    }
+    if (total_transferred > shared->total_size) total_transferred = shared->total_size;
+    uint64_t reported_transferred = total_transferred;
+    if (reported_transferred >= shared->total_size && shared->total_size > 0) {
+        reported_transferred = shared->total_size - 1;
+    }
+    int cancelled = shared->cancelled;
+    if (!cancelled && shared->progress && shared->progress(reported_transferred, shared->total_size, shared->progress_context) != 0) {
+        shared->cancelled = 1;
+        cancelled = 1;
+    }
+    pthread_mutex_unlock(&shared->mutex);
+    return cancelled;
+}
+
+static int pwrite_all(int fd, const char *buffer, size_t length, off_t offset) {
+    size_t written_total = 0;
+    while (written_total < length) {
+        ssize_t written = pwrite(fd, buffer + written_total, length - written_total, offset + (off_t)written_total);
+        if (written <= 0) return -1;
+        written_total += (size_t)written;
+    }
+    return 0;
+}
+
+static void *parallel_download_worker_main(void *context) {
+    VoltParallelDownloadWorker *worker = (VoltParallelDownloadWorker *)context;
+    VoltParallelDownloadShared *shared = worker->shared;
+    worker->status = -1;
+    worker->error[0] = '\0';
+
+    VoltSession session;
+    if (open_session(shared->host, shared->port, shared->username, shared->password, shared->private_key_path, shared->known_hosts_path, &session, worker->error, sizeof(worker->error)) != 0) {
+        parallel_download_cancel(shared);
+        return NULL;
+    }
+
+    LIBSSH2_SFTP_HANDLE *file = libssh2_sftp_open(session.sftp, shared->remote_path, LIBSSH2_FXF_READ, 0);
+    if (!file) {
+        set_session_error(session.session, worker->error, sizeof(worker->error), "Could not open remote file for reading.");
+        parallel_download_cancel(shared);
+        close_parallel_worker_session(&session, NULL);
+        return NULL;
+    }
+
+    libssh2_sftp_seek64(file, worker->offset);
+    uint64_t transferred = 0;
+    char buffer[VOLT_SFTP_TRANSFER_BUFFER_SIZE];
+    while (transferred < worker->length) {
+        if (parallel_download_is_cancelled(shared)) {
+            set_error(worker->error, sizeof(worker->error), "Transfer cancelled.");
+            close_parallel_worker_session(&session, file);
+            return NULL;
+        }
+
+        uint64_t remaining = worker->length - transferred;
+        size_t request_size = remaining < sizeof(buffer) ? (size_t)remaining : sizeof(buffer);
+        ssize_t n = libssh2_sftp_read(file, buffer, request_size);
+        if (n > 0) {
+            if (pwrite_all(shared->output_fd, buffer, (size_t)n, (off_t)(worker->offset + transferred)) != 0) {
+                set_error(worker->error, sizeof(worker->error), "Could not write the downloaded file.");
+                parallel_download_cancel(shared);
+                close_parallel_worker_session(&session, file);
+                return NULL;
+            }
+            transferred += (uint64_t)n;
+            if (parallel_download_report(shared, worker->index, transferred)) {
+                set_error(worker->error, sizeof(worker->error), "Transfer cancelled.");
+                close_parallel_worker_session(&session, file);
+                return NULL;
+            }
+        } else if (n == 0) {
+            set_error(worker->error, sizeof(worker->error), "Remote file ended before the download completed.");
+            parallel_download_cancel(shared);
+            close_parallel_worker_session(&session, file);
+            return NULL;
+        } else {
+            set_session_error(session.session, worker->error, sizeof(worker->error), "SFTP read failed.");
+            parallel_download_cancel(shared);
+            close_parallel_worker_session(&session, file);
+            return NULL;
+        }
+    }
+
+    close_parallel_worker_session(&session, file);
+    worker->status = 0;
+    return NULL;
+}
+
+int volt_sftp_download_parallel(const char *host, int port, const char *username, const char *password, const char *private_key_path, const char *known_hosts_path, const char *remote_path, const char *local_path, int overwrite, int workers, uint64_t min_parallel_size, VoltSFTPProgressCallback progress, void *progress_context, char *error, size_t error_len) {
+    if (error && error_len > 0) error[0] = '\0';
+    VoltSession session;
+    if (open_session(host, port, username, password, private_key_path, known_hosts_path, &session, error, error_len) != 0) return -1;
+
+    LIBSSH2_SFTP_HANDLE *file = libssh2_sftp_open(session.sftp, remote_path, LIBSSH2_FXF_READ, 0);
+    if (!file) {
+        set_session_error(session.session, error, error_len, "Could not open remote file for reading.");
+        close_session(&session);
+        return -1;
+    }
+
+    LIBSSH2_SFTP_ATTRIBUTES remote_attrs;
+    memset(&remote_attrs, 0, sizeof(remote_attrs));
+    uint64_t total_size = libssh2_sftp_fstat(file, &remote_attrs) == 0 && (remote_attrs.flags & LIBSSH2_SFTP_ATTR_SIZE)
+        ? (uint64_t)remote_attrs.filesize
+        : 0;
+    libssh2_sftp_close(file);
+
+    if (workers < 2 || total_size == 0 || total_size < min_parallel_size) {
+        int result = download_file_with_session(&session, remote_path, local_path, overwrite, progress, progress_context, error, error_len);
+        close_session(&session);
+        return result;
+    }
+    close_session(&session);
+
+    int worker_count = workers;
+    if (worker_count > 4) worker_count = 4;
+    if ((uint64_t)worker_count > total_size) worker_count = (int)total_size;
+    if (worker_count < 2) {
+        return volt_sftp_download(host, port, username, password, private_key_path, known_hosts_path, remote_path, local_path, overwrite, progress, progress_context, error, error_len);
+    }
+
+    char temp_path[4096];
+    int temp_path_length = snprintf(temp_path, sizeof(temp_path), "%s.volt-part.XXXXXX", local_path);
+    if (temp_path_length < 0 || (size_t)temp_path_length >= sizeof(temp_path)) {
+        set_error(error, error_len, "Local download path is too long.");
+        return -1;
+    }
+
+    int output_fd = mkstemp(temp_path);
+    if (output_fd < 0) {
+        set_error(error, error_len, strerror(errno));
+        return -1;
+    }
+    if (fchmod(output_fd, S_IRUSR | S_IWUSR) != 0) {
+        close(output_fd);
+        unlink(temp_path);
+        set_error(error, error_len, "Could not secure the downloaded file permissions.");
+        return -1;
+    }
+    if (ftruncate(output_fd, (off_t)total_size) != 0) {
+        close(output_fd);
+        unlink(temp_path);
+        set_error(error, error_len, "Could not prepare the local download file.");
+        return -1;
+    }
+
+    uint64_t *transferred_by_worker = calloc((size_t)worker_count, sizeof(uint64_t));
+    pthread_t *threads = calloc((size_t)worker_count, sizeof(pthread_t));
+    VoltParallelDownloadWorker *worker_contexts = calloc((size_t)worker_count, sizeof(VoltParallelDownloadWorker));
+    if (!transferred_by_worker || !threads || !worker_contexts) {
+        free(transferred_by_worker);
+        free(threads);
+        free(worker_contexts);
+        close(output_fd);
+        unlink(temp_path);
+        set_error(error, error_len, "Out of memory.");
+        return -1;
+    }
+
+    VoltParallelDownloadShared shared = {
+        .host = host,
+        .port = port,
+        .username = username,
+        .password = password,
+        .private_key_path = private_key_path,
+        .known_hosts_path = known_hosts_path,
+        .remote_path = remote_path,
+        .output_fd = output_fd,
+        .total_size = total_size,
+        .worker_count = worker_count,
+        .cancelled = 0,
+        .transferred_by_worker = transferred_by_worker,
+        .progress = progress,
+        .progress_context = progress_context,
+        .mutex = PTHREAD_MUTEX_INITIALIZER
+    };
+
+    int created_threads = 0;
+    uint64_t offset = 0;
+    for (int i = 0; i < worker_count; i++) {
+        uint64_t remaining = total_size - offset;
+        uint64_t remaining_workers = (uint64_t)(worker_count - i);
+        uint64_t length = remaining / remaining_workers;
+        if (i == worker_count - 1) length = remaining;
+        worker_contexts[i].shared = &shared;
+        worker_contexts[i].index = i;
+        worker_contexts[i].offset = offset;
+        worker_contexts[i].length = length;
+        worker_contexts[i].status = -1;
+        worker_contexts[i].error[0] = '\0';
+        if (pthread_create(&threads[i], NULL, parallel_download_worker_main, &worker_contexts[i]) != 0) {
+            parallel_download_cancel(&shared);
+            set_error(error, error_len, "Could not start parallel download worker.");
+            break;
+        }
+        created_threads++;
+        offset += length;
+    }
+
+    int result = created_threads == worker_count ? 0 : -1;
+    for (int i = 0; i < created_threads; i++) {
+        pthread_join(threads[i], NULL);
+    }
+    for (int i = 0; i < worker_count; i++) {
+        if (worker_contexts[i].status != 0) {
+            result = -1;
+            if (error && error_len > 0 && error[0] == '\0') {
+                set_error(error, error_len, worker_contexts[i].error[0] ? worker_contexts[i].error : "Parallel download failed.");
+            }
+        }
+    }
+
+    pthread_mutex_destroy(&shared.mutex);
+    free(transferred_by_worker);
+    free(threads);
+    free(worker_contexts);
+
+    int close_result = close(output_fd);
+    if (result == 0 && close_result != 0) {
+        result = -1;
+        set_error(error, error_len, "Could not finalize the downloaded file.");
+    }
+
+    if (result != 0) {
+        unlink(temp_path);
+        return -1;
+    }
+
+    int publish_result = volt_publish_download(temp_path, local_path, overwrite);
+    if (publish_result != 0) {
+        unlink(temp_path);
+        set_error(error, error_len, strerror(errno));
+        return -1;
+    }
+    if (progress) progress(total_size, total_size, progress_context);
+    return 0;
+}
+
+int volt_sftp_download_batch(const char *host, int port, const char *username, const char *password, const char *private_key_path, const char *known_hosts_path, const VoltSFTPDownloadRequest *requests, VoltSFTPDownloadResult *results, int count, VoltSFTPBatchProgressCallback progress, void *progress_context, char *error, size_t error_len) {
+    if (count < 0 || (count > 0 && (!requests || !results))) {
+        set_error(error, error_len, "Invalid batch download request.");
+        return -1;
+    }
+
+    for (int i = 0; i < count; i++) {
+        results[i].status = 0;
+        results[i].error[0] = '\0';
+    }
+
+    VoltSession session;
+    if (open_session(host, port, username, password, private_key_path, known_hosts_path, &session, error, error_len) != 0) return -1;
+
+    for (int i = 0; i < count; i++) {
+        VoltBatchProgressContext batch_context = {
+            .index = i,
+            .progress = progress,
+            .progress_context = progress_context
+        };
+        char item_error[sizeof(results[i].error)];
+        item_error[0] = '\0';
+        int result = download_file_with_session(
+            &session,
+            requests[i].remote_path,
+            requests[i].local_path,
+            requests[i].overwrite,
+            progress ? batch_progress_adapter : NULL,
+            &batch_context,
+            item_error,
+            sizeof(item_error)
+        );
+        results[i].status = result;
+        if (result != 0) {
+            snprintf(results[i].error, sizeof(results[i].error), "%s", item_error[0] ? item_error : "Download failed.");
+            if (strcmp(results[i].error, "Transfer cancelled.") == 0) {
+                set_error(error, error_len, "Transfer cancelled.");
+                close_session(&session);
+                return -1;
+            }
+        }
+    }
+
     close_session(&session);
     return 0;
+}
+
+int volt_sftp_download_result_status(const VoltSFTPDownloadResult *results, int index) {
+    return results[index].status;
+}
+
+const char *volt_sftp_download_result_error(const VoltSFTPDownloadResult *results, int index) {
+    return results[index].error;
 }
 
 int volt_sftp_mkdir(const char *host, int port, const char *username, const char *password, const char *private_key_path, const char *known_hosts_path, const char *remote_path, uint32_t mode, char *error, size_t error_len) {

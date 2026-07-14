@@ -5,13 +5,17 @@ import SwiftUI
 struct TransferQueueView: View {
     @ObservedObject var model: AppModel
     var layout: AppLayoutContext
-    @AppStorage("Volt.TransferQueueHeight") private var expandedHeight: Double = 210
+    @AppStorage("Volt.TransferQueueHeight") private var persistedHeight: Double = 210
+    @State private var draftHeight: Double = 210
     @State private var isHoveringResizeHandle = false
+    @State private var isResizingQueue = false
+
+    private let minQueueHeight: CGFloat = 150
+    private let maxQueueHeight: CGFloat = 420
 
     var body: some View {
         VStack(spacing: 0) {
             if model.showsTransfers {
-                resizeHandle
                 if layout.isQueueCompact {
                     compactExpandedQueue
                 } else {
@@ -28,10 +32,18 @@ struct TransferQueueView: View {
                 .fill(VoltTheme.hairline)
                 .frame(height: 1)
         }
+        .onAppear {
+            syncDraftHeightFromStorage()
+        }
+        .onChange(of: model.showsTransfers) { _, isShowing in
+            if isShowing {
+                syncDraftHeightFromStorage()
+            }
+        }
     }
 
     private var queueHeight: CGFloat {
-        min(420, max(150, CGFloat(expandedHeight)))
+        clampedHeight(draftHeight)
     }
 
     private var tableHeight: CGFloat {
@@ -58,25 +70,34 @@ struct TransferQueueView: View {
 
     private var resizeHandle: some View {
         ZStack {
-            Rectangle()
-                .fill(VoltTheme.transferPanelBackground)
+            Rectangle().fill(Color.clear)
             ResizeDragHandleView(
                 axis: .vertical,
                 cursor: .resizeUpDown,
                 currentValue: queueHeight,
-                minValue: 150,
-                maxValue: 420,
+                minValue: minQueueHeight,
+                maxValue: maxQueueHeight,
                 direction: 1
             ) { height in
-                expandedHeight = Double(height)
+                isResizingQueue = true
+                var transaction = Transaction()
+                transaction.animation = nil
+                withTransaction(transaction) {
+                    draftHeight = Double(height)
+                }
+            } onResizeEnd: {
+                isResizingQueue = false
+                persistedHeight = Double(queueHeight)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             Capsule()
                 .fill(isHoveringResizeHandle ? Color.accentColor.opacity(0.55) : VoltTheme.hairline)
-                .frame(width: 58, height: 4)
+                .frame(width: 48, height: 3)
+                .padding(.top, 4)
+                .frame(maxHeight: .infinity, alignment: .top)
                 .allowsHitTesting(false)
         }
-        .frame(height: 18)
+        .frame(width: 180, height: 16)
         .onHover { hovering in
             isHoveringResizeHandle = hovering
         }
@@ -110,6 +131,14 @@ struct TransferQueueView: View {
         .padding(.bottom, 12)
         .frame(height: queueHeight)
         .background(VoltTheme.transferPanelBackground)
+        .overlay(alignment: .top) {
+            resizeHandle
+        }
+        .transaction { transaction in
+            if isResizingQueue {
+                transaction.animation = nil
+            }
+        }
     }
 
     private var compactExpandedQueue: some View {
@@ -130,6 +159,22 @@ struct TransferQueueView: View {
         }
         .padding(10)
         .background(VoltTheme.transferPanelBackground)
+        .overlay(alignment: .top) {
+            resizeHandle
+        }
+        .transaction { transaction in
+            if isResizingQueue {
+                transaction.animation = nil
+            }
+        }
+    }
+
+    private func clampedHeight(_ height: Double) -> CGFloat {
+        min(maxQueueHeight, max(minQueueHeight, CGFloat(height)))
+    }
+
+    private func syncDraftHeightFromStorage() {
+        draftHeight = Double(clampedHeight(persistedHeight))
     }
 
     private var panelTabs: some View {
@@ -652,14 +697,14 @@ struct TransferQueueView: View {
         let running = model.transfers.filter { $0.state == .running || $0.state == .queued }
         let transferred = running.reduce(UInt64(0)) { $0 + $1.transferredBytes }
         guard transferred > 0 else { return nil }
-        let earliestStart = running.compactMap(\.startedAt).min()
+        let earliestStart = running.compactMap(\.progressStartedAt).min()
         guard let earliestStart else { return nil }
         let elapsed = max(0.5, Date().timeIntervalSince(earliestStart))
         return Double(transferred) / elapsed
     }
 
     private func speedText(for job: TransferJob) -> String? {
-        guard let startedAt = job.startedAt, job.transferredBytes > 0 else { return nil }
+        guard let startedAt = job.progressStartedAt, job.transferredBytes > 0 else { return nil }
         let elapsed = max(0.5, (job.updatedAt ?? Date()).timeIntervalSince(startedAt))
         let bytesPerSecond = Double(job.transferredBytes) / elapsed
         return ByteCountFormatter.string(fromByteCount: Int64(bytesPerSecond), countStyle: .file) + "/s"

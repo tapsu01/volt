@@ -20,6 +20,18 @@ typedef struct VoltSFTPItem {
 } VoltSFTPItem;
 
 typedef int (*VoltSFTPProgressCallback)(uint64_t transferred, uint64_t total, void *context);
+typedef int (*VoltSFTPBatchProgressCallback)(int index, uint64_t transferred, uint64_t total, void *context);
+
+typedef struct VoltSFTPDownloadRequest {
+    const char *remote_path;
+    const char *local_path;
+    int overwrite;
+} VoltSFTPDownloadRequest;
+
+typedef struct VoltSFTPDownloadResult {
+    int status;
+    char error[4096];
+} VoltSFTPDownloadResult;
 
 #define VOLT_HOSTKEY_MATCH 0
 #define VOLT_HOSTKEY_UNKNOWN 1
@@ -39,6 +51,10 @@ int volt_is_safe_entry_name(const char *name, size_t len);
 int volt_sftp_list(const char *host, int port, const char *username, const char *password, const char *private_key_path, const char *known_hosts_path, const char *remote_path, VoltSFTPItem **items, int *count, int *skipped_unsafe_count, char *error, size_t error_len);
 int volt_sftp_upload(const char *host, int port, const char *username, const char *password, const char *private_key_path, const char *known_hosts_path, const char *local_path, const char *remote_path, uint32_t mode, VoltSFTPProgressCallback progress, void *progress_context, char *error, size_t error_len);
 int volt_sftp_download(const char *host, int port, const char *username, const char *password, const char *private_key_path, const char *known_hosts_path, const char *remote_path, const char *local_path, int overwrite, VoltSFTPProgressCallback progress, void *progress_context, char *error, size_t error_len);
+int volt_sftp_download_parallel(const char *host, int port, const char *username, const char *password, const char *private_key_path, const char *known_hosts_path, const char *remote_path, const char *local_path, int overwrite, int workers, uint64_t min_parallel_size, VoltSFTPProgressCallback progress, void *progress_context, char *error, size_t error_len);
+int volt_sftp_download_batch(const char *host, int port, const char *username, const char *password, const char *private_key_path, const char *known_hosts_path, const VoltSFTPDownloadRequest *requests, VoltSFTPDownloadResult *results, int count, VoltSFTPBatchProgressCallback progress, void *progress_context, char *error, size_t error_len);
+int volt_sftp_download_result_status(const VoltSFTPDownloadResult *results, int index);
+const char *volt_sftp_download_result_error(const VoltSFTPDownloadResult *results, int index);
 int volt_sftp_mkdir(const char *host, int port, const char *username, const char *password, const char *private_key_path, const char *known_hosts_path, const char *remote_path, uint32_t mode, char *error, size_t error_len);
 int volt_sftp_create_empty_file(const char *host, int port, const char *username, const char *password, const char *private_key_path, const char *known_hosts_path, const char *remote_path, uint32_t mode, char *error, size_t error_len);
 int volt_sftp_rename(const char *host, int port, const char *username, const char *password, const char *private_key_path, const char *known_hosts_path, const char *from_path, const char *to_path, char *error, size_t error_len);
