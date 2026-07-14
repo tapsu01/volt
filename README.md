@@ -18,7 +18,7 @@
   <img alt="macOS 15+" src="https://img.shields.io/badge/macOS-15%2B-black.svg">
   <img alt="SFTP" src="https://img.shields.io/badge/protocol-SFTP-0A84FF.svg">
   <img alt="Security: host-key pinning" src="https://img.shields.io/badge/security-host--key%20pinning-brightgreen.svg">
-  <a href="https://github.com/tapsu01/volt/releases"><img alt="GitHub release" src="https://img.shields.io/github/v/release/tapsu01/volt?include_prereleases"></a>
+  <a href="https://github.com/tapsu01/volt/releases"><img alt="GitHub release" src="https://img.shields.io/github/v/release/tapsu01/volt?include_prereleases&cacheSeconds=3600"></a>
 </p>
 
 Volt is a focused macOS file-transfer app for working with local and remote
