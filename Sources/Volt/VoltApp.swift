@@ -4561,6 +4561,76 @@ struct BrowserSplitView: View {
         }
     }
 
+    private var localActionsMenu: some View {
+        Menu {
+            Button("Choose Folder...", action: model.chooseLocalFolder)
+            Divider()
+            Button("New Folder", action: model.makeLocalFolder)
+            Button("New File", action: model.makeLocalFile)
+            Divider()
+            Button("Get Info", action: model.getInfoLocalSelected)
+                .disabled(model.selectedLocal == nil)
+            Button("Copy Path", action: model.copyLocalPath)
+                .disabled(model.selectedLocal == nil)
+            Divider()
+            Button("Edit File", action: model.editLocalSelected)
+                .disabled(model.selectedLocalItems.count != 1 || model.selectedLocal?.isDirectory != false)
+            Button("Open With...", action: model.openLocalSelectedWithApp)
+                .disabled(model.selectedLocalItems.count != 1 || model.selectedLocal?.isDirectory != false)
+            Divider()
+            Button("Rename", action: model.renameLocalSelected)
+                .disabled(model.selectedLocalItems.count != 1)
+            Button("Duplicate", action: model.duplicateLocalSelected)
+                .disabled(model.selectedLocalItems.count != 1)
+            Button("Move...", action: model.moveLocalSelected)
+                .disabled(model.selectedLocalItems.count != 1)
+            Button("Delete", action: model.deleteLocalSelected)
+                .disabled(model.selectedLocalItems.isEmpty)
+        } label: {
+            PaneToolbarMenuLabel(systemImage: "ellipsis.circle")
+        }
+        .help("More local actions")
+    }
+
+    private var remoteActionsMenu: some View {
+        Menu {
+            Button("Upload Files or Folders...", action: model.uploadFromPicker)
+                .disabled(model.selectedConnection == nil)
+            Button("Open SSH Terminal", action: model.showTerminal)
+                .disabled(model.selectedConnection == nil)
+            Divider()
+            Button("Download To...", action: model.downloadSelectedToFolder)
+                .disabled(model.selectedRemoteItems.isEmpty)
+            Divider()
+            Button("New Folder", action: model.makeRemoteFolder)
+                .disabled(model.selectedConnection == nil)
+            Button("New File", action: model.makeRemoteFile)
+                .disabled(model.selectedConnection == nil)
+            Divider()
+            Button("Get Info", action: model.getInfoRemoteSelected)
+                .disabled(model.selectedRemote == nil)
+            Button("Copy Path", action: model.copyRemotePath)
+                .disabled(model.selectedRemote == nil)
+            Divider()
+            Button("Edit Remote File", action: model.editRemoteSelected)
+                .disabled(model.selectedRemoteItems.count != 1 || model.selectedRemote?.isDirectory != false)
+            Button("Open With...", action: model.openRemoteSelectedWithApp)
+                .disabled(model.selectedRemoteItems.count != 1 || model.selectedRemote?.isDirectory != false)
+            Divider()
+            Button("Rename", action: model.renameRemoteSelected)
+                .disabled(model.selectedRemoteItems.count != 1)
+            Button("Duplicate", action: model.duplicateRemoteSelected)
+                .disabled(model.selectedRemoteItems.count != 1)
+            Button("Move...", action: model.moveRemoteSelected)
+                .disabled(model.selectedRemoteItems.count != 1)
+            Button("Delete", action: model.deleteRemoteSelected)
+                .disabled(model.selectedRemoteItems.isEmpty)
+        } label: {
+            PaneToolbarMenuLabel(systemImage: "ellipsis.circle")
+        }
+        .help("More remote actions")
+    }
+
     private var disconnectedRemotePane: some View {
         VStack(spacing: 0) {
             disconnectedRemoteHeader
@@ -4639,26 +4709,22 @@ struct BrowserSplitView: View {
                 isRemote: false,
                 searchText: searchText,
                 toolbar: {
-                    Button(action: model.chooseLocalFolder) { Image(systemName: "folder") }.help("Choose folder")
-                    Button(action: model.localUp) { Image(systemName: "arrow.up") }.help("Parent folder")
-                    Button(action: model.refreshLocal) { Image(systemName: "arrow.clockwise") }.help("Refresh")
-                    Button(action: model.makeLocalFolder) { Image(systemName: "folder.badge.plus") }.help("New folder")
-                    Button(action: model.uploadSelected) { Image(systemName: "arrow.right.circle") }.help("Upload")
-                        .disabled(model.selectedLocalItems.isEmpty || model.selectedConnection == nil)
-                    Button(action: model.editLocalSelected) { Image(systemName: "pencil") }.help("Edit file")
-                        .disabled(model.selectedLocalItems.count != 1 || model.selectedLocal?.isDirectory != false)
-                    Menu {
-                        Button("New File", action: model.makeLocalFile)
-                        Button("Open With...", action: model.openLocalSelectedWithApp)
-                            .disabled(model.selectedLocalItems.count != 1 || model.selectedLocal?.isDirectory != false)
-                        Button("Rename", action: model.renameLocalSelected)
-                            .disabled(model.selectedLocalItems.count != 1)
-                        Button("Delete", action: model.deleteLocalSelected)
-                            .disabled(model.selectedLocalItems.isEmpty)
-                    } label: {
-                        Image(systemName: "ellipsis.circle")
+                    ViewThatFits(in: .horizontal) {
+                        HStack(spacing: 4) {
+                            PaneToolbarIconButton(systemImage: "arrow.up", help: "Parent folder", action: model.localUp)
+                            PaneToolbarIconButton(systemImage: "arrow.clockwise", help: "Refresh", action: model.refreshLocal)
+                            PaneToolbarIconButton(systemImage: "square.and.arrow.up", help: "Upload selected", action: model.uploadSelected)
+                                .disabled(model.selectedLocalItems.isEmpty || model.selectedConnection == nil)
+                            localActionsMenu
+                        }
+                        HStack(spacing: 4) {
+                            PaneToolbarIconButton(systemImage: "arrow.up", help: "Parent folder", action: model.localUp)
+                            PaneToolbarIconButton(systemImage: "arrow.clockwise", help: "Refresh", action: model.refreshLocal)
+                            PaneToolbarIconButton(systemImage: "square.and.arrow.up", help: "Upload selected", action: model.uploadSelected)
+                                .disabled(model.selectedLocalItems.isEmpty || model.selectedConnection == nil)
+                            localActionsMenu
+                        }
                     }
-                    .help("More local actions")
                 },
                 open: model.openLocal,
                 contextMenu: { item in
@@ -4738,32 +4804,22 @@ struct BrowserSplitView: View {
                 isRemote: true,
                 searchText: searchText,
                 toolbar: {
-                    Button(action: model.remoteUp) { Image(systemName: "arrow.up") }.help("Parent folder")
-                    Button(action: model.refreshRemote) { Image(systemName: "arrow.clockwise") }.help("Refresh")
-                    Button(action: model.makeRemoteFolder) { Image(systemName: "folder.badge.plus") }.help("New folder")
-                    Button(action: model.uploadFromPicker) { Image(systemName: "square.and.arrow.up") }.help("Upload files or folders")
-                        .disabled(model.selectedConnection == nil)
-                    Button(action: model.showTerminal) { Image(systemName: "terminal") }.help("Open SSH terminal")
-                        .disabled(model.selectedConnection == nil)
-                    Button(action: model.downloadSelected) { Image(systemName: "arrow.left.circle") }.help("Download")
-                        .disabled(model.selectedRemoteItems.isEmpty)
-                    Button(action: model.editRemoteSelected) { Image(systemName: "pencil") }.help("Edit remote file")
-                        .disabled(model.selectedRemoteItems.count != 1 || model.selectedRemote?.isDirectory != false)
-                    Menu {
-                        Button("Download To...", action: model.downloadSelectedToFolder)
-                            .disabled(model.selectedRemoteItems.isEmpty)
-                        Button("Open With...", action: model.openRemoteSelectedWithApp)
-                            .disabled(model.selectedRemoteItems.count != 1 || model.selectedRemote?.isDirectory != false)
-                        Button("New File", action: model.makeRemoteFile)
-                            .disabled(model.selectedConnection == nil)
-                        Button("Rename", action: model.renameRemoteSelected)
-                            .disabled(model.selectedRemoteItems.count != 1)
-                        Button("Delete", action: model.deleteRemoteSelected)
-                            .disabled(model.selectedRemoteItems.isEmpty)
-                    } label: {
-                        Image(systemName: "ellipsis.circle")
+                    ViewThatFits(in: .horizontal) {
+                        HStack(spacing: 4) {
+                            PaneToolbarIconButton(systemImage: "arrow.up", help: "Parent folder", action: model.remoteUp)
+                            PaneToolbarIconButton(systemImage: "arrow.clockwise", help: "Refresh", action: model.refreshRemote)
+                            PaneToolbarIconButton(systemImage: "square.and.arrow.down", help: "Download selected", action: model.downloadSelected)
+                                .disabled(model.selectedRemoteItems.isEmpty)
+                            remoteActionsMenu
+                        }
+                        HStack(spacing: 4) {
+                            PaneToolbarIconButton(systemImage: "arrow.up", help: "Parent folder", action: model.remoteUp)
+                            PaneToolbarIconButton(systemImage: "arrow.clockwise", help: "Refresh", action: model.refreshRemote)
+                            PaneToolbarIconButton(systemImage: "square.and.arrow.down", help: "Download selected", action: model.downloadSelected)
+                                .disabled(model.selectedRemoteItems.isEmpty)
+                            remoteActionsMenu
+                        }
                     }
-                    .help("More remote actions")
                 },
                 open: model.openRemote,
                 contextMenu: { item in
@@ -4842,6 +4898,36 @@ struct BrowserSplitView: View {
     }
 }
 
+private struct PaneToolbarIconButton: View {
+    var systemImage: String
+    var help: String
+    var action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: systemImage)
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundStyle(.primary)
+                .frame(width: 26, height: 28)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(help)
+    }
+}
+
+private struct PaneToolbarMenuLabel: View {
+    var systemImage: String
+
+    var body: some View {
+        Image(systemName: systemImage)
+            .font(.system(size: 14, weight: .semibold))
+            .foregroundStyle(.primary)
+            .frame(width: 26, height: 28)
+            .contentShape(Rectangle())
+    }
+}
+
 struct FilePane<ToolbarContent: View, ContextMenuContent: View, BackgroundContextMenuContent: View>: View {
     private enum ListColumn: Equatable {
         case name
@@ -4913,7 +4999,7 @@ struct FilePane<ToolbarContent: View, ContextMenuContent: View, BackgroundContex
 
     private func paneHeader(displayedItems: [FileItem]) -> some View {
         VStack(spacing: 0) {
-            HStack(spacing: 10) {
+            HStack(spacing: 8) {
                 HStack(spacing: 8) {
                     Image(systemName: isRemote ? "network" : "desktopcomputer")
                         .foregroundStyle(.secondary)
@@ -4931,8 +5017,9 @@ struct FilePane<ToolbarContent: View, ContextMenuContent: View, BackgroundContex
                     RoundedRectangle(cornerRadius: 8)
                         .stroke(VoltTheme.hairline)
                 )
+                .layoutPriority(0)
 
-                Spacer(minLength: 10)
+                Spacer(minLength: 8)
 
                 Text(itemCountText(displayedItems: displayedItems))
                     .font(.caption)
@@ -4941,8 +5028,12 @@ struct FilePane<ToolbarContent: View, ContextMenuContent: View, BackgroundContex
 
                 toolbar()
                     .buttonStyle(.borderless)
-                    .controlSize(.large)
+                    .controlSize(.small)
+                    .fixedSize(horizontal: true, vertical: false)
+                    .layoutPriority(2)
                 viewOptions
+                    .fixedSize()
+                    .layoutPriority(2)
             }
             .padding(.horizontal, 14)
             .padding(.vertical, 10)
@@ -5192,7 +5283,9 @@ struct FilePane<ToolbarContent: View, ContextMenuContent: View, BackgroundContex
             Toggle("Show file count", isOn: $preferences.showFileCount)
             Divider()
             Stepper("Text size: \(Int(preferences.textSize))", value: $preferences.textSize, in: 10...20, step: 1)
-        } label: { Image(systemName: "square.grid.2x2") }
+        } label: {
+            PaneToolbarMenuLabel(systemImage: "square.grid.2x2")
+        }
         .menuStyle(.borderlessButton).fixedSize().help("View options")
     }
 
