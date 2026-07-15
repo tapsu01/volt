@@ -65,7 +65,7 @@ struct HostKeyProbe: Sendable {
     var trustStatus: Int32
 }
 
-struct FileItem: Identifiable, Hashable {
+struct FileItem: Identifiable, Hashable, Sendable {
     var id: String { path }
     var name: String
     var path: String
@@ -87,6 +87,41 @@ struct FileItem: Identifiable, Hashable {
         guard let permissions else { return !isDirectory }
         return (permissions & 0o170000) == 0o100000
     }
+}
+
+private func loadLocalDirectoryItems(atPath path: String) throws -> [FileItem] {
+    let url = URL(fileURLWithPath: path)
+    let keys: Set<URLResourceKey> = [
+        .isDirectoryKey,
+        .fileSizeKey,
+        .contentModificationDateKey,
+        .contentTypeKey,
+        .isHiddenKey
+    ]
+    return try FileManager.default.contentsOfDirectory(at: url, includingPropertiesForKeys: Array(keys), options: [])
+        .map { fileURL in
+            let values = try fileURL.resourceValues(forKeys: keys)
+            let attributes = try? FileManager.default.attributesOfItem(atPath: fileURL.path)
+            let isDirectory = values.isDirectory == true
+            return FileItem(
+                name: fileURL.lastPathComponent,
+                path: fileURL.path,
+                isDirectory: isDirectory,
+                size: isDirectory ? nil : values.fileSize.map(Int64.init),
+                modified: values.contentModificationDate,
+                kind: isDirectory ? "Folder" : (values.contentType?.localizedDescription ?? "File"),
+                owner: attributes?[.ownerAccountName] as? String,
+                group: attributes?[.groupOwnerAccountName] as? String,
+                permissions: (attributes?[.posixPermissions] as? NSNumber)?.uint32Value,
+                isHidden: values.isHidden == true || fileURL.lastPathComponent.hasPrefix(".")
+            )
+        }
+        .sorted(by: defaultItemSort)
+}
+
+private func defaultItemSort(_ lhs: FileItem, _ rhs: FileItem) -> Bool {
+    if lhs.isDirectory != rhs.isDirectory { return lhs.isDirectory }
+    return lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
 }
 
 /// Kết quả của một lần liệt kê thư mục remote: danh sách entry hợp lệ và số entry bị bỏ vì không an
@@ -1317,12 +1352,14 @@ final class AppModel: ObservableObject {
     private let sftp = SFTPClient()
     private let transferLimiter = TransferLimiter(limit: TransferTuning.maxConcurrentTransfers)
     private var transferControls: [UUID: TransferControl] = [:]
+    private var lastTransferProgressUpdateByID: [UUID: Date] = [:]
     private var uploadConflictBatchPolicy: UploadConflictBatchPolicy?
     private var reservedUploadPaths: Set<String> = []
     private var activeOperationCount = 0
     private var isRestoringTab = false
     private var isSuppressingSidebarSelection = false
     private var isSelectingConnection = false
+    private let transferProgressMinimumInterval: TimeInterval = 0.08
 
     var hasCompletedTransfers: Bool {
         transfers.contains { $0.state == .done || $0.state == .failed || $0.state == .cancelled }
@@ -1712,32 +1749,20 @@ final class AppModel: ObservableObject {
     }
 
     func refreshLocal() {
-        do {
-            let url = URL(fileURLWithPath: localPath)
-            let keys: Set<URLResourceKey> = [.isDirectoryKey, .fileSizeKey, .contentModificationDateKey, .contentTypeKey, .isHiddenKey]
-            localItems = try FileManager.default.contentsOfDirectory(at: url, includingPropertiesForKeys: Array(keys), options: [])
-                .map { fileURL in
-                    let values = try fileURL.resourceValues(forKeys: keys)
-                    let attributes = try? FileManager.default.attributesOfItem(atPath: fileURL.path)
-                    let isDirectory = values.isDirectory == true
-                    return FileItem(
-                        name: fileURL.lastPathComponent,
-                        path: fileURL.path,
-                        isDirectory: isDirectory,
-                        size: isDirectory ? nil : values.fileSize.map(Int64.init),
-                        modified: values.contentModificationDate,
-                        kind: isDirectory ? "Folder" : (values.contentType?.localizedDescription ?? "File"),
-                        owner: attributes?[.ownerAccountName] as? String,
-                        group: attributes?[.groupOwnerAccountName] as? String,
-                        permissions: (attributes?[.posixPermissions] as? NSNumber)?.uint32Value,
-                        isHidden: values.isHidden == true || fileURL.lastPathComponent.hasPrefix(".")
-                    )
-                }
-                .sorted(by: itemSort)
-            status = "Local folder loaded"
-            syncCurrentTab()
-        } catch {
-            status = error.localizedDescription
+        let path = localPath
+        Task {
+            do {
+                let items = try await Task.detached(priority: .userInitiated) {
+                    try loadLocalDirectoryItems(atPath: path)
+                }.value
+                guard self.localPath == path else { return }
+                self.localItems = items
+                self.status = "Local folder loaded"
+                self.syncCurrentTab()
+            } catch {
+                guard self.localPath == path else { return }
+                self.status = error.localizedDescription
+            }
         }
     }
 
@@ -3264,19 +3289,34 @@ final class AppModel: ObservableObject {
         }
         if state == .done || state == .failed || state == .cancelled {
             transferControls.removeValue(forKey: id)
+            lastTransferProgressUpdateByID.removeValue(forKey: id)
         }
     }
 
     private func updateTransferProgress(_ id: UUID, transferred: UInt64, total: UInt64) {
         guard let index = transfers.firstIndex(where: { $0.id == id }) else { return }
+        let previousTransferred = transfers[index].transferredBytes
+        let previousTotal = transfers[index].totalBytes
+        guard previousTransferred != transferred || previousTotal != total else { return }
+
+        let now = Date()
+        let totalChanged = previousTotal != total
+        let isComplete = total > 0 && transferred >= total
+        if !totalChanged && !isComplete,
+           let lastUpdate = lastTransferProgressUpdateByID[id],
+           now.timeIntervalSince(lastUpdate) < transferProgressMinimumInterval {
+            return
+        }
+
         transfers[index].transferredBytes = transferred
         transfers[index].totalBytes = total
-        transfers[index].updatedAt = Date()
+        transfers[index].updatedAt = now
+        lastTransferProgressUpdateByID[id] = now
         if transferred > 0 && transfers[index].startedAt == nil {
-            transfers[index].startedAt = Date()
+            transfers[index].startedAt = now
         }
         if transferred > 0 && transfers[index].progressStartedAt == nil {
-            transfers[index].progressStartedAt = Date()
+            transfers[index].progressStartedAt = now
         }
     }
 
@@ -3647,11 +3687,6 @@ final class AppModel: ObservableObject {
         if localItems.isEmpty {
             refreshLocal()
         }
-    }
-
-    private func itemSort(_ lhs: FileItem, _ rhs: FileItem) -> Bool {
-        if lhs.isDirectory != rhs.isDirectory { return lhs.isDirectory }
-        return lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
     }
 
     private func joinRemote(_ base: String, _ child: String) -> String {
@@ -4858,16 +4893,17 @@ struct FilePane<ToolbarContent: View, ContextMenuContent: View, BackgroundContex
     }
 
     var body: some View {
+        let visibleItems = displayedItems
         VStack(spacing: 0) {
-            paneHeader
+            paneHeader(displayedItems: visibleItems)
 
-            browserContent
+            browserContent(displayedItems: visibleItems)
                 .background(Color.clear)
                 .contentShape(Rectangle())
                 .contextMenu { backgroundContextMenu() }
             if preferences.showFileCount {
                 Divider()
-                Text("\(displayedItems.count) items").font(.caption).foregroundStyle(.secondary)
+                Text("\(visibleItems.count) items").font(.caption).foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 12).padding(.vertical, 4)
             }
         }
@@ -4875,7 +4911,7 @@ struct FilePane<ToolbarContent: View, ContextMenuContent: View, BackgroundContex
         .background(VoltTheme.paneBackground)
     }
 
-    private var paneHeader: some View {
+    private func paneHeader(displayedItems: [FileItem]) -> some View {
         VStack(spacing: 0) {
             HStack(spacing: 10) {
                 HStack(spacing: 8) {
@@ -4898,7 +4934,7 @@ struct FilePane<ToolbarContent: View, ContextMenuContent: View, BackgroundContex
 
                 Spacer(minLength: 10)
 
-                Text(itemCountText)
+                Text(itemCountText(displayedItems: displayedItems))
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
@@ -4978,16 +5014,18 @@ struct FilePane<ToolbarContent: View, ContextMenuContent: View, BackgroundContex
         return crumbs.isEmpty ? [("Home", FileManager.default.homeDirectoryForCurrentUser.path)] : crumbs
     }
 
-    private var itemCountText: String {
+    private func itemCountText(displayedItems: [FileItem]) -> String {
         let total = displayedItems.count
-        let selectedCount = selection.filter { id in displayedItems.contains { $0.id == id } }.count
+        let selectedCount = displayedItems.reduce(0) { count, item in
+            count + (selection.contains(item.id) ? 1 : 0)
+        }
         if selectedCount > 0 {
             return "\(selectedCount) of \(total) selected"
         }
         return "\(total) items"
     }
 
-    @ViewBuilder private var browserContent: some View {
+    @ViewBuilder private func browserContent(displayedItems: [FileItem]) -> some View {
         switch preferences.viewMode {
         case .list:
             GeometryReader { proxy in
@@ -5017,7 +5055,7 @@ struct FilePane<ToolbarContent: View, ContextMenuContent: View, BackgroundContex
                 }.padding(12)
             }
         case .columns:
-            columnBrowser
+            columnBrowser(displayedItems: displayedItems)
         }
     }
 
@@ -5107,7 +5145,7 @@ struct FilePane<ToolbarContent: View, ContextMenuContent: View, BackgroundContex
         .contextMenu { contextMenu(item) }
     }
 
-    private var columnBrowser: some View {
+    private func columnBrowser(displayedItems: [FileItem]) -> some View {
         HStack(spacing: 0) {
             ScrollView {
                 LazyVStack(spacing: 1) {
