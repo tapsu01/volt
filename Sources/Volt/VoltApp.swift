@@ -4773,6 +4773,9 @@ struct BrowserSplitView: View {
 
     private var localActionsMenu: some View {
         Menu {
+            Button("Upload Selected", action: model.uploadSelected)
+                .disabled(model.selectedLocalItems.isEmpty || model.selectedConnection == nil)
+            Divider()
             Button("Choose Folder...", action: model.chooseLocalFolder)
             Divider()
             Button("New Folder", action: model.makeLocalFolder)
@@ -4809,6 +4812,8 @@ struct BrowserSplitView: View {
             Button("Open SSH Terminal", action: model.showTerminal)
                 .disabled(model.selectedConnection == nil)
             Divider()
+            Button("Download Selected", action: model.downloadSelected)
+                .disabled(model.selectedRemoteItems.isEmpty)
             Button("Download To...", action: model.downloadSelectedToFolder)
                 .disabled(model.selectedRemoteItems.isEmpty)
             Divider()
@@ -4930,8 +4935,6 @@ struct BrowserSplitView: View {
                         HStack(spacing: 4) {
                             PaneToolbarIconButton(systemImage: "arrow.up", help: "Parent folder", action: model.localUp)
                             PaneToolbarIconButton(systemImage: "arrow.clockwise", help: "Refresh", action: model.refreshLocal)
-                            PaneToolbarIconButton(systemImage: "square.and.arrow.up", help: "Upload selected", action: model.uploadSelected)
-                                .disabled(model.selectedLocalItems.isEmpty || model.selectedConnection == nil)
                             localActionsMenu
                         }
                     }
@@ -5025,8 +5028,6 @@ struct BrowserSplitView: View {
                         HStack(spacing: 4) {
                             PaneToolbarIconButton(systemImage: "arrow.up", help: "Parent folder", action: model.remoteUp)
                             PaneToolbarIconButton(systemImage: "arrow.clockwise", help: "Refresh", action: model.refreshRemote)
-                            PaneToolbarIconButton(systemImage: "square.and.arrow.down", help: "Download selected", action: model.downloadSelected)
-                                .disabled(model.selectedRemoteItems.isEmpty)
                             remoteActionsMenu
                         }
                     }
@@ -5210,46 +5211,68 @@ struct FilePane<ToolbarContent: View, ContextMenuContent: View, BackgroundContex
     private func paneHeader(displayedItems: [FileItem]) -> some View {
         VStack(spacing: 0) {
             HStack(spacing: 8) {
-                HStack(spacing: 8) {
-                    Image(systemName: isRemote ? "network" : "desktopcomputer")
-                        .foregroundStyle(.secondary)
-                    ScrollView(.horizontal, showsIndicators: false) {
-                        pathBar
+                pathBarContainer
+                    .frame(minWidth: 0, idealWidth: 0, maxWidth: .infinity)
+                    .layoutPriority(-10)
+
+                ViewThatFits(in: .horizontal) {
+                    HStack(spacing: 8) {
+                        itemCountLabel(displayedItems: displayedItems)
+                        paneToolbarControls
                     }
+                    paneToolbarControls
                 }
-                .padding(.horizontal, 10)
-                .frame(height: 36)
-                .background(
-                    RoundedRectangle(cornerRadius: 8)
-                        .fill(VoltTheme.controlBackground)
-                )
-                .overlay(
-                    RoundedRectangle(cornerRadius: 8)
-                        .stroke(VoltTheme.hairline)
-                )
-                .layoutPriority(0)
-
-                Spacer(minLength: 8)
-
-                Text(itemCountText(displayedItems: displayedItems))
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-
-                toolbar()
-                    .buttonStyle(.borderless)
-                    .controlSize(.small)
-                    .fixedSize(horizontal: true, vertical: false)
-                    .layoutPriority(2)
-                viewOptions
-                    .fixedSize()
-                    .layoutPriority(2)
+                .layoutPriority(3)
             }
             .padding(.horizontal, 14)
             .padding(.vertical, 10)
+            .frame(maxWidth: .infinity)
 
             Divider()
         }
+    }
+
+    private var pathBarContainer: some View {
+        HStack(spacing: 8) {
+            Image(systemName: isRemote ? "network" : "desktopcomputer")
+                .foregroundStyle(.secondary)
+                .frame(width: 18)
+            ScrollView(.horizontal, showsIndicators: false) {
+                pathBar
+            }
+            .frame(minWidth: 0, maxWidth: .infinity)
+            .clipped()
+        }
+        .padding(.horizontal, 10)
+        .frame(height: 36)
+        .frame(minWidth: 0, maxWidth: .infinity)
+        .clipped()
+        .background(
+            RoundedRectangle(cornerRadius: 8)
+                .fill(VoltTheme.controlBackground)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(VoltTheme.hairline)
+        )
+    }
+
+    private func itemCountLabel(displayedItems: [FileItem]) -> some View {
+        Text(itemCountText(displayedItems: displayedItems))
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .lineLimit(1)
+            .fixedSize(horizontal: true, vertical: false)
+    }
+
+    private var paneToolbarControls: some View {
+        HStack(spacing: 4) {
+            toolbar()
+                .buttonStyle(.borderless)
+                .controlSize(.small)
+            viewOptions
+        }
+        .fixedSize(horizontal: true, vertical: false)
     }
 
     private var pathBar: some View {
