@@ -96,6 +96,11 @@ struct RemoteListingResult {
     let skippedUnsafeCount: Int
 }
 
+struct RemoteDirectoryCacheEntry {
+    var items: [FileItem]
+    var loadedAt: Date
+}
+
 struct FolderDownloadSummary {
     var downloadedFiles = 0
     var skippedItems = 0
@@ -748,6 +753,11 @@ private enum UploadConflictResolution {
     case skip
 }
 
+private enum RemoteRefreshMode {
+    case foreground
+    case background
+}
+
 final class SecureStorage {
     private static let legacyKey = "connections"
 
@@ -1302,7 +1312,7 @@ final class AppModel: ObservableObject {
     private var tabCredentials: [BrowserTab.ID: SensitiveCredential] = [:]
     private var terminalSessions: [BrowserTab.ID: SSHTerminalSession] = [:]
     private var verifiedHosts: Set<String> = []
-    private var remoteDirectoryCache: [String: [FileItem]] = [:]
+    private var remoteDirectoryCache: [String: RemoteDirectoryCacheEntry] = [:]
 
     private let sftp = SFTPClient()
     private let transferLimiter = TransferLimiter(limit: TransferTuning.maxConcurrentTransfers)
@@ -1746,7 +1756,7 @@ final class AppModel: ObservableObject {
     }
 
     func refreshRemote() {
-        refreshRemote(finalStatus: "Remote folder loaded")
+        refreshRemote(finalStatus: "Remote folder loaded", mode: .foreground)
     }
 
     func submitRemotePath() {
@@ -1754,11 +1764,10 @@ final class AppModel: ObservableObject {
         remotePath = trimmedPath.isEmpty ? "/" : "/" + trimmedPath.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
         selectedRemoteIDs.removeAll()
         noteRecentActivity()
-        syncCurrentTab()
-        refreshRemote()
+        loadCurrentRemotePathUsingCache()
     }
 
-    private func refreshRemote(finalStatus: String) {
+    private func refreshRemote(finalStatus: String, mode: RemoteRefreshMode = .foreground) {
         guard let connection = selectedConnection else { status = "Choose a connection"; return }
         if let validationError = validate(connection) {
             status = validationError
@@ -1767,7 +1776,7 @@ final class AppModel: ObservableObject {
         let path = remotePath
         let credential = credentialForCurrentTab().clone()
         let operationTabID = selectedTabID
-        runBusy("Loading remote folder") {
+        let operation: @Sendable () async throws -> Void = {
             let result: RemoteListingResult
             do {
                 try await self.verifyHostKey(for: connection)
@@ -1789,7 +1798,7 @@ final class AppModel: ObservableObject {
                       self.tabs[tabIndex].remotePath == path
                 else { return }
 
-                self.remoteDirectoryCache[self.remoteCacheKey(connectionID: connection.id, path: path)] = result.items
+                self.storeRemoteListing(result.items, connectionID: connection.id, path: path)
                 let statusText = result.skippedUnsafeCount > 0
                     ? "\(result.skippedUnsafeCount) unsafe remote entries were hidden."
                     : finalStatus
@@ -1808,6 +1817,36 @@ final class AppModel: ObservableObject {
                 }
             }
         }
+
+        switch mode {
+        case .foreground:
+            runBusy("Loading remote folder", operation: operation)
+        case .background:
+            Task {
+                do {
+                    try await operation()
+                } catch {
+                    await MainActor.run {
+                        self.status = error.localizedDescription
+                    }
+                }
+            }
+        }
+    }
+
+    private func loadCurrentRemotePathUsingCache() {
+        if let connection = selectedConnection,
+           let cachedItems = cachedRemoteItems(connectionID: connection.id, path: remotePath) {
+            remoteItems = cachedItems
+            status = "Remote folder loaded"
+            syncCurrentTab()
+            refreshRemote(finalStatus: "Remote folder updated", mode: .background)
+            return
+        }
+
+        remoteItems = []
+        syncCurrentTab()
+        refreshRemote(finalStatus: "Remote folder loaded", mode: .foreground)
     }
 
     func openLocal(_ item: FileItem) {
@@ -1827,12 +1866,7 @@ final class AppModel: ObservableObject {
         remotePath = item.path
         selectedRemoteIDs.removeAll()
         noteRecentActivity()
-        if let connection = selectedConnection,
-           let cachedItems = remoteDirectoryCache[remoteCacheKey(connectionID: connection.id, path: item.path)] {
-            remoteItems = cachedItems
-        }
-        syncCurrentTab()
-        refreshRemote()
+        loadCurrentRemotePathUsingCache()
     }
 
     func localUp() {
@@ -1848,8 +1882,7 @@ final class AppModel: ObservableObject {
         let parent = URL(fileURLWithPath: remotePath).deletingLastPathComponent().path
         remotePath = parent.isEmpty ? "/" : parent
         noteRecentActivity()
-        syncCurrentTab()
-        refreshRemote()
+        loadCurrentRemotePathUsingCache()
     }
 
     func chooseLocalFolder() {
@@ -1932,6 +1965,7 @@ final class AppModel: ObservableObject {
                 self.markTransfer(transferID, .done, warning ?? "Uploaded edited file")
                 self.remoteEditSessions.removeAll { $0.id == session.id }
                 self.cleanupEditSessions([session])
+                self.invalidateRemoteCacheForChangedItem(connectionID: connection.id, path: session.remotePath)
                 self.syncCurrentTab()
                 self.refreshRemote()
             }
@@ -2012,6 +2046,7 @@ final class AppModel: ObservableObject {
             await MainActor.run {
                 self.markTransfer(transferID, .done, warning ?? "Uploaded")
                 if let warning { self.status = warning }
+                self.invalidateRemoteCacheForChangedItem(connectionID: connection.id, path: destination)
                 if refreshWhenDone {
                     self.refreshRemote()
                 }
@@ -2041,6 +2076,7 @@ final class AppModel: ObservableObject {
                 let fileText = "\(summary.uploadedFiles) file\(summary.uploadedFiles == 1 ? "" : "s")"
                 let skippedText = summary.skippedItems > 0 ? ", skipped \(summary.skippedItems)" : ""
                 self.markTransfer(transferID, .done, "Uploaded \(fileText)\(skippedText)")
+                self.invalidateRemoteCacheForChangedItem(connectionID: connection.id, path: remotePath, wasDirectory: true)
                 if refreshWhenDone {
                     self.refreshRemote()
                 }
@@ -2693,12 +2729,12 @@ final class AppModel: ObservableObject {
             return remoteItems.first { $0.name == name }
         }
 
-        if let cachedItems = remoteDirectoryCache[remoteCacheKey(connectionID: connection.id, path: parent)] {
+        if let cachedItems = cachedRemoteItems(connectionID: connection.id, path: parent) {
             return cachedItems.first { $0.name == name }
         }
 
         let result = try await sftp.list(connection: connection, credential: credential, path: parent)
-        remoteDirectoryCache[remoteCacheKey(connectionID: connection.id, path: parent)] = result.items
+        storeRemoteListing(result.items, connectionID: connection.id, path: parent)
         return result.items.first { $0.name == name }
     }
 
@@ -2821,6 +2857,7 @@ final class AppModel: ObservableObject {
         runBusy("Creating folder") {
             let warning = try await self.sftp.makeDirectory(connection: connection, credential: credential, path: path)
             await MainActor.run {
+                self.invalidateRemoteCacheForChangedItem(connectionID: connection.id, path: path, wasDirectory: true)
                 self.refreshRemote(finalStatus: warning ?? "Remote folder loaded")
             }
         }
@@ -2835,6 +2872,7 @@ final class AppModel: ObservableObject {
         runBusy("Creating file") {
             let warning = try await self.sftp.createFile(connection: connection, credential: credential, remotePath: path)
             await MainActor.run {
+                self.invalidateRemoteCacheForChangedItem(connectionID: connection.id, path: path)
                 self.refreshRemote(finalStatus: warning ?? "Remote folder loaded")
             }
         }
@@ -2895,14 +2933,19 @@ final class AppModel: ObservableObject {
         guard let item = selectedRemote, item.isDirectory else { return }
         var newTab = currentSessionTab(title: item.name)
         newTab.remotePath = item.path
-        newTab.remoteItems = selectedConnection.flatMap {
-            remoteDirectoryCache[remoteCacheKey(connectionID: $0.id, path: item.path)]
-        } ?? []
+        let cachedItems = selectedConnection.flatMap {
+            cachedRemoteItems(connectionID: $0.id, path: item.path)
+        }
+        newTab.remoteItems = cachedItems ?? []
         newTab.selectedRemoteIDs.removeAll()
         tabs.append(newTab)
         tabCredentials[newTab.id] = credentialForCurrentTab().clone()
         selectTab(newTab.id)
-        refreshRemote()
+        if cachedItems != nil {
+            refreshRemote(finalStatus: "Remote folder updated", mode: .background)
+        } else {
+            refreshRemote(finalStatus: "Remote folder loaded", mode: .foreground)
+        }
     }
 
     func duplicateRemoteSelected() {
@@ -2939,7 +2982,10 @@ final class AppModel: ObservableObject {
 
             _ = try runner.run(executable, arguments: args, stdin: "")
             
-            await MainActor.run { self.refreshRemote() }
+            await MainActor.run {
+                self.invalidateRemoteCacheForChangedItem(connectionID: connection.id, path: newPath, wasDirectory: item.isDirectory)
+                self.refreshRemote()
+            }
         }
     }
 
@@ -2954,6 +3000,8 @@ final class AppModel: ObservableObject {
             try await self.sftp.rename(connection: connection, credential: credential, from: item.path, to: newPath)
             await MainActor.run {
                 self.selectedRemoteIDs.removeAll()
+                self.invalidateRemoteCacheForChangedItem(connectionID: connection.id, path: item.path, wasDirectory: item.isDirectory)
+                self.invalidateRemoteCacheForChangedItem(connectionID: connection.id, path: newPath, wasDirectory: item.isDirectory)
                 self.refreshRemote()
             }
         }
@@ -2991,6 +3039,7 @@ final class AppModel: ObservableObject {
             try await self.sftp.remove(connection: connection, credential: credential, path: item.path, isDirectory: item.isDirectory)
             await MainActor.run {
                 self.selectedRemoteIDs.removeAll()
+                self.invalidateRemoteCacheForChangedItem(connectionID: connection.id, path: item.path, wasDirectory: item.isDirectory)
                 self.refreshRemote()
             }
         }
@@ -3034,6 +3083,8 @@ final class AppModel: ObservableObject {
             try await self.sftp.rename(connection: connection, credential: credential, from: item.path, to: destination)
             await MainActor.run {
                 self.selectedRemoteIDs.removeAll()
+                self.invalidateRemoteCacheForChangedItem(connectionID: connection.id, path: item.path, wasDirectory: item.isDirectory)
+                self.invalidateRemoteCacheForChangedItem(connectionID: connection.id, path: destination, wasDirectory: item.isDirectory)
                 self.refreshRemote()
             }
         }
@@ -3510,6 +3561,40 @@ final class AppModel: ObservableObject {
 
     private func remoteCacheKey(connectionID: UUID, path: String) -> String {
         "\(connectionID.uuidString):\(path)"
+    }
+
+    private func cachedRemoteItems(connectionID: UUID, path: String) -> [FileItem]? {
+        remoteDirectoryCache[remoteCacheKey(connectionID: connectionID, path: path)]?.items
+    }
+
+    private func storeRemoteListing(_ items: [FileItem], connectionID: UUID, path: String) {
+        remoteDirectoryCache[remoteCacheKey(connectionID: connectionID, path: path)] = RemoteDirectoryCacheEntry(items: items, loadedAt: Date())
+        pruneRemoteDirectoryCache(maxEntries: 200)
+    }
+
+    private func invalidateRemoteCache(connectionID: UUID, path: String) {
+        remoteDirectoryCache.removeValue(forKey: remoteCacheKey(connectionID: connectionID, path: path))
+    }
+
+    private func invalidateRemoteCacheForChangedItem(connectionID: UUID, path: String, wasDirectory: Bool = false) {
+        if let parent = remoteParentPath(path) {
+            invalidateRemoteCache(connectionID: connectionID, path: parent)
+        }
+        if wasDirectory {
+            invalidateRemoteCache(connectionID: connectionID, path: path)
+        }
+    }
+
+    private func pruneRemoteDirectoryCache(maxEntries: Int) {
+        guard remoteDirectoryCache.count > maxEntries else { return }
+        let overflow = remoteDirectoryCache.count - maxEntries
+        let staleKeys = remoteDirectoryCache
+            .sorted { $0.value.loadedAt < $1.value.loadedAt }
+            .prefix(overflow)
+            .map(\.key)
+        for key in staleKeys {
+            remoteDirectoryCache.removeValue(forKey: key)
+        }
     }
 
     private func syncCurrentTab() {
