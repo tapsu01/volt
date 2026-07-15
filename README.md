@@ -141,6 +141,17 @@ Build for a specific native architecture:
 ARCH=arm64 ./Scripts/package-app.sh
 ```
 
+Run the self-use verification flow before using Volt with important VPSes:
+
+```bash
+./Scripts/verify-self-build.sh
+```
+
+This runs the security C tests, dependency audit, release packaging, codesign
+verification, bundled dependency hash checks, and runtime library linkage
+checks. Without `NOTARY_PROFILE`, the resulting app is an ad-hoc signed,
+self-use-only build for this Mac.
+
 Sign and notarize a distribution build:
 
 ```bash
@@ -168,6 +179,18 @@ created remote files and folders.
 Volt reports a warning when a transfer or create operation succeeds but the
 server refuses the requested permission change.
 
+## Important Servers
+
+Saved connections can be marked as `Important Server`. This mode adds extra
+confirmation around destructive remote actions and overwrite uploads, disables
+apply-to-all replace decisions for upload conflicts, warns before password SFTP
+use, and blocks `root` login unless an explicit root override is enabled.
+
+For important VPSes, build from a clean working tree, run
+`Scripts/verify-self-build.sh`, verify the SSH host-key fingerprint outside
+Volt, and keep a server snapshot or backup before large delete, rename, move, or
+replace operations.
+
 ## Security Model
 
 - SFTP transport and authentication are implemented with libssh2.
@@ -184,6 +207,10 @@ server refuses the requested permission change.
 - Downloaded and temporary edit files are created with restrictive permissions.
 - Remote directory entries with unsafe or invalid names are skipped before they
   reach the SwiftUI layer.
+- Volt is a high-trust local file manager. Full App Sandbox is intentionally not
+  enabled in this phase because local folder access, security-scoped bookmarks,
+  remote edit temporary files, and external editor selection need a broader
+  design pass.
 
 SSH key or agent authentication is recommended for long-lived server access.
 
@@ -214,9 +241,17 @@ Check whether bundled security dependencies need an update:
 ./Scripts/audit-dependencies.sh
 ```
 
+Verify a packaged app bundle:
+
+```bash
+./Scripts/verify-build.sh build/Volt.app
+```
+
 Release builds include third-party license files and a
 `DependencyManifest.json` containing dependency versions, architecture, source
-provenance, and SHA-256 hashes of the signed dylibs.
+provenance, and SHA-256 hashes of the signed dylibs. Builds also include a
+`BuildInfo.txt` file with the Swift toolchain, signing mode, dependency versions,
+and dependency hashes used for that app bundle.
 
 See [`Support/DEPENDENCY_MAINTENANCE.md`](Support/DEPENDENCY_MAINTENANCE.md)
 for the release maintenance process.

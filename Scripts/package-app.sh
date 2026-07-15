@@ -33,6 +33,9 @@ OPENSSL_PREFIX="$($BREW --prefix openssl@3)"
 LIBSSH2_SOURCE="$LIBSSH2_PREFIX/lib/libssh2.1.dylib"
 SSL_SOURCE="$OPENSSL_PREFIX/lib/libssl.3.dylib"
 CRYPTO_SOURCE="$OPENSSL_PREFIX/lib/libcrypto.3.dylib"
+SWIFTPM_HOME="${VOLT_SWIFTPM_HOME:-${TMPDIR:-/tmp}/volt-swiftpm-home}"
+MODULE_CACHE="${VOLT_MODULE_CACHE:-${TMPDIR:-/tmp}/volt-clang-module-cache}"
+/bin/mkdir -p "$SWIFTPM_HOME" "$MODULE_CACHE"
 
 check_architecture() {
   file="$1"
@@ -50,11 +53,11 @@ check_architecture "$CRYPTO_SOURCE"
 export VOLT_LIBSSH2_PREFIX="$LIBSSH2_PREFIX"
 /usr/bin/env PATH="$PATH" \
   VOLT_LIBSSH2_PREFIX="$VOLT_LIBSSH2_PREFIX" \
-  CLANG_MODULE_CACHE_PATH="$ROOT_DIR/.build/ModuleCache" \
-  HOME="$ROOT_DIR/.build/home" \
-  /usr/bin/swift build -c release --arch "$ARCH"
+  CLANG_MODULE_CACHE_PATH="$MODULE_CACHE" \
+  HOME="$SWIFTPM_HOME" \
+  /usr/bin/swift build --disable-sandbox -c release --arch "$ARCH"
 
-BUILD_DIR="$(/usr/bin/env PATH="$PATH" VOLT_LIBSSH2_PREFIX="$VOLT_LIBSSH2_PREFIX" HOME="$ROOT_DIR/.build/home" /usr/bin/swift build -c release --arch "$ARCH" --show-bin-path)"
+BUILD_DIR="$(/usr/bin/env PATH="$PATH" VOLT_LIBSSH2_PREFIX="$VOLT_LIBSSH2_PREFIX" CLANG_MODULE_CACHE_PATH="$MODULE_CACHE" HOME="$SWIFTPM_HOME" /usr/bin/swift build --disable-sandbox -c release --arch "$ARCH" --show-bin-path)"
 
 /bin/rm -rf "$APP_DIR"
 /bin/mkdir -p "$MACOS_DIR" "$FRAMEWORKS_DIR" "$LICENSES_DIR"
@@ -107,6 +110,13 @@ LIBSSH2_SHA="$(/usr/bin/shasum -a 256 "$FRAMEWORKS_DIR/libssh2.1.dylib" | /usr/b
 SSL_SHA="$(/usr/bin/shasum -a 256 "$FRAMEWORKS_DIR/libssl.3.dylib" | /usr/bin/awk '{print $1}')"
 CRYPTO_SHA="$(/usr/bin/shasum -a 256 "$FRAMEWORKS_DIR/libcrypto.3.dylib" | /usr/bin/awk '{print $1}')"
 MANIFEST_PATH="$RESOURCES_DIR/DependencyManifest.json"
+BUILD_INFO_PATH="$RESOURCES_DIR/BuildInfo.txt"
+SWIFT_VERSION="$(/usr/bin/swift --version | /usr/bin/head -n 1)"
+BUILD_TIME_UTC="$(/bin/date -u '+%Y-%m-%dT%H:%M:%SZ')"
+SIGN_MODE="ad-hoc"
+if [ "$SIGN_IDENTITY" != "-" ]; then
+  SIGN_MODE="Developer ID"
+fi
 
 /usr/bin/printf '%s\n' \
   '{' \
@@ -120,12 +130,27 @@ MANIFEST_PATH="$RESOURCES_DIR/DependencyManifest.json"
   '  ]' \
   '}' > "$MANIFEST_PATH"
 
+/usr/bin/printf '%s\n' \
+  "Volt build information" \
+  "buildTimeUTC=$BUILD_TIME_UTC" \
+  "architecture=$ARCH" \
+  "swiftToolchain=$SWIFT_VERSION" \
+  "signing=$SIGN_MODE" \
+  "notarized=$([ -n "${NOTARY_PROFILE:-}" ] && /usr/bin/printf yes || /usr/bin/printf no)" \
+  "libssh2.version=$LIBSSH2_VERSION" \
+  "libssh2.sha256=$LIBSSH2_SHA" \
+  "openssl.version=$OPENSSL_VERSION" \
+  "libssl.sha256=$SSL_SHA" \
+  "libcrypto.sha256=$CRYPTO_SHA" \
+  > "$BUILD_INFO_PATH"
+
 if [ "$SIGN_IDENTITY" = "-" ]; then
   /usr/bin/codesign --force --sign - --entitlements "$ROOT_DIR/Support/Volt.entitlements" "$APP_DIR"
 else
   /usr/bin/codesign --force --sign "$SIGN_IDENTITY" --options=runtime --timestamp --entitlements "$ROOT_DIR/Support/Volt.entitlements" "$APP_DIR"
 fi
 /usr/bin/codesign --verify --deep --strict --verbose=2 "$APP_DIR"
+"$ROOT_DIR/Scripts/verify-build.sh" "$APP_DIR"
 
 /bin/rm -f "$ZIP_PATH"
 /usr/bin/ditto -c -k --keepParent "$APP_DIR" "$ZIP_PATH"
@@ -139,6 +164,7 @@ if [ -n "${NOTARY_PROFILE:-}" ]; then
   /usr/bin/xcrun stapler staple "$APP_DIR"
   /usr/bin/xcrun stapler validate "$APP_DIR"
   /usr/sbin/spctl --assess --type execute -vvv "$APP_DIR"
+  "$ROOT_DIR/Scripts/verify-build.sh" "$APP_DIR"
   /bin/rm -f "$ZIP_PATH"
   /usr/bin/ditto -c -k --keepParent "$APP_DIR" "$ZIP_PATH"
 fi

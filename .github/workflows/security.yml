@@ -1,0 +1,33 @@
+name: Security
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  macos-security:
+    runs-on: macos-15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install SSH dependencies
+        run: brew install libssh2 openssl@3
+
+      - name: Run Swift tests
+        run: |
+          export VOLT_LIBSSH2_PREFIX="$(brew --prefix libssh2)"
+          export CLANG_MODULE_CACHE_PATH="$PWD/.build/ModuleCache"
+          export HOME="$PWD/.build/home"
+          swift test
+
+      - name: Run security C tests
+        run: Scripts/test-security.sh
+
+      - name: Audit bundled dependency freshness
+        continue-on-error: true
+        run: Scripts/audit-dependencies.sh
+
+      - name: Package and verify app bundle
+        run: |
+          ARCH="$(uname -m)" Scripts/package-app.sh

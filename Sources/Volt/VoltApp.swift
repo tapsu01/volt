@@ -42,6 +42,20 @@ enum RemotePermissionPreset: String, Codable, CaseIterable, Identifiable {
     }
 }
 
+enum ConnectionSafetyProfile: String, Codable, CaseIterable, Identifiable {
+    case standard = "standard"
+    case important = "important"
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .standard: "Standard"
+        case .important: "Important Server"
+        }
+    }
+}
+
 struct SavedConnection: Identifiable, Codable, Equatable {
     var id = UUID()
     var name: String = "My Server"
@@ -53,9 +67,48 @@ struct SavedConnection: Identifiable, Codable, Equatable {
     var privateKeyPath: String = ""
     var privateKeyBookmark: Data?
     var permissionPreset: RemotePermissionPreset?
+    var safetyProfile: ConnectionSafetyProfile = .standard
+    var allowRootLoginOnImportantServer = false
 
     var effectivePermissionPreset: RemotePermissionPreset {
         permissionPreset ?? .web
+    }
+
+    var requiresImportantServerGuards: Bool {
+        safetyProfile == .important
+    }
+
+    init() {}
+
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case name
+        case host
+        case port
+        case username
+        case protocolKind
+        case remotePath
+        case privateKeyPath
+        case privateKeyBookmark
+        case permissionPreset
+        case safetyProfile
+        case allowRootLoginOnImportantServer
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decodeIfPresent(UUID.self, forKey: .id) ?? UUID()
+        name = try container.decodeIfPresent(String.self, forKey: .name) ?? "My Server"
+        host = try container.decodeIfPresent(String.self, forKey: .host) ?? ""
+        port = try container.decodeIfPresent(Int.self, forKey: .port) ?? 22
+        username = try container.decodeIfPresent(String.self, forKey: .username) ?? NSUserName()
+        protocolKind = try container.decodeIfPresent(ProtocolKind.self, forKey: .protocolKind) ?? .sftp
+        remotePath = try container.decodeIfPresent(String.self, forKey: .remotePath) ?? "/"
+        privateKeyPath = try container.decodeIfPresent(String.self, forKey: .privateKeyPath) ?? ""
+        privateKeyBookmark = try container.decodeIfPresent(Data.self, forKey: .privateKeyBookmark)
+        permissionPreset = try container.decodeIfPresent(RemotePermissionPreset.self, forKey: .permissionPreset)
+        safetyProfile = try container.decodeIfPresent(ConnectionSafetyProfile.self, forKey: .safetyProfile) ?? .standard
+        allowRootLoginOnImportantServer = try container.decodeIfPresent(Bool.self, forKey: .allowRootLoginOnImportantServer) ?? false
     }
 }
 
@@ -776,7 +829,7 @@ private enum UploadConflictBatchPolicy {
     case skip
 }
 
-private enum UploadConflictChoice {
+private enum UploadConflictChoice: Equatable {
     case replace
     case keepBoth
     case skip
@@ -1631,6 +1684,10 @@ final class AppModel: ObservableObject {
     }
 
     func saveDraft() {
+        if let validationError = validate(connectionDraft) {
+            status = validationError
+            return
+        }
         if let index = connections.firstIndex(where: { $0.id == connectionDraft.id }) {
             connections[index] = connectionDraft
         } else {
@@ -1650,6 +1707,11 @@ final class AppModel: ObservableObject {
     func connectDraft(password: String) {
         if let validationError = validate(connectionDraft) {
             status = validationError
+            return
+        }
+        if shouldWarnAboutImportantServerPassword(connectionDraft, password: password),
+           !confirmImportantServerPasswordUse(connection: connectionDraft) {
+            status = "Connection cancelled"
             return
         }
         remotePath = connectionDraft.remotePath.isEmpty ? "/" : connectionDraft.remotePath
@@ -1712,6 +1774,14 @@ final class AppModel: ObservableObject {
     }
 
     func connectWithPassword(_ password: String) {
+        if shouldWarnAboutImportantServerPassword(connectionDraft, password: password),
+           !confirmImportantServerPasswordUse(connection: connectionDraft) {
+            credentialForCurrentTab().clear()
+            showsPasswordPrompt = false
+            syncCurrentTab()
+            status = "Connection cancelled"
+            return
+        }
         capturePasswordInput(password)
         showsPasswordPrompt = false
         syncCurrentTab()
@@ -1970,6 +2040,12 @@ final class AppModel: ObservableObject {
 
     func uploadEditedRemoteFile(_ session: RemoteEditSession) {
         guard let connection = selectedConnection else { return }
+        guard confirmImportantServerAction(
+            connection: connection,
+            action: "replace the edited remote file",
+            remotePath: session.remotePath,
+            confirmation: "REPLACE"
+        ) else { return }
         let credential = credentialForCurrentTab().clone()
         let transferID = enqueue(direction: .upload, source: session.localPath, destination: session.remotePath)
         guard let control = transferControls[transferID] else { return }
@@ -2514,11 +2590,11 @@ final class AppModel: ObservableObject {
             return .upload(path: remotePath, policy: .createNew)
         }
 
-        if let uploadConflictBatchPolicy {
+        if let uploadConflictBatchPolicy, !connection.requiresImportantServerGuards {
             return try await uploadResolution(for: uploadConflictBatchPolicy, remotePath: remotePath, connection: connection, credential: credential)
         }
 
-        let promptResult = promptUploadConflict(remotePath: remotePath)
+        let promptResult = promptUploadConflict(remotePath: remotePath, connection: connection)
         if let batchPolicy = promptResult.applyToAllPolicy {
             uploadConflictBatchPolicy = batchPolicy
         }
@@ -2555,7 +2631,7 @@ final class AppModel: ObservableObject {
             return remotePath
         }
 
-        if let uploadConflictBatchPolicy {
+        if let uploadConflictBatchPolicy, !connection.requiresImportantServerGuards {
             return try await folderUploadResolution(
                 for: uploadConflictBatchPolicy,
                 existingEntry: existingEntry,
@@ -2566,7 +2642,7 @@ final class AppModel: ObservableObject {
         }
 
         guard existingEntry.isDirectory else {
-            let promptResult = promptFolderUploadBlockedByFile(remotePath: remotePath)
+            let promptResult = promptFolderUploadBlockedByFile(remotePath: remotePath, connection: connection)
             if let batchPolicy = promptResult.applyToAllPolicy {
                 uploadConflictBatchPolicy = batchPolicy
             }
@@ -2587,6 +2663,7 @@ final class AppModel: ObservableObject {
 
         let promptResult = promptUploadConflict(
             remotePath: remotePath,
+            connection: connection,
             primaryActionTitle: "Merge"
         )
         if let batchPolicy = promptResult.applyToAllPolicy {
@@ -2654,23 +2731,30 @@ final class AppModel: ObservableObject {
 
     private func promptUploadConflict(
         remotePath: String,
+        connection: SavedConnection,
         primaryActionTitle: String = "Replace"
     ) -> (choice: UploadConflictChoice, applyToAllPolicy: UploadConflictBatchPolicy?) {
         let name = URL(fileURLWithPath: remotePath).lastPathComponent
         let alert = NSAlert()
         alert.messageText = "An item named \"\(name)\" already exists on the server."
-        alert.informativeText = "Choose what Volt should do before uploading."
+        alert.informativeText = connection.requiresImportantServerGuards
+            ? "Important Server: \(remoteActionContext(connection: connection, remotePath: remotePath))\nChoose what Volt should do before uploading."
+            : "Choose what Volt should do before uploading."
         alert.alertStyle = .warning
         alert.addButton(withTitle: primaryActionTitle)
         alert.addButton(withTitle: "Keep Both")
         alert.addButton(withTitle: "Skip")
         alert.addButton(withTitle: "Cancel")
 
-        let checkbox = NSButton(checkboxWithTitle: "Apply to all upload conflicts", target: nil, action: nil)
+        let checkboxTitle = connection.requiresImportantServerGuards
+            ? "Apply to all upload conflicts (disabled for Important Server)"
+            : "Apply to all upload conflicts"
+        let checkbox = NSButton(checkboxWithTitle: checkboxTitle, target: nil, action: nil)
         checkbox.state = .off
+        checkbox.isEnabled = !connection.requiresImportantServerGuards
         alert.accessoryView = checkbox
 
-        let choice: UploadConflictChoice
+        var choice: UploadConflictChoice
         switch alert.runModal() {
         case .alertFirstButtonReturn:
             choice = .replace
@@ -2679,6 +2763,16 @@ final class AppModel: ObservableObject {
         case .alertThirdButtonReturn:
             choice = .skip
         default:
+            choice = .cancel
+        }
+
+        if choice == .replace,
+           !confirmImportantServerAction(
+                connection: connection,
+                action: primaryActionTitle.lowercased() == "merge" ? "merge into the existing remote folder" : "replace the remote item",
+                remotePath: remotePath,
+                confirmation: primaryActionTitle.uppercased()
+           ) {
             choice = .cancel
         }
 
@@ -2701,18 +2795,24 @@ final class AppModel: ObservableObject {
         return (choice, applyToAllPolicy)
     }
 
-    private func promptFolderUploadBlockedByFile(remotePath: String) -> (choice: UploadConflictChoice, applyToAllPolicy: UploadConflictBatchPolicy?) {
+    private func promptFolderUploadBlockedByFile(remotePath: String, connection: SavedConnection) -> (choice: UploadConflictChoice, applyToAllPolicy: UploadConflictBatchPolicy?) {
         let name = URL(fileURLWithPath: remotePath).lastPathComponent
         let alert = NSAlert()
         alert.messageText = "A file named \"\(name)\" already exists on the server."
-        alert.informativeText = "A folder cannot be merged into that file. Choose a new folder name or skip it."
+        alert.informativeText = connection.requiresImportantServerGuards
+            ? "Important Server: \(remoteActionContext(connection: connection, remotePath: remotePath))\nA folder cannot be merged into that file. Choose a new folder name or skip it."
+            : "A folder cannot be merged into that file. Choose a new folder name or skip it."
         alert.alertStyle = .warning
         alert.addButton(withTitle: "Keep Both")
         alert.addButton(withTitle: "Skip")
         alert.addButton(withTitle: "Cancel")
 
-        let checkbox = NSButton(checkboxWithTitle: "Apply to all upload conflicts", target: nil, action: nil)
+        let checkboxTitle = connection.requiresImportantServerGuards
+            ? "Apply to all upload conflicts (disabled for Important Server)"
+            : "Apply to all upload conflicts"
+        let checkbox = NSButton(checkboxWithTitle: checkboxTitle, target: nil, action: nil)
         checkbox.state = .off
+        checkbox.isEnabled = !connection.requiresImportantServerGuards
         alert.accessoryView = checkbox
 
         let choice: UploadConflictChoice
@@ -3020,6 +3120,12 @@ final class AppModel: ObservableObject {
         guard !newName.isEmpty, newName != item.name else { return }
         
         let newPath = joinRemote(remotePath, newName)
+        guard confirmImportantServerAction(
+            connection: connection,
+            action: "move the remote item",
+            remotePath: "\(item.path) -> \(newPath)",
+            confirmation: "MOVE"
+        ) else { return }
         let credential = credentialForCurrentTab().clone()
         runBusy("Moving remote item") {
             try await self.sftp.rename(connection: connection, credential: credential, from: item.path, to: newPath)
@@ -3052,13 +3158,22 @@ final class AppModel: ObservableObject {
 
     func deleteRemoteSelected() {
         guard let connection = selectedConnection, let item = selectedRemote else { return }
-        let alert = NSAlert()
-        alert.messageText = "Delete \"\(item.name)\"?"
-        alert.informativeText = "This remote item will be permanently deleted."
-        alert.alertStyle = .warning
-        alert.addButton(withTitle: "Delete")
-        alert.addButton(withTitle: "Cancel")
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        if connection.requiresImportantServerGuards {
+            guard confirmImportantServerAction(
+                connection: connection,
+                action: "permanently delete the remote item",
+                remotePath: item.path,
+                confirmation: "DELETE"
+            ) else { return }
+        } else {
+            let alert = NSAlert()
+            alert.messageText = "Delete \"\(item.name)\"?"
+            alert.informativeText = "This remote item will be permanently deleted."
+            alert.alertStyle = .warning
+            alert.addButton(withTitle: "Delete")
+            alert.addButton(withTitle: "Cancel")
+            guard alert.runModal() == .alertFirstButtonReturn else { return }
+        }
         let credential = credentialForCurrentTab().clone()
         runBusy("Deleting remote item") {
             try await self.sftp.remove(connection: connection, credential: credential, path: item.path, isDirectory: item.isDirectory)
@@ -3103,6 +3218,12 @@ final class AppModel: ObservableObject {
         let newName = prompt("Rename Remote Item", defaultValue: item.name, actionTitle: "Rename")
         guard !newName.isEmpty, newName != item.name else { return }
         let destination = remoteParentPath(item.path).map { joinRemote($0, newName) } ?? joinRemote(remotePath, newName)
+        guard confirmImportantServerAction(
+            connection: connection,
+            action: "rename the remote item",
+            remotePath: "\(item.path) -> \(destination)",
+            confirmation: "RENAME"
+        ) else { return }
         let credential = credentialForCurrentTab().clone()
         runBusy("Renaming remote item") {
             try await self.sftp.rename(connection: connection, credential: credential, from: item.path, to: destination)
@@ -3473,6 +3594,58 @@ final class AppModel: ObservableObject {
         return alert.runModal() == .alertFirstButtonReturn ? input.stringValue.trimmingCharacters(in: .whitespacesAndNewlines) : ""
     }
 
+    private func confirmImportantServerAction(
+        connection: SavedConnection,
+        action: String,
+        remotePath: String,
+        confirmation: String
+    ) -> Bool {
+        guard connection.requiresImportantServerGuards else { return true }
+
+        let alert = NSAlert()
+        alert.messageText = "Confirm Important Server action"
+        alert.informativeText = """
+        You are about to \(action).
+
+        \(remoteActionContext(connection: connection, remotePath: remotePath))
+
+        Type \(confirmation) to continue.
+        """
+        alert.alertStyle = .critical
+        alert.addButton(withTitle: "Confirm")
+        alert.addButton(withTitle: "Cancel")
+
+        let input = NSTextField(frame: NSRect(x: 0, y: 0, width: 320, height: 24))
+        input.placeholderString = confirmation
+        alert.accessoryView = input
+
+        guard alert.runModal() == .alertFirstButtonReturn,
+              input.stringValue.trimmingCharacters(in: .whitespacesAndNewlines) == confirmation
+        else {
+            status = "Important Server action cancelled"
+            return false
+        }
+        return true
+    }
+
+    private func confirmImportantServerPasswordUse(connection: SavedConnection) -> Bool {
+        let alert = NSAlert()
+        alert.messageText = "Use password authentication for Important Server?"
+        alert.informativeText = """
+        \(remoteActionContext(connection: connection, remotePath: connection.remotePath))
+
+        SSH key or ssh-agent authentication is recommended for long-lived server access. Password SFTP is allowed, but keep this connection limited and verify the host key fingerprint out of band.
+        """
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Continue")
+        alert.addButton(withTitle: "Cancel")
+        return alert.runModal() == .alertFirstButtonReturn
+    }
+
+    private func remoteActionContext(connection: SavedConnection, remotePath: String) -> String {
+        "Server: \(connection.username)@\(connection.host):\(connection.port)\nRemote path: \(remotePath)"
+    }
+
     private func remoteParentPath(_ path: String) -> String? {
         let parent = URL(fileURLWithPath: path).deletingLastPathComponent().path
         return parent.isEmpty ? "/" : parent
@@ -3508,7 +3681,18 @@ final class AppModel: ObservableObject {
         if !(1...65_535).contains(connection.port) {
             return "SSH port must be between 1 and 65535."
         }
+        if connection.requiresImportantServerGuards,
+           username == "root",
+           !connection.allowRootLoginOnImportantServer {
+            return "Important Server blocks root login unless the explicit root override is enabled."
+        }
         return nil
+    }
+
+    private func shouldWarnAboutImportantServerPassword(_ connection: SavedConnection, password: String) -> Bool {
+        connection.requiresImportantServerGuards
+            && connection.privateKeyPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && !password.trimmingCharacters(in: .newlines).isEmpty
     }
 
     private func credentialForCurrentTab() -> SensitiveCredential {
@@ -4393,6 +4577,25 @@ struct ConnectionEditor: View {
                 .frame(maxWidth: .infinity)
                 Spacer(minLength: 0)
             }
+
+            HStack(spacing: 12) {
+                Text("Safety")
+                    .foregroundStyle(.secondary)
+                    .frame(minWidth: 120, alignment: .leading)
+                Picker("Safety", selection: $model.connectionDraft.safetyProfile) {
+                    ForEach(ConnectionSafetyProfile.allCases) { profile in
+                        Text(profile.title).tag(profile)
+                    }
+                }
+                .labelsHidden()
+                .pickerStyle(.segmented)
+                .frame(width: 260)
+                if model.connectionDraft.requiresImportantServerGuards {
+                    Toggle("Allow root login", isOn: $model.connectionDraft.allowRootLoginOnImportantServer)
+                        .toggleStyle(.checkbox)
+                }
+                Spacer(minLength: 0)
+            }
         }
         .padding(12)
         .onDisappear {
@@ -4413,6 +4616,13 @@ struct PasswordPromptView: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
+            if model.connectionDraft.requiresImportantServerGuards,
+               model.connectionDraft.privateKeyPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                Text("Important Server: SSH key or ssh-agent authentication is recommended.")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
             SecurePasswordField(controller: passwordController, placeholder: "Password") { password in
                 model.connectWithPassword(password)
             }
