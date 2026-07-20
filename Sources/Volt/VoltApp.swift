@@ -14,6 +14,21 @@ private func decodeCError(_ buffer: [CChar]) -> String {
     return String(decoding: bytes, as: UTF8.self)
 }
 
+private enum WorkspaceFileOpener {
+    static func open(_ fileURL: URL, with appURL: URL?, onError: @escaping (String) -> Void) {
+        if let appURL {
+            let configuration = NSWorkspace.OpenConfiguration()
+            NSWorkspace.shared.open([fileURL], withApplicationAt: appURL, configuration: configuration) { _, error in
+                if let error {
+                    onError(error.localizedDescription)
+                }
+            }
+        } else {
+            NSWorkspace.shared.open(fileURL)
+        }
+    }
+}
+
 enum ProtocolKind: String, Codable, CaseIterable, Identifiable {
     case sftp = "SFTP"
 
@@ -1761,7 +1776,7 @@ final class AppModel: ObservableObject {
             if let index = tabs.firstIndex(where: { $0.id == tabID }) {
                 cleanupEditSessions(tabs[index].remoteEditSessions)
                 stopTerminal(for: tabID)
-                resetConnectionState(forTabAt: index, showEditor: tabID == selectedTabID)
+                resetConnectionState(forTabAt: index)
             }
             tabCredentials.removeValue(forKey: tabID)?.clear()
         }
@@ -3316,17 +3331,10 @@ final class AppModel: ObservableObject {
     }
 
     private func openFile(_ fileURL: URL, with appURL: URL?) {
-        if let appURL {
-            let configuration = NSWorkspace.OpenConfiguration()
-            NSWorkspace.shared.open([fileURL], withApplicationAt: appURL, configuration: configuration) { _, error in
-                if let error {
-                    Task { @MainActor in
-                        self.status = error.localizedDescription
-                    }
-                }
+        WorkspaceFileOpener.open(fileURL, with: appURL) { [weak self] message in
+            Task { @MainActor [weak self] in
+                self?.status = message
             }
-        } else {
-            NSWorkspace.shared.open(fileURL)
         }
     }
 
@@ -3739,7 +3747,7 @@ final class AppModel: ObservableObject {
         selectTab(tab.id)
     }
 
-    private func resetConnectionState(forTabAt index: Int, showEditor: Bool) {
+    private func resetConnectionState(forTabAt index: Int) {
         tabs[index].connectionID = nil
         tabs[index].connectionDraft = SavedConnection()
         tabs[index].remotePath = "/"
@@ -3749,7 +3757,7 @@ final class AppModel: ObservableObject {
         tabs[index].terminalOutput = ""
         tabs[index].terminalStatus = .idle
         tabs[index].isConnected = false
-        tabs[index].showsConnectionEditor = showEditor
+        tabs[index].showsConnectionEditor = false
         tabs[index].title = tabTitle(forLocalPath: tabs[index].localPath)
     }
 
