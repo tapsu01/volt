@@ -15,12 +15,15 @@ private func decodeCError(_ buffer: [CChar]) -> String {
 }
 
 private enum WorkspaceFileOpener {
-    static func open(_ fileURL: URL, with appURL: URL?, onError: @escaping (String) -> Void) {
+    static func open(_ fileURL: URL, with appURL: URL?, onError: @escaping @Sendable @MainActor (String) -> Void) {
         if let appURL {
             let configuration = NSWorkspace.OpenConfiguration()
             NSWorkspace.shared.open([fileURL], withApplicationAt: appURL, configuration: configuration) { _, error in
                 if let error {
-                    onError(error.localizedDescription)
+                    let message = error.localizedDescription
+                    Task { @MainActor in
+                        onError(message)
+                    }
                 }
             }
         } else {
@@ -3332,9 +3335,7 @@ final class AppModel: ObservableObject {
 
     private func openFile(_ fileURL: URL, with appURL: URL?) {
         WorkspaceFileOpener.open(fileURL, with: appURL) { [weak self] message in
-            Task { @MainActor [weak self] in
-                self?.status = message
-            }
+            self?.status = message
         }
     }
 
