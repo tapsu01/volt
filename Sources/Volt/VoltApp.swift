@@ -6076,13 +6076,22 @@ private struct FileThumbnailView: View {
                 image = cachedImage
                 return
             }
-            let request = QLThumbnailGenerator.Request(fileAt: URL(fileURLWithPath: item.path), size: CGSize(width: 256, height: 192), scale: NSScreen.main?.backingScaleFactor ?? 2, representationTypes: .thumbnail)
-            let generatedImage: NSImage? = await withCheckedContinuation { continuation in
+            let thumbnailSize = CGSize(width: 256, height: 192)
+            let thumbnailScale = NSScreen.main?.backingScaleFactor ?? 2
+            let request = QLThumbnailGenerator.Request(fileAt: URL(fileURLWithPath: item.path), size: thumbnailSize, scale: thumbnailScale, representationTypes: .thumbnail)
+            let generatedCGImage: CGImage? = await withCheckedContinuation { continuation in
                 QLThumbnailGenerator.shared.generateBestRepresentation(for: request) { representation, _ in
-                    continuation.resume(returning: representation?.nsImage)
+                    continuation.resume(returning: representation?.cgImage)
                 }
             }
-            guard !Task.isCancelled, let generatedImage else { return }
+            guard !Task.isCancelled, let generatedCGImage else { return }
+            let generatedImage = NSImage(
+                cgImage: generatedCGImage,
+                size: NSSize(
+                    width: CGFloat(generatedCGImage.width) / thumbnailScale,
+                    height: CGFloat(generatedCGImage.height) / thumbnailScale
+                )
+            )
             ThumbnailCache.shared.insert(generatedImage, forKey: cacheKey)
             image = generatedImage
         }
