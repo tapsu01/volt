@@ -33,6 +33,8 @@ typedef struct VoltSFTPDownloadResult {
     char error[4096];
 } VoltSFTPDownloadResult;
 
+typedef struct VoltSessionHandle VoltSessionHandle;
+
 #define VOLT_HOSTKEY_MATCH 0
 #define VOLT_HOSTKEY_UNKNOWN 1
 #define VOLT_HOSTKEY_MISMATCH 2
@@ -47,6 +49,15 @@ void volt_secure_zero(void *buffer, size_t length);
 int volt_publish_download(const char *temporary_path, const char *destination_path, int overwrite);
 
 int volt_is_safe_entry_name(const char *name, size_t len);
+
+int volt_session_open(const char *host, int port, const char *username, const char *password, const char *private_key_path, const char *known_hosts_path, VoltSessionHandle **out, char *error, size_t error_len);
+void volt_session_close(VoltSessionHandle *handle);
+
+int volt_sftp_list_on(VoltSessionHandle *handle, const char *remote_path, VoltSFTPItem **items, int *count, int *skipped_unsafe_count, char *error, size_t error_len);
+int volt_sftp_mkdir_on(VoltSessionHandle *handle, const char *remote_path, uint32_t mode, char *error, size_t error_len);
+int volt_sftp_create_empty_file_on(VoltSessionHandle *handle, const char *remote_path, uint32_t mode, char *error, size_t error_len);
+int volt_sftp_rename_on(VoltSessionHandle *handle, const char *from_path, const char *to_path, char *error, size_t error_len);
+int volt_sftp_remove_on(VoltSessionHandle *handle, const char *remote_path, int is_directory, char *error, size_t error_len);
 
 int volt_sftp_list(const char *host, int port, const char *username, const char *password, const char *private_key_path, const char *known_hosts_path, const char *remote_path, VoltSFTPItem **items, int *count, int *skipped_unsafe_count, char *error, size_t error_len);
 int volt_sftp_upload(const char *host, int port, const char *username, const char *password, const char *private_key_path, const char *known_hosts_path, const char *local_path, const char *remote_path, uint32_t mode, int overwrite, VoltSFTPProgressCallback progress, void *progress_context, char *error, size_t error_len);

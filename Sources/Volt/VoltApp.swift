@@ -160,7 +160,7 @@ struct FileItem: Identifiable, Hashable, Sendable {
     }
 }
 
-private func loadLocalDirectoryItems(atPath path: String) throws -> [FileItem] {
+private func loadLocalDirectoryItems(atPath path: String, includeOwnerGroupPermissions: Bool) throws -> [FileItem] {
     let url = URL(fileURLWithPath: path)
     let keys: Set<URLResourceKey> = [
         .isDirectoryKey,
@@ -172,7 +172,9 @@ private func loadLocalDirectoryItems(atPath path: String) throws -> [FileItem] {
     return try FileManager.default.contentsOfDirectory(at: url, includingPropertiesForKeys: Array(keys), options: [])
         .map { fileURL in
             let values = try fileURL.resourceValues(forKeys: keys)
-            let attributes = try? FileManager.default.attributesOfItem(atPath: fileURL.path)
+            let attributes = includeOwnerGroupPermissions
+                ? try? FileManager.default.attributesOfItem(atPath: fileURL.path)
+                : nil
             let isDirectory = values.isDirectory == true
             return FileItem(
                 name: fileURL.lastPathComponent,
@@ -803,6 +805,12 @@ final class SensitiveCredential: @unchecked Sendable {
         return copy
     }
 
+    func fingerprint() -> Data {
+        lock.lock()
+        defer { lock.unlock() }
+        return Data(SHA256.hash(data: Data(bytes)))
+    }
+
     func clear() {
         lock.lock()
         zeroizeLocked()
@@ -1054,7 +1062,102 @@ enum AppPaths {
     }
 }
 
+private struct SFTPConnectionPoolKey: Hashable, Sendable {
+    var connectionID: UUID
+    var host: String
+    var port: Int
+    var username: String
+    var privateKeyPath: String
+    var passwordFingerprint: Data
+}
+
+private final class PooledSFTPSession: @unchecked Sendable {
+    private var pointer: OpaquePointer?
+
+    init(_ pointer: OpaquePointer) {
+        self.pointer = pointer
+    }
+
+    var handle: OpaquePointer? {
+        pointer
+    }
+
+    func close() {
+        if let pointer {
+            volt_session_close(pointer)
+            self.pointer = nil
+        }
+    }
+
+    deinit {
+        close()
+    }
+}
+
+private actor SFTPConnectionPool {
+    private var sessions: [SFTPConnectionPoolKey: PooledSFTPSession] = [:]
+
+    func call(
+        key: SFTPConnectionPoolKey,
+        openSession: @Sendable (UnsafeMutablePointer<CChar>, Int) throws -> PooledSFTPSession,
+        operation: @Sendable (OpaquePointer, UnsafeMutablePointer<CChar>, Int) -> Int32
+    ) async throws -> String? {
+        var error = [CChar](repeating: 0, count: 4096)
+        let errorLength = error.count
+
+        let session: PooledSFTPSession
+        if let existingSession = sessions[key], existingSession.handle != nil {
+            session = existingSession
+        } else {
+            session = try error.withUnsafeMutableBufferPointer { errorBuffer in
+                try openSession(errorBuffer.baseAddress!, errorLength)
+            }
+            sessions[key] = session
+        }
+
+        guard let handle = session.handle else {
+            sessions.removeValue(forKey: key)
+            throw AppError.commandFailed("SFTP session is not open.")
+        }
+
+        let status = error.withUnsafeMutableBufferPointer { errorBuffer in
+            operation(handle, errorBuffer.baseAddress!, errorLength)
+        }
+        let message = error.withUnsafeBufferPointer { buffer in
+            String(cString: buffer.baseAddress!)
+        }
+        guard status >= 0 else {
+            sessions.removeValue(forKey: key)
+            session.close()
+            throw AppError.commandFailed(message)
+        }
+        return status == VOLT_SFTP_PERMISSION_WARNING ? message : nil
+    }
+
+    func closeSessions(for connectionID: UUID) {
+        let keys = sessions.keys.filter { $0.connectionID == connectionID }
+        for key in keys {
+            sessions.removeValue(forKey: key)?.close()
+        }
+    }
+
+    func closeAll() {
+        for session in sessions.values {
+            session.close()
+        }
+        sessions.removeAll()
+    }
+}
+
+private final class SFTPListOutput: @unchecked Sendable {
+    var items: UnsafeMutablePointer<VoltSFTPItem>?
+    var count: Int32 = 0
+    var skippedUnsafe: Int32 = 0
+}
+
 final class SFTPClient: @unchecked Sendable {
+    private let pool = SFTPConnectionPool()
+
     func probeHostKey(connection: SavedConnection) async throws -> HostKeyProbe {
         try await Task.detached {
             var keyPointer: UnsafeMutablePointer<UInt8>?
@@ -1122,23 +1225,23 @@ final class SFTPClient: @unchecked Sendable {
 
     func list(connection: SavedConnection, credential: SensitiveCredential, path: String) async throws -> RemoteListingResult {
         try await Task.detached {
-            var items: UnsafeMutablePointer<VoltSFTPItem>?
-            var count: Int32 = 0
-            var skippedUnsafe: Int32 = 0
-            _ = try self.call(connection: connection, credential: credential) { host, port, username, password, keyPath, knownHostsPath, error, errorLength in
-                volt_sftp_list(host, port, username, password, keyPath, knownHostsPath, path, &items, &count, &skippedUnsafe, error, errorLength)
+            let output = SFTPListOutput()
+            _ = try await self.callOnPooledSession(connection: connection, credential: credential) { handle, error, errorLength in
+                path.withCString { remotePath in
+                    volt_sftp_list_on(handle, remotePath, &output.items, &output.count, &output.skippedUnsafe, error, errorLength)
+                }
             }
             defer {
-                if let items {
+                if let items = output.items {
                     volt_sftp_free_items(items)
                 }
             }
-            guard let items else {
-                return RemoteListingResult(items: [], skippedUnsafeCount: Int(skippedUnsafe))
+            guard let items = output.items else {
+                return RemoteListingResult(items: [], skippedUnsafeCount: Int(output.skippedUnsafe))
             }
             var parsed: [FileItem] = []
             var swiftSkipped = 0
-            for index in 0..<Int(count) {
+            for index in 0..<Int(output.count) {
                 // Một guard chung cho cả name và path: chỉ đếm MỘT lần mỗi entry, và loại bỏ triệt để
                 // bytes không phải UTF-8 hợp lệ (String(cString:) sẽ thay thế lossy bằng U+FFFD, khiến
                 // path re-encode không còn trỏ đúng entry gốc).
@@ -1169,7 +1272,7 @@ final class SFTPClient: @unchecked Sendable {
                 if lhs.isDirectory != rhs.isDirectory { return lhs.isDirectory }
                 return lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
             }
-            return RemoteListingResult(items: parsed, skippedUnsafeCount: Int(skippedUnsafe) + swiftSkipped)
+            return RemoteListingResult(items: parsed, skippedUnsafeCount: Int(output.skippedUnsafe) + swiftSkipped)
         }.value
     }
 
@@ -1288,34 +1391,52 @@ final class SFTPClient: @unchecked Sendable {
 
     func makeDirectory(connection: SavedConnection, credential: SensitiveCredential, path: String) async throws -> String? {
         try await Task.detached {
-            try self.call(connection: connection, credential: credential) { host, port, username, password, keyPath, knownHostsPath, error, errorLength in
-                volt_sftp_mkdir(host, port, username, password, keyPath, knownHostsPath, path, connection.effectivePermissionPreset.folderMode, error, errorLength)
+            try await self.callOnPooledSession(connection: connection, credential: credential) { handle, error, errorLength in
+                path.withCString { remotePath in
+                    volt_sftp_mkdir_on(handle, remotePath, connection.effectivePermissionPreset.folderMode, error, errorLength)
+                }
             }
         }.value
     }
 
     func createFile(connection: SavedConnection, credential: SensitiveCredential, remotePath: String) async throws -> String? {
         try await Task.detached {
-            try self.call(connection: connection, credential: credential) { host, port, username, password, keyPath, knownHostsPath, error, errorLength in
-                volt_sftp_create_empty_file(host, port, username, password, keyPath, knownHostsPath, remotePath, connection.effectivePermissionPreset.fileMode, error, errorLength)
+            try await self.callOnPooledSession(connection: connection, credential: credential) { handle, error, errorLength in
+                remotePath.withCString { remotePathPointer in
+                    volt_sftp_create_empty_file_on(handle, remotePathPointer, connection.effectivePermissionPreset.fileMode, error, errorLength)
+                }
             }
         }.value
     }
 
     func rename(connection: SavedConnection, credential: SensitiveCredential, from: String, to: String) async throws {
         try await Task.detached {
-            _ = try self.call(connection: connection, credential: credential) { host, port, username, password, keyPath, knownHostsPath, error, errorLength in
-                volt_sftp_rename(host, port, username, password, keyPath, knownHostsPath, from, to, error, errorLength)
+            _ = try await self.callOnPooledSession(connection: connection, credential: credential) { handle, error, errorLength in
+                from.withCString { fromPath in
+                    to.withCString { toPath in
+                        volt_sftp_rename_on(handle, fromPath, toPath, error, errorLength)
+                    }
+                }
             }
         }.value
     }
 
     func remove(connection: SavedConnection, credential: SensitiveCredential, path: String, isDirectory: Bool) async throws {
         try await Task.detached {
-            _ = try self.call(connection: connection, credential: credential) { host, port, username, password, keyPath, knownHostsPath, error, errorLength in
-                volt_sftp_remove(host, port, username, password, keyPath, knownHostsPath, path, isDirectory ? 1 : 0, error, errorLength)
+            _ = try await self.callOnPooledSession(connection: connection, credential: credential) { handle, error, errorLength in
+                path.withCString { remotePath in
+                    volt_sftp_remove_on(handle, remotePath, isDirectory ? 1 : 0, error, errorLength)
+                }
             }
         }.value
+    }
+
+    func closePooledSessions(for connectionID: UUID) async {
+        await pool.closeSessions(for: connectionID)
+    }
+
+    func closeAllPooledSessions() async {
+        await pool.closeAll()
     }
 
     static func controlSocketDir() throws -> String {
@@ -1376,6 +1497,62 @@ final class SFTPClient: @unchecked Sendable {
         }
         return status == VOLT_SFTP_PERMISSION_WARNING ? message : nil
     }
+
+    private func callOnPooledSession(
+        connection: SavedConnection,
+        credential: SensitiveCredential,
+        _ body: @escaping @Sendable (OpaquePointer, UnsafeMutablePointer<CChar>, Int) -> Int32
+    ) async throws -> String? {
+        var bookmarkIsStale = false
+        let bookmarkedKeyURL = connection.privateKeyBookmark.flatMap {
+            try? URL(
+                resolvingBookmarkData: $0,
+                options: [.withSecurityScope, .withoutUI],
+                relativeTo: nil,
+                bookmarkDataIsStale: &bookmarkIsStale
+            )
+        }
+        let isAccessingKey = bookmarkedKeyURL?.startAccessingSecurityScopedResource() == true
+        defer {
+            if isAccessingKey { bookmarkedKeyURL?.stopAccessingSecurityScopedResource() }
+        }
+        let keyPath = (bookmarkedKeyURL?.path ?? connection.privateKeyPath).trimmingCharacters(in: .whitespacesAndNewlines)
+        let knownHostsPath = try AppPaths.knownHostsURL().path
+        let poolKey = SFTPConnectionPoolKey(
+            connectionID: connection.id,
+            host: connection.host,
+            port: connection.port,
+            username: connection.username,
+            privateKeyPath: keyPath,
+            passwordFingerprint: credential.fingerprint()
+        )
+
+        return try await pool.call(
+            key: poolKey,
+            openSession: { errorPointer, errorLength in
+                var handle: OpaquePointer?
+                let status = credential.withCString { passwordPointer in
+                    connection.host.withCString { host in
+                        connection.username.withCString { username in
+                            knownHostsPath.withCString { knownHostsPointer in
+                                if keyPath.isEmpty {
+                                    return volt_session_open(host, Int32(connection.port), username, passwordPointer, nil, knownHostsPointer, &handle, errorPointer, errorLength)
+                                }
+                                return keyPath.withCString { keyPointer in
+                                    volt_session_open(host, Int32(connection.port), username, passwordPointer, keyPointer, knownHostsPointer, &handle, errorPointer, errorLength)
+                                }
+                            }
+                        }
+                    }
+                }
+                guard status == 0, let handle else {
+                    throw AppError.commandFailed(String(cString: errorPointer))
+                }
+                return PooledSFTPSession(handle)
+            },
+            operation: body
+        )
+    }
 }
 
 @MainActor
@@ -1393,7 +1570,14 @@ final class AppModel: ObservableObject {
     @Published var selectedLocalIDs: Set<FileItem.ID> = []
     @Published var selectedRemoteIDs: Set<FileItem.ID> = []
     @Published var localBrowserPreferences = FileBrowserPreferences.load(key: "Volt.LocalBrowserPreferences") {
-        didSet { localBrowserPreferences.save(key: "Volt.LocalBrowserPreferences") }
+        didSet {
+            let oldNeedsMetadata = Self.needsLocalOwnerGroupPermissions(for: oldValue)
+            let newNeedsMetadata = Self.needsLocalOwnerGroupPermissions(for: localBrowserPreferences)
+            localBrowserPreferences.save(key: "Volt.LocalBrowserPreferences")
+            if oldNeedsMetadata != newNeedsMetadata {
+                refreshLocal()
+            }
+        }
     }
     @Published var remoteBrowserPreferences = FileBrowserPreferences.load(key: "Volt.RemoteBrowserPreferences") {
         didSet { remoteBrowserPreferences.save(key: "Volt.RemoteBrowserPreferences") }
@@ -1417,7 +1601,7 @@ final class AppModel: ObservableObject {
     private var hostKeyConfirmationContinuation: CheckedContinuation<Bool, Never>?
     private var tabCredentials: [BrowserTab.ID: SensitiveCredential] = [:]
     private var terminalSessions: [BrowserTab.ID: SSHTerminalSession] = [:]
-    private var verifiedHosts: Set<String> = []
+    private var verifiedHostProbes: [String: HostKeyProbe] = [:]
     private var remoteDirectoryCache: [String: RemoteDirectoryCacheEntry] = [:]
 
     private let sftp = SFTPClient()
@@ -1438,12 +1622,9 @@ final class AppModel: ObservableObject {
 
     init() {
         selectedTabID = tabs.first?.id
-        AppPaths.migrateFromSandboxContainerIfNeeded()
-        SecureStorage.migrateFromUserDefaults()
-        AppPaths.cleanupEditFiles(olderThan: 0)
-        loadConnections()
         refreshLocal()
         syncCurrentTab()
+        loadStartupStorage()
     }
 
     var selectedConnection: SavedConnection? {
@@ -1706,10 +1887,17 @@ final class AppModel: ObservableObject {
             status = validationError
             return
         }
+        let previousConnection = connections.first { $0.id == connectionDraft.id }
         if let index = connections.firstIndex(where: { $0.id == connectionDraft.id }) {
             connections[index] = connectionDraft
         } else {
             connections.append(connectionDraft)
+        }
+        if let previousConnection,
+           hostKeyScopeChanged(from: previousConnection, to: connectionDraft) {
+            verifiedHostProbes.removeValue(forKey: hostKeyVerificationKey(for: previousConnection))
+            verifiedHostProbes.removeValue(forKey: hostKeyVerificationKey(for: connectionDraft))
+            Task { await sftp.closePooledSessions(for: connectionDraft.id) }
         }
         isSuppressingSidebarSelection = true
         selectedConnectionID = connectionDraft.id
@@ -1744,11 +1932,15 @@ final class AppModel: ObservableObject {
         guard confirmDiscardEditSessions(remoteEditSessions, action: "create a new connection") else { return }
         cleanupEditSessions(remoteEditSessions)
         if let selectedTabID { stopTerminal(for: selectedTabID) }
+        let previousConnectionID = selectedConnectionID
         connectionDraft = SavedConnection()
         credentialForCurrentTab().clear()
         selectedConnectionID = nil
         isConnected = false
         showsConnectionEditor = true
+        if let previousConnectionID {
+            Task { await sftp.closePooledSessions(for: previousConnectionID) }
+        }
         showsPasswordPrompt = false
         remoteItems = []
         remoteEditSessions = []
@@ -1787,6 +1979,7 @@ final class AppModel: ObservableObject {
         if let selectedTabID, targetTabIDs.contains(selectedTabID) {
             restoreCurrentTab()
         }
+        Task { await sftp.closePooledSessions(for: targetConnectionID) }
         showsPasswordPrompt = false
         status = "Disconnected"
     }
@@ -1831,6 +2024,10 @@ final class AppModel: ObservableObject {
             remoteEditSessions = []
         }
         connections.removeAll { $0.id == id }
+        verifiedHostProbes = verifiedHostProbes.filter { key, _ in
+            !key.hasPrefix("\(id.uuidString):")
+        }
+        Task { await sftp.closePooledSessions(for: id) }
         disconnectConnection(id: id)
         saveConnections()
         status = "Connection removed"
@@ -1838,10 +2035,14 @@ final class AppModel: ObservableObject {
 
     func refreshLocal() {
         let path = localPath
+        let includeOwnerGroupPermissions = Self.needsLocalOwnerGroupPermissions(for: localBrowserPreferences)
         Task {
             do {
                 let items = try await Task.detached(priority: .userInitiated) {
-                    try loadLocalDirectoryItems(atPath: path)
+                    try loadLocalDirectoryItems(
+                        atPath: path,
+                        includeOwnerGroupPermissions: includeOwnerGroupPermissions
+                    )
                 }.value
                 guard self.localPath == path else { return }
                 self.localItems = items
@@ -3586,6 +3787,7 @@ final class AppModel: ObservableObject {
         for control in transferControls.values { control.cancel() }
         for session in terminalSessions.values { session.terminate() }
         terminalSessions.removeAll()
+        Task { await sftp.closeAllPooledSessions() }
         for credential in tabCredentials.values { credential.clear() }
         tabCredentials.removeAll()
         cleanupEditSessions(tabs.flatMap(\.remoteEditSessions) + remoteEditSessions)
@@ -3664,6 +3866,18 @@ final class AppModel: ObservableObject {
         connections = SecureStorage.load()
     }
 
+    private func loadStartupStorage() {
+        Task {
+            let loadedConnections = await Task.detached(priority: .utility) {
+                AppPaths.migrateFromSandboxContainerIfNeeded()
+                SecureStorage.migrateFromUserDefaults()
+                AppPaths.cleanupEditFiles(olderThan: 0)
+                return SecureStorage.load()
+            }.value
+            connections = loadedConnections
+        }
+    }
+
     private func saveConnections() {
         SecureStorage.save(connections)
     }
@@ -3672,6 +3886,25 @@ final class AppModel: ObservableObject {
         if recentsCleared {
             recentsCleared = false
         }
+    }
+
+    private static func needsLocalOwnerGroupPermissions(for preferences: FileBrowserPreferences) -> Bool {
+        preferences.visibleColumns.contains { column in
+            column == .owner || column == .group || column == .permissions
+        } || preferences.sortField == .owner
+            || preferences.sortField == .group
+            || preferences.sortField == .permissions
+    }
+
+    private func hostKeyVerificationKey(for connection: SavedConnection) -> String {
+        let host = connection.host
+        let port = connection.port
+        let lookupHost = port == 22 ? host : "[\(host)]:\(port)"
+        return "\(connection.id.uuidString):\(lookupHost)"
+    }
+
+    private func hostKeyScopeChanged(from oldConnection: SavedConnection, to newConnection: SavedConnection) -> Bool {
+        oldConnection.host != newConnection.host || oldConnection.port != newConnection.port
     }
 
     private func shouldPromptForPassword(_ connection: SavedConnection) -> Bool {
@@ -3897,11 +4130,15 @@ final class AppModel: ObservableObject {
         let host = connection.host
         let port = connection.port
         let lookupHost = port == 22 ? host : "[\(host)]:\(port)"
-        let verificationKey = "\(connection.id.uuidString):\(lookupHost)"
+        let verificationKey = hostKeyVerificationKey(for: connection)
+
+        if let cachedProbe = verifiedHostProbes[verificationKey] {
+            return cachedProbe
+        }
 
         let probe = try await sftp.probeHostKey(connection: connection)
         if probe.trustStatus == VOLT_HOSTKEY_MATCH {
-            verifiedHosts.insert(verificationKey)
+            verifiedHostProbes[verificationKey] = probe
             return probe
         }
         if probe.trustStatus == VOLT_HOSTKEY_MISMATCH {
@@ -3922,7 +4159,7 @@ final class AppModel: ObservableObject {
             throw AppError.hostKeyRejected
         }
         try await sftp.commitHostKey(connection: connection, probe: probe)
-        verifiedHosts.insert(verificationKey)
+        verifiedHostProbes[verificationKey] = probe
         return probe
     }
 
@@ -5184,22 +5421,22 @@ struct FilePane<ToolbarContent: View, ContextMenuContent: View, BackgroundContex
     @ViewBuilder var backgroundContextMenu: () -> BackgroundContextMenuContent
     @State private var anchorSelectionID: FileItem.ID?
     @State private var columnResizeDraft: ColumnResizeDraft?
+    @State private var visibleItems: [FileItem] = []
 
     private let listColumnSpacing: CGFloat = 12
     private let listHorizontalInset: CGFloat = 20
     private let listHeaderHeight: CGFloat = 38
     private let listMaximumNameColumnShare: CGFloat = 0.48
 
-    private var displayedItems: [FileItem] {
+    private func recomputeVisibleItems() {
         let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
-        return items
+        visibleItems = items
             .filter { preferences.showHiddenFiles || !$0.isHidden }
             .filter { query.isEmpty || $0.name.localizedCaseInsensitiveContains(query) || $0.path.localizedCaseInsensitiveContains(query) }
             .sorted(by: sortsBefore)
     }
 
     var body: some View {
-        let visibleItems = displayedItems
         VStack(spacing: 0) {
             paneHeader(displayedItems: visibleItems)
 
@@ -5215,6 +5452,10 @@ struct FilePane<ToolbarContent: View, ContextMenuContent: View, BackgroundContex
         }
         .frame(minWidth: 300)
         .background(VoltTheme.paneBackground)
+        .onAppear(perform: recomputeVisibleItems)
+        .onChange(of: items) { _, _ in recomputeVisibleItems() }
+        .onChange(of: preferences) { _, _ in recomputeVisibleItems() }
+        .onChange(of: searchText) { _, _ in recomputeVisibleItems() }
     }
 
     private func paneHeader(displayedItems: [FileItem]) -> some View {
@@ -5736,10 +5977,10 @@ struct FilePane<ToolbarContent: View, ContextMenuContent: View, BackgroundContex
 
     private func select(_ item: FileItem, modifiers: NSEvent.ModifierFlags) {
         if modifiers.contains(.shift), let anchorSelectionID,
-           let anchorIndex = displayedItems.firstIndex(where: { $0.id == anchorSelectionID }),
-           let itemIndex = displayedItems.firstIndex(where: { $0.id == item.id }) {
+           let anchorIndex = visibleItems.firstIndex(where: { $0.id == anchorSelectionID }),
+           let itemIndex = visibleItems.firstIndex(where: { $0.id == item.id }) {
             let bounds = min(anchorIndex, itemIndex)...max(anchorIndex, itemIndex)
-            selection = Set(displayedItems[bounds].map(\.id))
+            selection = Set(visibleItems[bounds].map(\.id))
             return
         }
 
@@ -5788,25 +6029,62 @@ struct FilePane<ToolbarContent: View, ContextMenuContent: View, BackgroundContex
     }
 }
 
+@MainActor
+private final class ThumbnailCache {
+    static let shared = ThumbnailCache()
+
+    private let cache = NSCache<NSString, NSImage>()
+
+    private init() {
+        cache.countLimit = 512
+    }
+
+    func image(forKey key: NSString) -> NSImage? {
+        cache.object(forKey: key)
+    }
+
+    func insert(_ image: NSImage, forKey key: NSString) {
+        cache.setObject(image, forKey: key)
+    }
+
+    func key(for item: FileItem) -> NSString {
+        let modified = item.modified?.timeIntervalSince1970 ?? 0
+        return "\(item.path)|\(modified)" as NSString
+    }
+}
+
 private struct FileThumbnailView: View {
     var item: FileItem
     var isRemote: Bool
     @State private var image: NSImage?
+
+    private var taskID: String {
+        let modified = item.modified?.timeIntervalSince1970 ?? 0
+        return "\(isRemote)|\(item.path)|\(modified)"
+    }
 
     var body: some View {
         Group {
             if let image { Image(nsImage: image).resizable().scaledToFit() }
             else { Image(systemName: item.isDirectory ? "folder.fill" : "doc.fill").resizable().scaledToFit().foregroundStyle(item.isDirectory ? Color.accentColor : Color.secondary).padding(16) }
         }
-        .task(id: item.id) {
+        .task(id: taskID) {
+            image = nil
             guard !isRemote, !item.isDirectory else { return }
+            let cacheKey = ThumbnailCache.shared.key(for: item)
+            if let cachedImage = ThumbnailCache.shared.image(forKey: cacheKey) {
+                image = cachedImage
+                return
+            }
             let request = QLThumbnailGenerator.Request(fileAt: URL(fileURLWithPath: item.path), size: CGSize(width: 256, height: 192), scale: NSScreen.main?.backingScaleFactor ?? 2, representationTypes: .thumbnail)
-            let imageData: Data? = await withCheckedContinuation { continuation in
+            let generatedImage: NSImage? = await withCheckedContinuation { continuation in
                 QLThumbnailGenerator.shared.generateBestRepresentation(for: request) { representation, _ in
-                    continuation.resume(returning: representation?.nsImage.tiffRepresentation)
+                    continuation.resume(returning: representation?.nsImage)
                 }
             }
-            image = imageData.flatMap(NSImage.init(data:))
+            guard !Task.isCancelled, let generatedImage else { return }
+            ThumbnailCache.shared.insert(generatedImage, forKey: cacheKey)
+            image = generatedImage
         }
     }
 }
@@ -5853,34 +6131,14 @@ private struct ColumnResizeHandle: View {
 
 private final class RightClickTrackingView: NSView {
     var onRightClick: (() -> Void)?
-    private var eventMonitor: Any?
 
-    override func viewDidMoveToWindow() {
-        super.viewDidMoveToWindow()
-        removeEventMonitor()
-        guard window != nil else { return }
-
-        eventMonitor = NSEvent.addLocalMonitorForEvents(matching: .rightMouseDown) { [weak self] event in
-            guard let self, event.window === self.window else { return event }
-            let point = self.convert(event.locationInWindow, from: nil)
-            guard self.bounds.contains(point) else { return event }
-            self.onRightClick?()
-            return event
-        }
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
+        true
     }
 
-    override func viewWillMove(toWindow newWindow: NSWindow?) {
-        if newWindow == nil {
-            removeEventMonitor()
-        }
-        super.viewWillMove(toWindow: newWindow)
-    }
-
-    private func removeEventMonitor() {
-        if let eventMonitor {
-            NSEvent.removeMonitor(eventMonitor)
-            self.eventMonitor = nil
-        }
+    override func rightMouseDown(with event: NSEvent) {
+        onRightClick?()
+        super.rightMouseDown(with: event)
     }
 }
 

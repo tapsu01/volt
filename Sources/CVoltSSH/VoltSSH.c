@@ -25,6 +25,10 @@ typedef struct VoltSession {
     LIBSSH2_SFTP *sftp;
 } VoltSession;
 
+struct VoltSessionHandle {
+    VoltSession session;
+};
+
 static pthread_once_t libssh2_once = PTHREAD_ONCE_INIT;
 static pthread_mutex_t known_hosts_mutex = PTHREAD_MUTEX_INITIALIZER;
 static int libssh2_init_result = -1;
@@ -284,6 +288,16 @@ int volt_ssh_probe_host_key(const char *host, int port, const char *known_hosts_
     }
     libssh2_session_set_blocking(session, 1);
     libssh2_session_set_timeout(session, volt_timeout_seconds * 1000L);
+    (void)libssh2_session_method_pref(
+        session,
+        LIBSSH2_METHOD_CRYPT_CS,
+        "aes128-gcm@openssh.com,chacha20-poly1305@openssh.com,aes128-ctr"
+    );
+    (void)libssh2_session_method_pref(
+        session,
+        LIBSSH2_METHOD_CRYPT_SC,
+        "aes128-gcm@openssh.com,chacha20-poly1305@openssh.com,aes128-ctr"
+    );
 
     if (libssh2_session_handshake(session, sock) != 0) {
         set_session_error(session, error, error_len, "SSH host key probe timed out or failed.");
@@ -490,6 +504,16 @@ static int open_session(const char *host, int port, const char *username, const 
     }
     libssh2_session_set_blocking(session, 1);
     libssh2_session_set_timeout(session, volt_timeout_seconds * 1000L);
+    (void)libssh2_session_method_pref(
+        session,
+        LIBSSH2_METHOD_CRYPT_CS,
+        "aes128-gcm@openssh.com,chacha20-poly1305@openssh.com,aes128-ctr"
+    );
+    (void)libssh2_session_method_pref(
+        session,
+        LIBSSH2_METHOD_CRYPT_SC,
+        "aes128-gcm@openssh.com,chacha20-poly1305@openssh.com,aes128-ctr"
+    );
 
     if (libssh2_session_handshake(session, sock) != 0) {
         set_session_error(session, error, error_len, "SSH handshake failed.");
@@ -547,6 +571,32 @@ static void close_session(VoltSession *session) {
     if (session->sock >= 0) close(session->sock);
 }
 
+int volt_session_open(const char *host, int port, const char *username, const char *password, const char *private_key_path, const char *known_hosts_path, VoltSessionHandle **out, char *error, size_t error_len) {
+    if (!out) {
+        set_error(error, error_len, "Missing session handle output.");
+        return -1;
+    }
+    *out = NULL;
+    VoltSessionHandle *handle = calloc(1, sizeof(VoltSessionHandle));
+    if (!handle) {
+        set_error(error, error_len, "Out of memory.");
+        return -1;
+    }
+    if (open_session(host, port, username, password, private_key_path, known_hosts_path, &handle->session, error, error_len) != 0) {
+        free(handle);
+        return -1;
+    }
+    libssh2_keepalive_config(handle->session.session, 1, 30);
+    *out = handle;
+    return 0;
+}
+
+void volt_session_close(VoltSessionHandle *handle) {
+    if (!handle) return;
+    close_session(&handle->session);
+    free(handle);
+}
+
 static void close_parallel_worker_session(VoltSession *session, LIBSSH2_SFTP_HANDLE *file) {
     if (session->session) libssh2_session_set_blocking(session->session, 0);
     if (file) libssh2_sftp_close(file);
@@ -575,17 +625,14 @@ int volt_is_safe_entry_name(const char *name, size_t len) {
     return 1;
 }
 
-int volt_sftp_list(const char *host, int port, const char *username, const char *password, const char *private_key_path, const char *known_hosts_path, const char *remote_path, VoltSFTPItem **items, int *count, int *skipped_unsafe_count, char *error, size_t error_len) {
+static int volt_sftp_list_with_session(VoltSession *session, const char *remote_path, VoltSFTPItem **items, int *count, int *skipped_unsafe_count, char *error, size_t error_len) {
     *items = NULL;
     *count = 0;
     *skipped_unsafe_count = 0;
-    VoltSession session;
-    if (open_session(host, port, username, password, private_key_path, known_hosts_path, &session, error, error_len) != 0) return -1;
 
-    LIBSSH2_SFTP_HANDLE *dir = libssh2_sftp_opendir(session.sftp, remote_path);
+    LIBSSH2_SFTP_HANDLE *dir = libssh2_sftp_opendir(session->sftp, remote_path);
     if (!dir) {
-        set_session_error(session.session, error, error_len, "Could not open remote directory.");
-        close_session(&session);
+        set_session_error(session->session, error, error_len, "Could not open remote directory.");
         return -1;
     }
 
@@ -594,7 +641,6 @@ int volt_sftp_list(const char *host, int port, const char *username, const char 
     VoltSFTPItem *list = calloc((size_t)capacity, sizeof(VoltSFTPItem));
     if (!list) {
         libssh2_sftp_closedir(dir);
-        close_session(&session);
         set_error(error, error_len, "Out of memory.");
         return -1;
     }
@@ -619,7 +665,6 @@ int volt_sftp_list(const char *host, int port, const char *username, const char 
                 if (!grown) {
                     free(list);
                     libssh2_sftp_closedir(dir);
-                    close_session(&session);
                     set_error(error, error_len, "Out of memory.");
                     return -1;
                 }
@@ -630,7 +675,6 @@ int volt_sftp_list(const char *host, int port, const char *username, const char 
             if (join_path(remote_path, name, list[used].path, sizeof(list[used].path)) != 0) {
                 free(list);
                 libssh2_sftp_closedir(dir);
-                close_session(&session);
                 set_error(error, error_len, "Remote path exceeds Volt's safety limit.");
                 return -1;
             }
@@ -646,17 +690,31 @@ int volt_sftp_list(const char *host, int port, const char *username, const char 
         } else {
             free(list);
             libssh2_sftp_closedir(dir);
-            close_session(&session);
             set_error(error, error_len, "Could not read remote directory.");
             return -1;
         }
     }
 
     libssh2_sftp_closedir(dir);
-    close_session(&session);
     *items = list;
     *count = used;
     return 0;
+}
+
+int volt_sftp_list_on(VoltSessionHandle *handle, const char *remote_path, VoltSFTPItem **items, int *count, int *skipped_unsafe_count, char *error, size_t error_len) {
+    if (!handle) {
+        set_error(error, error_len, "SFTP session is not open.");
+        return -1;
+    }
+    return volt_sftp_list_with_session(&handle->session, remote_path, items, count, skipped_unsafe_count, error, error_len);
+}
+
+int volt_sftp_list(const char *host, int port, const char *username, const char *password, const char *private_key_path, const char *known_hosts_path, const char *remote_path, VoltSFTPItem **items, int *count, int *skipped_unsafe_count, char *error, size_t error_len) {
+    VoltSession session;
+    if (open_session(host, port, username, password, private_key_path, known_hosts_path, &session, error, error_len) != 0) return -1;
+    int result = volt_sftp_list_with_session(&session, remote_path, items, count, skipped_unsafe_count, error, error_len);
+    close_session(&session);
+    return result;
 }
 
 int volt_sftp_upload(const char *host, int port, const char *username, const char *password, const char *private_key_path, const char *known_hosts_path, const char *local_path, const char *remote_path, uint32_t mode, int overwrite, VoltSFTPProgressCallback progress, void *progress_context, char *error, size_t error_len) {
@@ -1222,21 +1280,18 @@ const char *volt_sftp_download_result_error(const VoltSFTPDownloadResult *result
     return results[index].error;
 }
 
-int volt_sftp_mkdir(const char *host, int port, const char *username, const char *password, const char *private_key_path, const char *known_hosts_path, const char *remote_path, uint32_t mode, char *error, size_t error_len) {
-    VoltSession session;
-    if (open_session(host, port, username, password, private_key_path, known_hosts_path, &session, error, error_len) != 0) return -1;
+static int volt_sftp_mkdir_with_session(VoltSession *session, const char *remote_path, uint32_t mode, char *error, size_t error_len) {
     mode_t safe_mode = (mode_t)(mode & 0777U);
-    int rc = libssh2_sftp_mkdir(session.sftp, remote_path, safe_mode);
-    if (rc != 0) set_session_error(session.session, error, error_len, "Could not create remote directory.");
+    int rc = libssh2_sftp_mkdir(session->sftp, remote_path, safe_mode);
+    if (rc != 0) set_session_error(session->session, error, error_len, "Could not create remote directory.");
     int permission_result = 0;
     if (rc == 0) {
         LIBSSH2_SFTP_ATTRIBUTES attrs;
         memset(&attrs, 0, sizeof(attrs));
         attrs.flags = LIBSSH2_SFTP_ATTR_PERMISSIONS;
         attrs.permissions = safe_mode;
-        permission_result = libssh2_sftp_setstat(session.sftp, remote_path, &attrs);
+        permission_result = libssh2_sftp_setstat(session->sftp, remote_path, &attrs);
     }
-    close_session(&session);
     if (rc != 0) return -1;
     if (permission_result != 0) {
         set_error(error, error_len, "Folder created, but could not apply requested permissions.");
@@ -1245,14 +1300,27 @@ int volt_sftp_mkdir(const char *host, int port, const char *username, const char
     return 0;
 }
 
-int volt_sftp_create_empty_file(const char *host, int port, const char *username, const char *password, const char *private_key_path, const char *known_hosts_path, const char *remote_path, uint32_t mode, char *error, size_t error_len) {
+int volt_sftp_mkdir_on(VoltSessionHandle *handle, const char *remote_path, uint32_t mode, char *error, size_t error_len) {
+    if (!handle) {
+        set_error(error, error_len, "SFTP session is not open.");
+        return -1;
+    }
+    return volt_sftp_mkdir_with_session(&handle->session, remote_path, mode, error, error_len);
+}
+
+int volt_sftp_mkdir(const char *host, int port, const char *username, const char *password, const char *private_key_path, const char *known_hosts_path, const char *remote_path, uint32_t mode, char *error, size_t error_len) {
     VoltSession session;
     if (open_session(host, port, username, password, private_key_path, known_hosts_path, &session, error, error_len) != 0) return -1;
+    int result = volt_sftp_mkdir_with_session(&session, remote_path, mode, error, error_len);
+    close_session(&session);
+    return result;
+}
+
+static int volt_sftp_create_empty_file_with_session(VoltSession *session, const char *remote_path, uint32_t mode, char *error, size_t error_len) {
     mode_t safe_mode = (mode_t)(mode & 0777U);
-    LIBSSH2_SFTP_HANDLE *file = libssh2_sftp_open(session.sftp, remote_path, LIBSSH2_FXF_WRITE | LIBSSH2_FXF_CREAT | LIBSSH2_FXF_TRUNC, safe_mode);
+    LIBSSH2_SFTP_HANDLE *file = libssh2_sftp_open(session->sftp, remote_path, LIBSSH2_FXF_WRITE | LIBSSH2_FXF_CREAT | LIBSSH2_FXF_TRUNC, safe_mode);
     if (!file) {
-        set_session_error(session.session, error, error_len, "Could not create remote file.");
-        close_session(&session);
+        set_session_error(session->session, error, error_len, "Could not create remote file.");
         return -1;
     }
     LIBSSH2_SFTP_ATTRIBUTES attrs;
@@ -1261,7 +1329,6 @@ int volt_sftp_create_empty_file(const char *host, int port, const char *username
     attrs.permissions = safe_mode;
     int permission_result = libssh2_sftp_fsetstat(file, &attrs);
     libssh2_sftp_close(file);
-    close_session(&session);
     if (permission_result != 0) {
         set_error(error, error_len, "File created, but could not apply requested permissions.");
         return VOLT_SFTP_PERMISSION_WARNING;
@@ -1269,22 +1336,64 @@ int volt_sftp_create_empty_file(const char *host, int port, const char *username
     return 0;
 }
 
+int volt_sftp_create_empty_file_on(VoltSessionHandle *handle, const char *remote_path, uint32_t mode, char *error, size_t error_len) {
+    if (!handle) {
+        set_error(error, error_len, "SFTP session is not open.");
+        return -1;
+    }
+    return volt_sftp_create_empty_file_with_session(&handle->session, remote_path, mode, error, error_len);
+}
+
+int volt_sftp_create_empty_file(const char *host, int port, const char *username, const char *password, const char *private_key_path, const char *known_hosts_path, const char *remote_path, uint32_t mode, char *error, size_t error_len) {
+    VoltSession session;
+    if (open_session(host, port, username, password, private_key_path, known_hosts_path, &session, error, error_len) != 0) return -1;
+    int result = volt_sftp_create_empty_file_with_session(&session, remote_path, mode, error, error_len);
+    close_session(&session);
+    return result;
+}
+
+static int volt_sftp_rename_with_session(VoltSession *session, const char *from_path, const char *to_path, char *error, size_t error_len) {
+    int rc = libssh2_sftp_rename(session->sftp, from_path, to_path);
+    if (rc != 0) set_session_error(session->session, error, error_len, "Could not rename remote item.");
+    return rc == 0 ? 0 : -1;
+}
+
+int volt_sftp_rename_on(VoltSessionHandle *handle, const char *from_path, const char *to_path, char *error, size_t error_len) {
+    if (!handle) {
+        set_error(error, error_len, "SFTP session is not open.");
+        return -1;
+    }
+    return volt_sftp_rename_with_session(&handle->session, from_path, to_path, error, error_len);
+}
+
 int volt_sftp_rename(const char *host, int port, const char *username, const char *password, const char *private_key_path, const char *known_hosts_path, const char *from_path, const char *to_path, char *error, size_t error_len) {
     VoltSession session;
     if (open_session(host, port, username, password, private_key_path, known_hosts_path, &session, error, error_len) != 0) return -1;
-    int rc = libssh2_sftp_rename(session.sftp, from_path, to_path);
-    if (rc != 0) set_session_error(session.session, error, error_len, "Could not rename remote item.");
+    int result = volt_sftp_rename_with_session(&session, from_path, to_path, error, error_len);
     close_session(&session);
+    return result;
+}
+
+static int volt_sftp_remove_with_session(VoltSession *session, const char *remote_path, int is_directory, char *error, size_t error_len) {
+    int rc = is_directory ? libssh2_sftp_rmdir(session->sftp, remote_path) : libssh2_sftp_unlink(session->sftp, remote_path);
+    if (rc != 0) set_session_error(session->session, error, error_len, "Could not remove remote item.");
     return rc == 0 ? 0 : -1;
+}
+
+int volt_sftp_remove_on(VoltSessionHandle *handle, const char *remote_path, int is_directory, char *error, size_t error_len) {
+    if (!handle) {
+        set_error(error, error_len, "SFTP session is not open.");
+        return -1;
+    }
+    return volt_sftp_remove_with_session(&handle->session, remote_path, is_directory, error, error_len);
 }
 
 int volt_sftp_remove(const char *host, int port, const char *username, const char *password, const char *private_key_path, const char *known_hosts_path, const char *remote_path, int is_directory, char *error, size_t error_len) {
     VoltSession session;
     if (open_session(host, port, username, password, private_key_path, known_hosts_path, &session, error, error_len) != 0) return -1;
-    int rc = is_directory ? libssh2_sftp_rmdir(session.sftp, remote_path) : libssh2_sftp_unlink(session.sftp, remote_path);
-    if (rc != 0) set_session_error(session.session, error, error_len, "Could not remove remote item.");
+    int result = volt_sftp_remove_with_session(&session, remote_path, is_directory, error, error_len);
     close_session(&session);
-    return rc == 0 ? 0 : -1;
+    return result;
 }
 
 void volt_sftp_free_items(VoltSFTPItem *items) {
