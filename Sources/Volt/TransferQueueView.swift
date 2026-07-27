@@ -58,6 +58,9 @@ struct TransferQueueView: View {
         if model.selectedConnection != nil || !model.terminalOutput.isEmpty || model.terminalStatus != .idle {
             tabs.append(.terminal)
         }
+        if !model.operationHistory.isEmpty {
+            tabs.append(.history)
+        }
         return tabs
     }
 
@@ -191,6 +194,9 @@ struct TransferQueueView: View {
             if model.selectedConnection != nil || !model.terminalOutput.isEmpty || model.terminalStatus != .idle {
                 Text("Terminal").tag(TransferPanelTab.terminal)
             }
+            if !model.operationHistory.isEmpty {
+                Text("History (\(model.operationHistory.count))").tag(TransferPanelTab.history)
+            }
         }
         .pickerStyle(.segmented)
         .labelsHidden()
@@ -217,6 +223,14 @@ struct TransferQueueView: View {
             .help("Discard all open remote edits")
         case .terminal:
             EmptyView()
+        case .history:
+            Button(action: model.clearOperationHistory) {
+                Label("Clear", systemImage: "trash")
+            }
+            .labelStyle(.titleAndIcon)
+            .buttonStyle(.plain)
+            .disabled(model.operationHistory.isEmpty)
+            .help("Clear operation history")
         }
     }
 
@@ -228,6 +242,48 @@ struct TransferQueueView: View {
             remoteEditsTable
         case .terminal:
             TerminalPanelView(model: model)
+        case .history:
+            historyTable
+        }
+    }
+
+    private var historyTable: some View {
+        Table(model.operationHistory) {
+            TableColumn("When") { entry in
+                Text(entry.createdAt.formatted(date: .abbreviated, time: .shortened))
+                    .lineLimit(1)
+            }
+            .width(150)
+            TableColumn("Type") { entry in Text(entry.kind.rawValue) }.width(100)
+            TableColumn("Result") { entry in
+                Text(entry.result.rawValue)
+                    .foregroundStyle(entry.result == .failed ? Color.red : .secondary)
+            }
+            .width(85)
+            TableColumn("Path") { entry in
+                Text(entry.remotePath ?? entry.localPath ?? entry.backupPath ?? "--")
+                    .lineLimit(1)
+            }
+            TableColumn("Message") { entry in
+                Text(entry.message).lineLimit(1)
+            }
+            TableColumn("") { entry in
+                HStack(spacing: 6) {
+                    Button("Copy") {
+                        model.copyHistoryPath(entry)
+                    }
+                    .disabled(entry.remotePath == nil && entry.localPath == nil && entry.backupPath == nil)
+                    Button("Open") {
+                        model.openHistoryLocalPath(entry)
+                    }
+                    .disabled(entry.localPath == nil)
+                }
+            }
+            .width(105)
+        }
+        .contextMenu {
+            Button("Clear History", action: model.clearOperationHistory)
+                .disabled(model.operationHistory.isEmpty)
         }
     }
 
@@ -255,11 +311,17 @@ struct TransferQueueView: View {
             }.width(min: 150, ideal: 210)
             TableColumn("Message") { Text($0.message).lineLimit(1) }
             TableColumn("") { job in
-                Button("Cancel") {
-                    model.cancelTransfer(job.id)
+                HStack(spacing: 6) {
+                    Button("Retry") {
+                        model.retryTransfer(job)
+                    }
+                    .disabled(job.retryDescriptor == nil || (job.state != .failed && job.state != .cancelled))
+                    Button("Cancel") {
+                        model.cancelTransfer(job.id)
+                    }
+                    .disabled(job.state != .queued && job.state != .running)
                 }
-                .disabled(job.state != .queued && job.state != .running)
-            }.width(70)
+            }.width(120)
         }
     }
 
@@ -307,6 +369,8 @@ struct TransferQueueView: View {
         case .terminal:
             TerminalPanelView(model: model)
                 .frame(maxHeight: 150)
+        case .history:
+            compactHistoryList
         }
     }
 
@@ -358,6 +422,18 @@ struct TransferQueueView: View {
                         .font(.caption.weight(.medium))
                         .foregroundStyle(statusColor)
                     Spacer()
+                    if let connection = model.selectedConnection, !connection.commandShortcuts.isEmpty {
+                        Menu {
+                            ForEach(connection.commandShortcuts) { shortcut in
+                                Button(shortcut.name) {
+                                    model.runCommandShortcut(shortcut)
+                                }
+                                .disabled(shortcut.command.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                            }
+                        } label: {
+                            Label("Commands", systemImage: "command")
+                        }
+                    }
                     Button(action: model.startTerminal) {
                         Label(model.terminalStatus == .running ? "Reconnect" : "Connect", systemImage: "terminal")
                     }
@@ -425,6 +501,44 @@ struct TransferQueueView: View {
             default:
                 return VoltTheme.mutedText
             }
+        }
+    }
+
+    @ViewBuilder private var compactHistoryList: some View {
+        if model.operationHistory.isEmpty {
+            Text("No history")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.vertical, 10)
+        } else {
+            ScrollView {
+                LazyVStack(spacing: 6) {
+                    ForEach(model.operationHistory.prefix(5)) { entry in
+                        HStack(spacing: 8) {
+                            Image(systemName: entry.result == .success ? "checkmark.circle" : "exclamationmark.triangle")
+                                .foregroundStyle(entry.result == .success ? Color.green : Color.red)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("\(entry.kind.rawValue) · \(entry.result.rawValue)")
+                                    .font(.caption.weight(.medium))
+                                    .lineLimit(1)
+                                Text(entry.message)
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(1)
+                            }
+                            Spacer()
+                        }
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 6)
+                        .background(
+                            RoundedRectangle(cornerRadius: 6)
+                                .fill(VoltTheme.controlBackground)
+                        )
+                    }
+                }
+            }
+            .frame(maxHeight: 126)
         }
     }
 
@@ -622,6 +736,12 @@ struct TransferQueueView: View {
                     .lineLimit(1)
             }
             Spacer(minLength: 8)
+            if job.state == .failed || job.state == .cancelled {
+                Button("Retry") {
+                    model.retryTransfer(job)
+                }
+                .disabled(job.retryDescriptor == nil)
+            }
             ProgressView(value: progress(for: job))
                 .frame(width: 86)
             Text("\(Int(progress(for: job) * 100))%")

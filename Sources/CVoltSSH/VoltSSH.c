@@ -928,6 +928,138 @@ int volt_sftp_download(const char *host, int port, const char *username, const c
     return result;
 }
 
+static int download_file_resume_with_session(VoltSession *session, const char *remote_path, const char *partial_path, const char *local_path, int overwrite, int64_t expected_size, int64_t expected_modified, VoltSFTPProgressCallback progress, void *progress_context, char *error, size_t error_len) {
+    if (!partial_path || !partial_path[0]) {
+        set_error(error, error_len, "Partial download path is unavailable.");
+        return -1;
+    }
+
+    LIBSSH2_SFTP_HANDLE *file = libssh2_sftp_open(session->sftp, remote_path, LIBSSH2_FXF_READ, 0);
+    if (!file) {
+        set_session_error(session->session, error, error_len, "Could not open remote file for reading.");
+        return -1;
+    }
+
+    LIBSSH2_SFTP_ATTRIBUTES remote_attrs;
+    memset(&remote_attrs, 0, sizeof(remote_attrs));
+    if (libssh2_sftp_fstat(file, &remote_attrs) != 0 || !(remote_attrs.flags & LIBSSH2_SFTP_ATTR_SIZE)) {
+        libssh2_sftp_close(file);
+        set_error(error, error_len, "Could not read remote file metadata.");
+        return -1;
+    }
+
+    int64_t remote_size = (int64_t)remote_attrs.filesize;
+    int64_t remote_modified = (remote_attrs.flags & LIBSSH2_SFTP_ATTR_ACMODTIME) ? (int64_t)remote_attrs.mtime : 0;
+    if (expected_size >= 0 && expected_size != remote_size) {
+        libssh2_sftp_close(file);
+        set_error(error, error_len, "Remote file size changed; restart the download.");
+        return -1;
+    }
+    if (expected_modified > 0 && remote_modified > 0 && expected_modified != remote_modified) {
+        libssh2_sftp_close(file);
+        set_error(error, error_len, "Remote file changed; restart the download.");
+        return -1;
+    }
+
+    struct stat partial_stat;
+    uint64_t offset = 0;
+    if (stat(partial_path, &partial_stat) == 0 && partial_stat.st_size > 0) {
+        if ((int64_t)partial_stat.st_size > remote_size) {
+            unlink(partial_path);
+        } else {
+            offset = (uint64_t)partial_stat.st_size;
+        }
+    }
+
+    int output_fd = open(partial_path, O_CREAT | O_WRONLY, S_IRUSR | S_IWUSR);
+    if (output_fd < 0) {
+        libssh2_sftp_close(file);
+        set_error(error, error_len, strerror(errno));
+        return -1;
+    }
+    if (fchmod(output_fd, S_IRUSR | S_IWUSR) != 0) {
+        close(output_fd);
+        libssh2_sftp_close(file);
+        set_error(error, error_len, "Could not secure the partial download file.");
+        return -1;
+    }
+    if (lseek(output_fd, (off_t)offset, SEEK_SET) < 0 || ftruncate(output_fd, (off_t)offset) != 0) {
+        close(output_fd);
+        libssh2_sftp_close(file);
+        set_error(error, error_len, "Could not resume the partial download file.");
+        return -1;
+    }
+
+    libssh2_sftp_seek64(file, offset);
+    uint64_t transferred = offset;
+    if (progress && progress(transferred, (uint64_t)remote_size, progress_context) != 0) {
+        close(output_fd);
+        libssh2_sftp_close(file);
+        set_error(error, error_len, "Transfer cancelled.");
+        return -1;
+    }
+
+    char buffer[VOLT_SFTP_TRANSFER_BUFFER_SIZE];
+    while (transferred < (uint64_t)remote_size) {
+        ssize_t n = libssh2_sftp_read(file, buffer, sizeof(buffer));
+        if (n > 0) {
+            size_t written_total = 0;
+            while (written_total < (size_t)n) {
+                ssize_t written = write(output_fd, buffer + written_total, (size_t)n - written_total);
+                if (written <= 0) {
+                    close(output_fd);
+                    libssh2_sftp_close(file);
+                    set_error(error, error_len, "Could not write the partial download file.");
+                    return -1;
+                }
+                written_total += (size_t)written;
+            }
+            transferred += (uint64_t)n;
+            if (progress && progress(transferred, (uint64_t)remote_size, progress_context) != 0) {
+                close(output_fd);
+                libssh2_sftp_close(file);
+                set_error(error, error_len, "Transfer cancelled.");
+                return -1;
+            }
+        } else if (n == 0) {
+            break;
+        } else {
+            close(output_fd);
+            libssh2_sftp_close(file);
+            set_session_error(session->session, error, error_len, "SFTP read failed.");
+            return -1;
+        }
+    }
+
+    if (fsync(output_fd) != 0 || close(output_fd) != 0) {
+        libssh2_sftp_close(file);
+        set_error(error, error_len, "Could not finalize the partial download file.");
+        return -1;
+    }
+    if (transferred != (uint64_t)remote_size) {
+        libssh2_sftp_close(file);
+        set_error(error, error_len, "Remote file ended before the download completed.");
+        return -1;
+    }
+
+    int publish_result = volt_publish_download(partial_path, local_path, overwrite);
+    if (publish_result != 0) {
+        libssh2_sftp_close(file);
+        set_error(error, error_len, strerror(errno));
+        return -1;
+    }
+    libssh2_sftp_close(file);
+    return 0;
+}
+
+int volt_sftp_download_resume(const char *host, int port, const char *username, const char *password, const char *private_key_path, const char *known_hosts_path, const char *remote_path, const char *partial_path, const char *local_path, int overwrite, int64_t expected_size, int64_t expected_modified, VoltSFTPProgressCallback progress, void *progress_context, char *error, size_t error_len) {
+    VoltSession session;
+    if (open_session(host, port, username, password, private_key_path, known_hosts_path, &session, error, error_len) != 0) return -1;
+    int result = download_file_resume_with_session(&session, remote_path, partial_path, local_path, overwrite, expected_size, expected_modified, progress, progress_context, error, error_len);
+    close_session(&session);
+    return result;
+}
+
 typedef struct VoltBatchProgressContext {
     int index;
     VoltSFTPBatchProgressCallback progress;

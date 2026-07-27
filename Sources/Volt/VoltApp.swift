@@ -100,6 +100,27 @@ enum RemoteEditUploadMode: String, Codable, CaseIterable, Identifiable {
     }
 }
 
+enum CommandConfirmationMode: String, Codable, CaseIterable, Identifiable {
+    case automatic = "automatic"
+    case always = "always"
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .automatic: "Automatic"
+        case .always: "Always Confirm"
+        }
+    }
+}
+
+struct CommandShortcut: Identifiable, Codable, Equatable {
+    var id = UUID()
+    var name: String = "Restart Service"
+    var command: String = ""
+    var confirmationMode: CommandConfirmationMode = .automatic
+}
+
 struct SavedConnection: Identifiable, Codable, Equatable {
     var id = UUID()
     var name: String = "My Server"
@@ -115,6 +136,7 @@ struct SavedConnection: Identifiable, Codable, Equatable {
     var allowRootLoginOnImportantServer = false
     var quickPaths: [RemoteQuickPath] = []
     var logBookmarks: [RemoteLogBookmark] = []
+    var commandShortcuts: [CommandShortcut] = []
     var backupBeforeReplace = true
     var remoteEditUploadMode: RemoteEditUploadMode = .askAfterSave
 
@@ -143,6 +165,7 @@ struct SavedConnection: Identifiable, Codable, Equatable {
         case allowRootLoginOnImportantServer
         case quickPaths
         case logBookmarks
+        case commandShortcuts
         case backupBeforeReplace
         case remoteEditUploadMode
     }
@@ -163,6 +186,7 @@ struct SavedConnection: Identifiable, Codable, Equatable {
         allowRootLoginOnImportantServer = try container.decodeIfPresent(Bool.self, forKey: .allowRootLoginOnImportantServer) ?? false
         quickPaths = try container.decodeIfPresent([RemoteQuickPath].self, forKey: .quickPaths) ?? []
         logBookmarks = try container.decodeIfPresent([RemoteLogBookmark].self, forKey: .logBookmarks) ?? []
+        commandShortcuts = try container.decodeIfPresent([CommandShortcut].self, forKey: .commandShortcuts) ?? []
         backupBeforeReplace = try container.decodeIfPresent(Bool.self, forKey: .backupBeforeReplace) ?? true
         remoteEditUploadMode = try container.decodeIfPresent(RemoteEditUploadMode.self, forKey: .remoteEditUploadMode) ?? .askAfterSave
     }
@@ -388,6 +412,7 @@ enum TransferPanelTab: String {
     case transfers = "Transfers"
     case remoteEdits = "Remote Edits"
     case terminal = "Terminal"
+    case history = "History"
 }
 
 enum TerminalStatus: String, Equatable {
@@ -396,6 +421,15 @@ enum TerminalStatus: String, Equatable {
     case running = "Running"
     case exited = "Exited"
     case failed = "Failed"
+}
+
+enum TransferRetryDescriptor: Equatable {
+    case uploadFile(localPath: String, remotePath: String)
+    case downloadFile(remotePath: String, localPath: String)
+    case editDownload(remotePath: String, localPath: String)
+    case uploadEdited(remotePath: String, localPath: String)
+    case downloadFolder(remotePath: String, localPath: String)
+    case uploadFolder(localPath: String, remotePath: String)
 }
 
 struct TransferJob: Identifiable {
@@ -410,6 +444,82 @@ struct TransferJob: Identifiable {
     var startedAt: Date?
     var progressStartedAt: Date?
     var updatedAt: Date?
+    var retryDescriptor: TransferRetryDescriptor?
+    var remoteSize: Int64?
+    var remoteModified: Date?
+}
+
+enum SyncAction: String, Equatable {
+    case uploadNew = "Upload New"
+    case replaceRemote = "Replace Remote"
+    case createFolder = "Create Folder"
+    case skip = "Skip"
+    case conflict = "Conflict"
+    case remoteOnly = "Remote Only"
+}
+
+struct SyncPlanItem: Identifiable, Equatable {
+    let id = UUID()
+    var localPath: String?
+    var remotePath: String
+    var relativePath: String
+    var isDirectory: Bool
+    var localSize: Int64?
+    var remoteSize: Int64?
+    var localModified: Date?
+    var remoteModified: Date?
+    var action: SyncAction
+    var isSelected: Bool
+}
+
+struct SyncPlan: Equatable {
+    var localRoot: String
+    var remoteRoot: String
+    var items: [SyncPlanItem] = []
+}
+
+enum RemoteSearchMode: String, CaseIterable, Identifiable {
+    case filename = "Filename"
+    case text = "Text"
+
+    var id: String { rawValue }
+}
+
+struct RemoteSearchResult: Identifiable, Equatable {
+    let id = UUID()
+    var path: String
+    var name: String
+    var isDirectory: Bool
+    var line: Int?
+    var preview: String?
+}
+
+enum OperationHistoryKind: String, Codable {
+    case upload = "Upload"
+    case download = "Download"
+    case remoteEdit = "Remote Edit"
+    case backup = "Backup"
+    case sync = "Sync"
+    case search = "Search"
+    case command = "Command"
+}
+
+enum OperationHistoryResult: String, Codable {
+    case success = "Success"
+    case failed = "Failed"
+    case cancelled = "Cancelled"
+}
+
+struct OperationHistoryEntry: Identifiable, Codable, Equatable {
+    var id = UUID()
+    var kind: OperationHistoryKind
+    var result: OperationHistoryResult
+    var serverName: String?
+    var localPath: String?
+    var remotePath: String?
+    var backupPath: String?
+    var message: String
+    var createdAt: Date = Date()
 }
 
 actor TransferLimiter {
@@ -972,6 +1082,28 @@ final class SecureStorage {
     }
 }
 
+final class OperationHistoryStore {
+    static func save(_ entries: [OperationHistoryEntry]) {
+        guard let data = try? JSONEncoder().encode(entries) else { return }
+        do {
+            let url = try AppPaths.operationHistoryURL()
+            try data.write(to: url, options: [.atomic, .completeFileProtection])
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+        } catch {
+            return
+        }
+    }
+
+    static func load() -> [OperationHistoryEntry] {
+        guard let url = try? AppPaths.operationHistoryURL(),
+              let data = try? Data(contentsOf: url),
+              let entries = try? JSONDecoder().decode([OperationHistoryEntry].self, from: data) else {
+            return []
+        }
+        return entries
+    }
+}
+
 final class TransferControl: @unchecked Sendable {
     private let lock = NSLock()
     private var cancelled = false
@@ -1103,6 +1235,10 @@ enum AppPaths {
         }
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
         return url
+    }
+
+    static func operationHistoryURL() throws -> URL {
+        try supportDirectory().appendingPathComponent("operation-history.json", isDirectory: false)
     }
 
     static func editDirectory() throws -> URL {
@@ -1377,6 +1513,43 @@ final class SFTPClient: @unchecked Sendable {
                     policy == .replace ? 1 : 0,
                     Int32(TransferTuning.maxParallelFileDownloadSessions),
                     TransferTuning.parallelDownloadThreshold,
+                    transferProgressCallback,
+                    context,
+                    error,
+                    errorLength
+                )
+            }
+        }.value
+    }
+
+    func downloadResumable(
+        connection: SavedConnection,
+        credential: SensitiveCredential,
+        remotePath: String,
+        localPath: String,
+        partialPath: String,
+        policy: DownloadPublishPolicy,
+        expectedSize: Int64,
+        expectedModified: Date?,
+        control: TransferControl
+    ) async throws {
+        try await Task.detached {
+            let context = Unmanaged.passRetained(control).toOpaque()
+            defer { Unmanaged<TransferControl>.fromOpaque(context).release() }
+            _ = try self.call(connection: connection, credential: credential) { host, port, username, password, keyPath, knownHostsPath, error, errorLength in
+                volt_sftp_download_resume(
+                    host,
+                    port,
+                    username,
+                    password,
+                    keyPath,
+                    knownHostsPath,
+                    remotePath,
+                    partialPath,
+                    localPath,
+                    policy == .replace ? 1 : 0,
+                    expectedSize,
+                    expectedModified.map { Int64($0.timeIntervalSince1970) } ?? 0,
                     transferProgressCallback,
                     context,
                     error,
@@ -1672,6 +1845,15 @@ final class AppModel: ObservableObject {
     @Published var showsHostKeyPrompt = false
     @Published var pendingHostKeyFingerprint = ""
     @Published var pendingHostKeyHost = ""
+    @Published var operationHistory: [OperationHistoryEntry] = []
+    @Published var showsSyncPreview = false
+    @Published var syncPlan: SyncPlan?
+    @Published var isBuildingSyncPlan = false
+    @Published var showsRemoteSearch = false
+    @Published var remoteSearchText = ""
+    @Published var remoteSearchMode: RemoteSearchMode = .filename
+    @Published var remoteSearchResults: [RemoteSearchResult] = []
+    @Published var isSearchingRemote = false
     private var hostKeyConfirmationContinuation: CheckedContinuation<Bool, Never>?
     private var tabCredentials: [BrowserTab.ID: SensitiveCredential] = [:]
     private var terminalSessions: [BrowserTab.ID: SSHTerminalSession] = [:]
@@ -1820,6 +2002,133 @@ final class AppModel: ObservableObject {
             }
         }
         return total
+    }
+
+    private nonisolated static func collectLocalSyncEntries(root: String) throws -> [SyncPlanItem] {
+        let rootURL = URL(fileURLWithPath: root, isDirectory: true).standardizedFileURL
+        let keys: Set<URLResourceKey> = [.isDirectoryKey, .isRegularFileKey, .fileSizeKey, .contentModificationDateKey]
+        guard let enumerator = FileManager.default.enumerator(
+            at: rootURL,
+            includingPropertiesForKeys: Array(keys),
+            options: [.skipsHiddenFiles, .skipsPackageDescendants]
+        ) else { return [] }
+
+        var entries: [SyncPlanItem] = []
+        for case let url as URL in enumerator {
+            let values = try url.resourceValues(forKeys: keys)
+            guard values.isDirectory == true || values.isRegularFile == true else { continue }
+            let relativePath = relativePathForSync(url.path, root: rootURL.path)
+            guard !relativePath.isEmpty else { continue }
+            entries.append(SyncPlanItem(
+                localPath: url.path,
+                remotePath: "",
+                relativePath: relativePath,
+                isDirectory: values.isDirectory == true,
+                localSize: values.isDirectory == true ? nil : values.fileSize.map(Int64.init),
+                remoteSize: nil,
+                localModified: values.contentModificationDate,
+                remoteModified: nil,
+                action: .skip,
+                isSelected: false
+            ))
+        }
+        return entries
+    }
+
+    private func collectRemoteSyncEntries(
+        connection: SavedConnection,
+        credential: SensitiveCredential,
+        root: String
+    ) async throws -> [SyncPlanItem] {
+        try await collectRemoteSyncEntries(connection: connection, credential: credential, root: root, path: root)
+    }
+
+    private func collectRemoteSyncEntries(
+        connection: SavedConnection,
+        credential: SensitiveCredential,
+        root: String,
+        path: String
+    ) async throws -> [SyncPlanItem] {
+        let result = try await sftp.list(connection: connection, credential: credential, path: path)
+        var entries: [SyncPlanItem] = []
+        for item in result.items {
+            let relativePath = Self.relativePathForSync(item.path, root: root)
+            entries.append(SyncPlanItem(
+                localPath: nil,
+                remotePath: item.path,
+                relativePath: relativePath,
+                isDirectory: item.isDirectory,
+                localSize: nil,
+                remoteSize: item.size,
+                localModified: nil,
+                remoteModified: item.modified,
+                action: .remoteOnly,
+                isSelected: false
+            ))
+            if item.isDirectory {
+                entries.append(contentsOf: try await collectRemoteSyncEntries(
+                    connection: connection,
+                    credential: credential,
+                    root: root,
+                    path: item.path
+                ))
+            }
+        }
+        return entries
+    }
+
+    private func makeSyncPlan(
+        localRoot: String,
+        remoteRoot: String,
+        localEntries: [SyncPlanItem],
+        remoteEntries: [SyncPlanItem]
+    ) -> SyncPlan {
+        let remoteByRelativePath = Dictionary(uniqueKeysWithValues: remoteEntries.map { ($0.relativePath, $0) })
+        let localRelativePaths = Set(localEntries.map(\.relativePath))
+        var items: [SyncPlanItem] = []
+
+        for var local in localEntries {
+            local.remotePath = joinRemote(remoteRoot, local.relativePath)
+            if let remote = remoteByRelativePath[local.relativePath] {
+                local.remoteSize = remote.remoteSize
+                local.remoteModified = remote.remoteModified
+                if local.isDirectory != remote.isDirectory {
+                    local.action = .conflict
+                    local.isSelected = false
+                } else if local.isDirectory {
+                    local.action = .skip
+                    local.isSelected = false
+                } else if local.localSize != remote.remoteSize || (local.localModified ?? .distantPast) > (remote.remoteModified ?? .distantPast) {
+                    local.action = .replaceRemote
+                    local.isSelected = true
+                } else {
+                    local.action = .skip
+                    local.isSelected = false
+                }
+            } else {
+                local.action = local.isDirectory ? .createFolder : .uploadNew
+                local.isSelected = true
+            }
+            items.append(local)
+        }
+
+        for remote in remoteEntries where !localRelativePaths.contains(remote.relativePath) {
+            items.append(remote)
+        }
+
+        items.sort { lhs, rhs in
+            if lhs.action != rhs.action { return lhs.action.rawValue < rhs.action.rawValue }
+            return lhs.relativePath.localizedStandardCompare(rhs.relativePath) == .orderedAscending
+        }
+        return SyncPlan(localRoot: localRoot, remoteRoot: remoteRoot, items: items)
+    }
+
+    private nonisolated static func relativePathForSync(_ path: String, root: String) -> String {
+        let normalizedRoot = root.hasSuffix("/") ? String(root.dropLast()) : root
+        let normalizedPath = path
+        guard normalizedPath.hasPrefix(normalizedRoot) else { return URL(fileURLWithPath: path).lastPathComponent }
+        let start = normalizedPath.index(normalizedPath.startIndex, offsetBy: normalizedRoot.count)
+        return normalizedPath[start...].trimmingCharacters(in: CharacterSet(charactersIn: "/"))
     }
 
     func closeCurrentTab() {
@@ -2182,6 +2491,290 @@ final class AppModel: ObservableObject {
         startTerminal(remoteCommand: command, intro: "Tailing \(bookmark.path)")
     }
 
+    func runCommandShortcut(_ shortcut: CommandShortcut) {
+        guard let connection = selectedConnection else {
+            status = "Choose a connection"
+            return
+        }
+        let command = shortcut.command.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !command.isEmpty else {
+            status = "Command shortcut is empty."
+            return
+        }
+        if usesPasswordSFTP(connection: connection) {
+            status = "Command shortcuts require SSH key or ssh-agent authentication."
+            recordHistory(kind: .command, result: .failed, remotePath: command, message: status)
+            return
+        }
+        if shouldConfirmCommand(shortcut, command: command, connection: connection),
+           !confirmCommandShortcut(shortcut, command: command, connection: connection) {
+            status = "Command cancelled"
+            recordHistory(kind: .command, result: .cancelled, remotePath: command, message: "Command cancelled")
+            return
+        }
+        recordHistory(kind: .command, result: .success, remotePath: command, message: "Started command: \(shortcut.name)")
+        startTerminal(remoteCommand: command, intro: "Running \(shortcut.name)")
+    }
+
+    private func shouldConfirmCommand(_ shortcut: CommandShortcut, command: String, connection: SavedConnection) -> Bool {
+        if connection.requiresImportantServerGuards || shortcut.confirmationMode == .always { return true }
+        let lowered = command.lowercased()
+        let riskyTokens = [" rm ", " rm -", "sudo ", "reboot", "shutdown", "systemctl restart", "service "]
+        return riskyTokens.contains { token in
+            lowered == token.trimmingCharacters(in: .whitespaces) || lowered.contains(token)
+        }
+    }
+
+    private func confirmCommandShortcut(_ shortcut: CommandShortcut, command: String, connection: SavedConnection) -> Bool {
+        let alert = NSAlert()
+        alert.messageText = "Run command shortcut \"\(shortcut.name)\"?"
+        alert.informativeText = connection.requiresImportantServerGuards
+            ? "Important Server: \(remoteActionContext(connection: connection, remotePath: command))"
+            : command
+        alert.alertStyle = connection.requiresImportantServerGuards ? .critical : .warning
+        alert.addButton(withTitle: "Run")
+        alert.addButton(withTitle: "Cancel")
+        return alert.runModal() == .alertFirstButtonReturn
+    }
+
+    func showSyncPreview() {
+        guard selectedConnection != nil else {
+            status = "Choose a connection"
+            return
+        }
+        let localRoot: String
+        if selectedLocalItems.count == 1, let selectedLocal, selectedLocal.isDirectory {
+            localRoot = selectedLocal.path
+        } else {
+            localRoot = localPath
+        }
+        buildSyncPlan(localRoot: localRoot, remoteRoot: remotePath)
+    }
+
+    private func buildSyncPlan(localRoot: String, remoteRoot: String) {
+        guard let connection = selectedConnection else { return }
+        let credential = credentialForCurrentTab().clone()
+        isBuildingSyncPlan = true
+        status = "Building sync preview"
+        Task {
+            do {
+                let localEntries = try await Task.detached(priority: .userInitiated) {
+                    try AppModel.collectLocalSyncEntries(root: localRoot)
+                }.value
+                let remoteEntries = try await collectRemoteSyncEntries(
+                    connection: connection,
+                    credential: credential,
+                    root: remoteRoot
+                )
+                let plan = makeSyncPlan(localRoot: localRoot, remoteRoot: remoteRoot, localEntries: localEntries, remoteEntries: remoteEntries)
+                await MainActor.run {
+                    self.syncPlan = plan
+                    self.showsSyncPreview = true
+                    self.isBuildingSyncPlan = false
+                    self.status = "Sync preview ready"
+                }
+            } catch {
+                await MainActor.run {
+                    self.isBuildingSyncPlan = false
+                    self.status = error.localizedDescription
+                    self.recordHistory(kind: .sync, result: .failed, localPath: localRoot, remotePath: remoteRoot, message: error.localizedDescription)
+                }
+            }
+        }
+    }
+
+    func updateSyncPlanItemSelection(_ id: SyncPlanItem.ID, isSelected: Bool) {
+        guard var plan = syncPlan,
+              let index = plan.items.firstIndex(where: { $0.id == id }) else { return }
+        plan.items[index].isSelected = isSelected
+        syncPlan = plan
+    }
+
+    func executeSyncPlan() {
+        guard let plan = syncPlan, let connection = selectedConnection else { return }
+        let selectedItems = plan.items.filter { $0.isSelected && ($0.action == .uploadNew || $0.action == .replaceRemote || $0.action == .createFolder) }
+        guard !selectedItems.isEmpty else {
+            status = "No sync actions selected"
+            return
+        }
+        if selectedItems.contains(where: { $0.action == .replaceRemote }),
+           !confirmImportantServerAction(connection: connection, action: "replace remote files during sync", remotePath: plan.remoteRoot, confirmation: "SYNC") {
+            return
+        }
+
+        let credential = credentialForCurrentTab().clone()
+        let transferID = enqueue(direction: .upload, source: plan.localRoot, destination: plan.remoteRoot)
+        guard let control = transferControls[transferID] else { return }
+        showsSyncPreview = false
+        runBusy("Syncing", transferID: transferID) {
+            let folders = selectedItems.filter(\.isDirectory).sorted { $0.relativePath < $1.relativePath }
+            let files = selectedItems.filter { !$0.isDirectory }.sorted { $0.relativePath < $1.relativePath }
+            let total = UInt64(max(1, folders.count + files.count))
+            var completed: UInt64 = 0
+            await MainActor.run { self.updateTransferProgress(transferID, transferred: 0, total: total) }
+
+            for item in folders {
+                guard !control.isCancelled else { throw AppError.commandFailed("Transfer cancelled.") }
+                _ = try await self.sftp.makeDirectory(connection: connection, credential: credential, path: item.remotePath)
+                completed += 1
+                await MainActor.run {
+                    self.markTransfer(transferID, .running, "Created \(item.relativePath)")
+                    self.updateTransferProgress(transferID, transferred: completed, total: total)
+                }
+            }
+
+            for item in files {
+                guard !control.isCancelled else { throw AppError.commandFailed("Transfer cancelled.") }
+                guard let localPath = item.localPath else { continue }
+                let policy: UploadPublishPolicy = item.action == .replaceRemote ? .replace : .createNew
+                if let backupPath = try await self.backupRemoteFileIfNeeded(connection: connection, credential: credential, remotePath: item.remotePath, policy: policy) {
+                    await MainActor.run {
+                        self.invalidateRemoteCacheForChangedItem(connectionID: connection.id, path: backupPath)
+                    }
+                }
+                _ = try await self.sftp.upload(connection: connection, credential: credential, localPath: localPath, remotePath: item.remotePath, policy: policy, control: control)
+                completed += 1
+                await MainActor.run {
+                    self.markTransfer(transferID, .running, "Uploaded \(item.relativePath)")
+                    self.updateTransferProgress(transferID, transferred: completed, total: total)
+                }
+            }
+
+            await MainActor.run {
+                self.markTransfer(transferID, .done, "Synced \(selectedItems.count) item\(selectedItems.count == 1 ? "" : "s")")
+                self.invalidateRemoteCache(connectionID: connection.id, path: plan.remoteRoot)
+                self.recordHistory(kind: .sync, result: .success, localPath: plan.localRoot, remotePath: plan.remoteRoot, message: "Synced \(selectedItems.count) item\(selectedItems.count == 1 ? "" : "s")")
+                self.refreshRemote()
+            }
+        } onFailure: { error in
+            self.recordHistory(kind: .sync, result: .failed, localPath: plan.localRoot, remotePath: plan.remoteRoot, message: error.localizedDescription)
+        }
+    }
+
+    func showRemoteSearch() {
+        guard selectedConnection != nil else {
+            status = "Choose a connection"
+            return
+        }
+        remoteSearchResults = []
+        remoteSearchText = ""
+        remoteSearchMode = .filename
+        showsRemoteSearch = true
+    }
+
+    func performRemoteSearch() {
+        let query = remoteSearchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else { return }
+        guard let connection = selectedConnection else { return }
+        let credential = credentialForCurrentTab().clone()
+        isSearchingRemote = true
+        status = "Searching remote files"
+
+        Task {
+            do {
+                let results: [RemoteSearchResult]
+                switch self.remoteSearchMode {
+                case .filename:
+                    let items = try await self.collectRemoteSearchItems(connection: connection, credential: credential, path: self.remotePath)
+                    results = items
+                        .filter { $0.name.localizedCaseInsensitiveContains(query) || $0.path.localizedCaseInsensitiveContains(query) }
+                        .map { RemoteSearchResult(path: $0.path, name: $0.name, isDirectory: $0.isDirectory, line: nil, preview: nil) }
+                case .text:
+                    if self.usesPasswordSFTP(connection: connection) {
+                        throw AppError.unsupportedPasswordAuth
+                    }
+                    results = try await self.runRemoteTextSearch(connection: connection, query: query, root: self.remotePath)
+                }
+                await MainActor.run {
+                    self.remoteSearchResults = results
+                    self.isSearchingRemote = false
+                    self.status = "Found \(results.count) result\(results.count == 1 ? "" : "s")"
+                    self.recordHistory(kind: .search, result: .success, remotePath: self.remotePath, message: "\(self.remoteSearchMode.rawValue) search: \(query)")
+                }
+            } catch {
+                await MainActor.run {
+                    self.isSearchingRemote = false
+                    self.status = error.localizedDescription
+                    self.recordHistory(kind: .search, result: .failed, remotePath: self.remotePath, message: error.localizedDescription)
+                }
+            }
+        }
+    }
+
+    func openRemoteSearchResult(_ result: RemoteSearchResult) {
+        if result.isDirectory {
+            remotePath = result.path
+        } else if let parent = remoteParentPath(result.path) {
+            remotePath = parent
+            selectedRemoteIDs = [result.path]
+        }
+        showsRemoteSearch = false
+        loadCurrentRemotePathUsingCache()
+    }
+
+    func copyRemoteSearchResultPath(_ result: RemoteSearchResult) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(result.path, forType: .string)
+        status = "Copied remote path"
+    }
+
+    func downloadRemoteSearchResult(_ result: RemoteSearchResult) {
+        guard !result.isDirectory else { return }
+        guard let destination = safeLocalDestination(base: URL(fileURLWithPath: localPath), name: result.name) else {
+            status = "Refused unsafe remote filename."
+            return
+        }
+        download(remotePath: result.path, localPath: destination.path, refreshWhenDone: true)
+    }
+
+    func tailRemoteSearchResult(_ result: RemoteSearchResult) {
+        guard let connection = selectedConnection else { return }
+        guard !result.isDirectory else { return }
+        if usesPasswordSFTP(connection: connection) {
+            status = "Live tail requires SSH key or ssh-agent authentication."
+            return
+        }
+        startTerminal(remoteCommand: "tail -n 200 -f \(Self.shellQuoted(result.path))", intro: "Tailing \(result.path)")
+        showsRemoteSearch = false
+    }
+
+    private func collectRemoteSearchItems(
+        connection: SavedConnection,
+        credential: SensitiveCredential,
+        path: String
+    ) async throws -> [FileItem] {
+        let result = try await sftp.list(connection: connection, credential: credential, path: path)
+        var items = result.items
+        for item in result.items where item.isDirectory {
+            items.append(contentsOf: try await collectRemoteSearchItems(connection: connection, credential: credential, path: item.path))
+        }
+        return items
+    }
+
+    private func runRemoteTextSearch(connection: SavedConnection, query: String, root: String) async throws -> [RemoteSearchResult] {
+        let command = "grep -RIn --exclude-dir=.git -- \(Self.shellQuoted(query)) \(Self.shellQuoted(root)) 2>/dev/null | head -200"
+        let result = try await runSSHCommand(connection: connection, command: command)
+        guard result.status == 0 || result.status == 1 else {
+            throw AppError.commandFailed(result.stderr.isEmpty ? result.stdout : result.stderr)
+        }
+        return result.stdout
+            .split(separator: "\n", omittingEmptySubsequences: true)
+            .compactMap { line -> RemoteSearchResult? in
+                let parts = line.split(separator: ":", maxSplits: 2, omittingEmptySubsequences: false)
+                guard parts.count >= 2 else { return nil }
+                let path = String(parts[0])
+                let lineNumber = Int(parts[1])
+                let preview = parts.count > 2 ? String(parts[2]) : nil
+                return RemoteSearchResult(
+                    path: path,
+                    name: URL(fileURLWithPath: path).lastPathComponent,
+                    isDirectory: false,
+                    line: lineNumber,
+                    preview: preview
+                )
+            }
+    }
+
     func removeConnection(id: UUID) {
         if selectedConnectionID == id {
             guard confirmDiscardEditSessions(remoteEditSessions, action: "remove this connection") else { return }
@@ -2431,7 +3024,12 @@ final class AppModel: ObservableObject {
             confirmation: "REPLACE"
         ) else { return }
         let credential = credentialForCurrentTab().clone()
-        let transferID = enqueue(direction: .upload, source: session.localPath, destination: session.remotePath)
+        let transferID = enqueue(
+            direction: .upload,
+            source: session.localPath,
+            destination: session.remotePath,
+            retryDescriptor: .uploadEdited(remotePath: session.remotePath, localPath: session.localPath)
+        )
         guard let control = transferControls[transferID] else { return }
         setRemoteEditState(session.id, .uploading)
         runBusy("Uploading edited file", transferID: transferID) {
@@ -2463,11 +3061,13 @@ final class AppModel: ObservableObject {
                 self.remoteEditSessions.removeAll { $0.id == session.id }
                 self.cleanupEditSessions([session])
                 self.invalidateRemoteCacheForChangedItem(connectionID: connection.id, path: session.remotePath)
+                self.recordHistory(kind: .remoteEdit, result: .success, localPath: session.localPath, remotePath: session.remotePath, message: warning ?? "Uploaded edited file")
                 self.syncCurrentTab()
                 self.refreshRemote()
             }
-        } onFailure: {
+        } onFailure: { error in
             self.setRemoteEditState(session.id, .failed)
+            self.recordHistory(kind: .remoteEdit, result: .failed, localPath: session.localPath, remotePath: session.remotePath, message: error.localizedDescription)
         }
     }
 
@@ -2517,7 +3117,12 @@ final class AppModel: ObservableObject {
     private func upload(localPath: String, remotePath: String, refreshWhenDone: Bool) {
         guard let connection = selectedConnection else { return }
         let credential = credentialForCurrentTab().clone()
-        let transferID = enqueue(direction: .upload, source: localPath, destination: remotePath)
+        let transferID = enqueue(
+            direction: .upload,
+            source: localPath,
+            destination: remotePath,
+            retryDescriptor: .uploadFile(localPath: localPath, remotePath: remotePath)
+        )
         guard let control = transferControls[transferID] else { return }
         runBusy("Uploading", transferID: transferID) {
             let resolution = try await self.resolveUploadConflict(
@@ -2557,17 +3162,25 @@ final class AppModel: ObservableObject {
                 self.markTransfer(transferID, .done, warning ?? "Uploaded")
                 if let warning { self.status = warning }
                 self.invalidateRemoteCacheForChangedItem(connectionID: connection.id, path: destination)
+                self.recordHistory(kind: .upload, result: .success, localPath: localPath, remotePath: destination, message: warning ?? "Uploaded")
                 if refreshWhenDone {
                     self.refreshRemote()
                 }
             }
+        } onFailure: { error in
+            self.recordHistory(kind: .upload, result: .failed, localPath: localPath, remotePath: remotePath, message: error.localizedDescription)
         }
     }
 
     private func uploadFolder(item: FileItem, remotePath: String, refreshWhenDone: Bool) {
         guard let connection = selectedConnection else { return }
         let credential = credentialForCurrentTab().clone()
-        let transferID = enqueue(direction: .upload, source: item.path, destination: remotePath)
+        let transferID = enqueue(
+            direction: .upload,
+            source: item.path,
+            destination: remotePath,
+            retryDescriptor: .uploadFolder(localPath: item.path, remotePath: remotePath)
+        )
         guard let control = transferControls[transferID] else { return }
         runBusy("Uploading folder", transferID: transferID) {
             let summary = try await self.transferLimiter.withPermit {
@@ -2587,10 +3200,13 @@ final class AppModel: ObservableObject {
                 let skippedText = summary.skippedItems > 0 ? ", skipped \(summary.skippedItems)" : ""
                 self.markTransfer(transferID, .done, "Uploaded \(fileText)\(skippedText)")
                 self.invalidateRemoteCacheForChangedItem(connectionID: connection.id, path: remotePath, wasDirectory: true)
+                self.recordHistory(kind: .upload, result: .success, localPath: item.path, remotePath: remotePath, message: "Uploaded \(fileText)\(skippedText)")
                 if refreshWhenDone {
                     self.refreshRemote()
                 }
             }
+        } onFailure: { error in
+            self.recordHistory(kind: .upload, result: .failed, localPath: item.path, remotePath: remotePath, message: error.localizedDescription)
         }
     }
 
@@ -2735,14 +3351,19 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private func downloadFolder(item: FileItem, localPath: String, refreshWhenDone: Bool) {
+    private func downloadFolder(item: FileItem, localPath: String, refreshWhenDone: Bool, reuseCompletedFiles: Bool = false) {
         guard let connection = selectedConnection else { return }
         guard let destination = resolveDirectoryDownloadConflict(at: localPath) else {
             status = "Download cancelled"
             return
         }
         let credential = credentialForCurrentTab().clone()
-        let transferID = enqueue(direction: .download, source: item.path, destination: destination)
+        let transferID = enqueue(
+            direction: .download,
+            source: item.path,
+            destination: destination,
+            retryDescriptor: .downloadFolder(remotePath: item.path, localPath: destination)
+        )
         guard let control = transferControls[transferID] else { return }
         runBusy("Downloading folder", transferID: transferID) {
             guard !control.isCancelled else { throw AppError.commandFailed("Transfer cancelled.") }
@@ -2753,7 +3374,8 @@ final class AppModel: ObservableObject {
                 remotePath: item.path,
                 localURL: URL(fileURLWithPath: destination, isDirectory: true),
                 control: control,
-                transferID: transferID
+                transferID: transferID,
+                reuseCompletedFiles: reuseCompletedFiles
             )
             let summary = try await self.downloadPlannedFolderFiles(
                 connection: connection,
@@ -2766,10 +3388,13 @@ final class AppModel: ObservableObject {
                 let fileText = "\(summary.downloadedFiles) file\(summary.downloadedFiles == 1 ? "" : "s")"
                 let skippedText = summary.skippedItems > 0 ? ", skipped \(summary.skippedItems)" : ""
                 self.markTransfer(transferID, .done, "Downloaded \(fileText)\(skippedText)")
+                self.recordHistory(kind: .download, result: .success, localPath: destination, remotePath: item.path, message: "Downloaded \(fileText)\(skippedText)")
                 if refreshWhenDone {
                     self.refreshLocal()
                 }
             }
+        } onFailure: { error in
+            self.recordHistory(kind: .download, result: .failed, localPath: destination, remotePath: item.path, message: error.localizedDescription)
         }
     }
 
@@ -2781,20 +3406,59 @@ final class AppModel: ObservableObject {
         }
         let credential = credentialForCurrentTab().clone()
         let destination = resolution.path
-        let transferID = enqueue(direction: .download, source: remotePath, destination: destination)
+        let remoteItem = selectedRemoteItems.first { $0.path == remotePath } ?? selectedRemote
+        let transferID = enqueue(
+            direction: .download,
+            source: remotePath,
+            destination: destination,
+            retryDescriptor: .downloadFile(remotePath: remotePath, localPath: destination),
+            remoteSize: remoteItem?.size,
+            remoteModified: remoteItem?.modified
+        )
         guard let control = transferControls[transferID] else { return }
         runBusy("Downloading", transferID: transferID) {
             try await self.transferLimiter.withPermit {
                 guard !control.isCancelled else { throw AppError.commandFailed("Transfer cancelled.") }
                 await MainActor.run { self.markTransfer(transferID, .running, "") }
-                try await self.sftp.download(connection: connection, credential: credential, remotePath: remotePath, localPath: destination, policy: resolution.policy, control: control)
+                let partialPath = destination + ".voltpartial"
+                do {
+                    try await self.sftp.downloadResumable(
+                        connection: connection,
+                        credential: credential,
+                        remotePath: remotePath,
+                        localPath: destination,
+                        partialPath: partialPath,
+                        policy: resolution.policy,
+                        expectedSize: remoteItem?.size ?? -1,
+                        expectedModified: remoteItem?.modified,
+                        control: control
+                    )
+                } catch {
+                    guard !control.isCancelled else { throw error }
+                    try? FileManager.default.removeItem(atPath: partialPath)
+                    try await self.sftp.downloadResumable(
+                        connection: connection,
+                        credential: credential,
+                        remotePath: remotePath,
+                        localPath: destination,
+                        partialPath: partialPath,
+                        policy: resolution.policy,
+                        expectedSize: -1,
+                        expectedModified: nil,
+                        control: control
+                    )
+                }
             }
             await MainActor.run {
                 self.markTransfer(transferID, .done, "Downloaded")
+                try? FileManager.default.removeItem(atPath: destination + ".voltpartial")
+                self.recordHistory(kind: .download, result: .success, localPath: destination, remotePath: remotePath, message: "Downloaded")
                 if refreshWhenDone {
                     self.refreshLocal()
                 }
             }
+        } onFailure: { error in
+            self.recordHistory(kind: .download, result: .failed, localPath: destination, remotePath: remotePath, message: error.localizedDescription)
         }
     }
 
@@ -2804,7 +3468,8 @@ final class AppModel: ObservableObject {
         remotePath: String,
         localURL: URL,
         control: TransferControl,
-        transferID: UUID
+        transferID: UUID,
+        reuseCompletedFiles: Bool
     ) async throws -> FolderDownloadPlan {
         guard !control.isCancelled else { throw AppError.commandFailed("Transfer cancelled.") }
         await MainActor.run {
@@ -2827,7 +3492,8 @@ final class AppModel: ObservableObject {
                     remotePath: child.path,
                     localURL: childURL,
                     control: control,
-                    transferID: transferID
+                    transferID: transferID,
+                    reuseCompletedFiles: reuseCompletedFiles
                 )
                 plan.files.append(contentsOf: childPlan.files)
                 plan.directories.append(contentsOf: childPlan.directories)
@@ -2840,7 +3506,13 @@ final class AppModel: ObservableObject {
                     }
                     continue
                 }
-                let fileDestination = availableDownloadPathIfNeeded(for: childURL.path)
+                if reuseCompletedFiles,
+                   FileManager.default.fileExists(atPath: childURL.path),
+                   localFileSize(at: childURL.path) == child.size {
+                    plan.skippedItems += 1
+                    continue
+                }
+                let fileDestination = reuseCompletedFiles ? childURL.path : availableDownloadPathIfNeeded(for: childURL.path)
                 plan.files.append(FolderDownloadFile(
                     id: child.path,
                     remotePath: child.path,
@@ -3009,6 +3681,7 @@ final class AppModel: ObservableObject {
             credential: credential
         )
         try await sftp.rename(connection: connection, credential: credential, from: remotePath, to: backupPath)
+        recordHistory(kind: .backup, result: .success, remotePath: remotePath, backupPath: backupPath, message: "Created backup before replace")
         return backupPath
     }
 
@@ -3407,6 +4080,12 @@ final class AppModel: ObservableObject {
         }
     }
 
+    private func localFileSize(at path: String) -> Int64? {
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: path),
+              let size = attributes[.size] as? NSNumber else { return nil }
+        return size.int64Value
+    }
+
     func makeLocalFolder() {
         let name = prompt("New Local Folder", defaultValue: "Untitled Folder", actionTitle: "Create")
         guard !name.isEmpty else { return }
@@ -3737,7 +4416,14 @@ final class AppModel: ObservableObject {
             status = "Refused unsafe remote filename."
             return
         }
-        let transferID = enqueue(direction: .edit, source: item.path, destination: localURL.path)
+        let transferID = enqueue(
+            direction: .edit,
+            source: item.path,
+            destination: localURL.path,
+            retryDescriptor: .editDownload(remotePath: item.path, localPath: localURL.path),
+            remoteSize: item.size,
+            remoteModified: item.modified
+        )
         downloadForEdit(remoteItem: item, localURL: localURL, appURL: appURL, transferID: transferID)
     }
 
@@ -3944,7 +4630,7 @@ final class AppModel: ObservableObject {
         _ label: String,
         transferID: UUID? = nil,
         operation: @escaping @Sendable () async throws -> Void,
-        onFailure: (@MainActor () -> Void)? = nil
+        onFailure: (@MainActor (Error) -> Void)? = nil
     ) {
         activeOperationCount += 1
         isBusy = true
@@ -3953,7 +4639,7 @@ final class AppModel: ObservableObject {
             do {
                 try await operation()
             } catch {
-                onFailure?()
+                onFailure?(error)
                 if let transferID {
                     let wasCancelled = transferControls[transferID]?.isCancelled == true
                     markTransfer(
@@ -3970,8 +4656,23 @@ final class AppModel: ObservableObject {
     }
 
     @discardableResult
-    private func enqueue(direction: TransferDirection, source: String, destination: String) -> UUID {
-        let job = TransferJob(direction: direction, source: source, destination: destination, state: .queued)
+    private func enqueue(
+        direction: TransferDirection,
+        source: String,
+        destination: String,
+        retryDescriptor: TransferRetryDescriptor? = nil,
+        remoteSize: Int64? = nil,
+        remoteModified: Date? = nil
+    ) -> UUID {
+        let job = TransferJob(
+            direction: direction,
+            source: source,
+            destination: destination,
+            state: .queued,
+            retryDescriptor: retryDescriptor,
+            remoteSize: remoteSize,
+            remoteModified: remoteModified
+        )
         let control = TransferControl { [weak self] transferred, total in
             Task { @MainActor [weak self] in
                 self?.updateTransferProgress(job.id, transferred: transferred, total: total)
@@ -4039,6 +4740,61 @@ final class AppModel: ObservableObject {
               transfers[index].state == .queued || transfers[index].state == .running else { return }
         control.cancel()
         transfers[index].message = "Cancelling…"
+    }
+
+    func retryTransfer(_ job: TransferJob) {
+        guard job.state == .failed || job.state == .cancelled else { return }
+        guard let retryDescriptor = job.retryDescriptor else {
+            status = "This transfer cannot be retried."
+            return
+        }
+        switch retryDescriptor {
+        case .uploadFile(let localPath, let remotePath):
+            upload(localPath: localPath, remotePath: remotePath, refreshWhenDone: true)
+        case .downloadFile(let remotePath, let localPath):
+            download(remotePath: remotePath, localPath: localPath, refreshWhenDone: true)
+        case .editDownload(let remotePath, let localPath):
+            let localURL = URL(fileURLWithPath: localPath)
+            try? FileManager.default.createDirectory(
+                at: localURL.deletingLastPathComponent(),
+                withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700]
+            )
+            let item = FileItem(
+                name: URL(fileURLWithPath: remotePath).lastPathComponent,
+                path: remotePath,
+                isDirectory: false,
+                size: job.remoteSize,
+                modified: job.remoteModified
+            )
+            downloadForEdit(remoteItem: item, localURL: localURL, appURL: nil, transferID: enqueue(
+                direction: .edit,
+                source: remotePath,
+                destination: localPath,
+                retryDescriptor: retryDescriptor,
+                remoteSize: job.remoteSize,
+                remoteModified: job.remoteModified
+            ))
+        case .uploadEdited(let remotePath, let localPath):
+            if let session = remoteEditSessions.first(where: { $0.remotePath == remotePath && $0.localPath == localPath }) {
+                uploadEditedRemoteFile(session)
+            } else {
+                upload(localPath: localPath, remotePath: remotePath, refreshWhenDone: true)
+            }
+        case .downloadFolder(let remotePath, let localPath):
+            downloadFolder(
+                item: FileItem(name: URL(fileURLWithPath: remotePath).lastPathComponent, path: remotePath, isDirectory: true),
+                localPath: localPath,
+                refreshWhenDone: true,
+                reuseCompletedFiles: true
+            )
+        case .uploadFolder(let localPath, let remotePath):
+            uploadFolder(
+                item: localFileItem(for: URL(fileURLWithPath: localPath, isDirectory: true)),
+                remotePath: remotePath,
+                refreshWhenDone: true
+            )
+        }
     }
 
     func showTerminal() {
@@ -4232,6 +4988,48 @@ final class AppModel: ObservableObject {
             && !credentialForCurrentTab().isEmpty
     }
 
+    private func runSSHCommand(connection: SavedConnection, command: String) async throws -> CommandResult {
+        let probe = try await verifiedHostKeyProbe(for: connection)
+        let knownHostsPath = try terminalKnownHostsPath(for: connection, probe: probe)
+        let hostKeyAlgorithm = openSSHHostKeyAlgorithm(for: probe.keyType)
+        let keyPath = try shellPrivateKeyPath(for: connection)
+        return try await Task.detached {
+            var args = [
+                "-F", "/dev/null",
+                "-oBatchMode=yes",
+                "-oStrictHostKeyChecking=yes",
+                "-oUserKnownHostsFile=\(knownHostsPath)",
+                "-oGlobalKnownHostsFile=/dev/null",
+                "-oClearAllForwardings=yes",
+                "-p", "\(connection.port)"
+            ]
+            if let hostKeyAlgorithm {
+                args.append(contentsOf: ["-oHostKeyAlgorithms=\(hostKeyAlgorithm)"])
+            }
+            if !keyPath.isEmpty {
+                args.append(contentsOf: ["-i", keyPath])
+            }
+            args.append("--")
+            args.append("\(connection.username)@\(connection.host)")
+            args.append(command)
+            return try CommandRunner().run("/usr/bin/ssh", arguments: args, stdin: "")
+        }.value
+    }
+
+    private func shellPrivateKeyPath(for connection: SavedConnection) throws -> String {
+        var bookmarkIsStale = false
+        if let bookmark = connection.privateKeyBookmark,
+           let url = try? URL(
+                resolvingBookmarkData: bookmark,
+                options: [.withSecurityScope, .withoutUI],
+                relativeTo: nil,
+                bookmarkDataIsStale: &bookmarkIsStale
+           ) {
+            return url.path.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        return connection.privateKeyPath.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     private static func shellQuoted(_ value: String) -> String {
         "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
@@ -4299,18 +5097,65 @@ final class AppModel: ObservableObject {
 
     private func loadStartupStorage() {
         Task {
-            let loadedConnections = await Task.detached(priority: .utility) {
+            let loaded = await Task.detached(priority: .utility) {
                 AppPaths.migrateFromSandboxContainerIfNeeded()
                 SecureStorage.migrateFromUserDefaults()
                 AppPaths.cleanupEditFiles(olderThan: 0)
-                return SecureStorage.load()
+                return (connections: SecureStorage.load(), history: OperationHistoryStore.load())
             }.value
-            connections = loadedConnections
+            connections = loaded.connections
+            operationHistory = loaded.history
         }
     }
 
     private func saveConnections() {
         SecureStorage.save(connections)
+    }
+
+    private func recordHistory(
+        kind: OperationHistoryKind,
+        result: OperationHistoryResult,
+        localPath: String? = nil,
+        remotePath: String? = nil,
+        backupPath: String? = nil,
+        message: String
+    ) {
+        let entry = OperationHistoryEntry(
+            kind: kind,
+            result: result,
+            serverName: selectedConnection?.name,
+            localPath: localPath,
+            remotePath: remotePath,
+            backupPath: backupPath,
+            message: message
+        )
+        operationHistory.insert(entry, at: 0)
+        if operationHistory.count > 300 {
+            operationHistory.removeLast(operationHistory.count - 300)
+        }
+        OperationHistoryStore.save(operationHistory)
+    }
+
+    func clearOperationHistory() {
+        operationHistory = []
+        OperationHistoryStore.save(operationHistory)
+        status = "History cleared"
+    }
+
+    func copyHistoryPath(_ entry: OperationHistoryEntry) {
+        guard let path = entry.remotePath ?? entry.localPath ?? entry.backupPath else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(path, forType: .string)
+        status = "Copied history path"
+    }
+
+    func openHistoryLocalPath(_ entry: OperationHistoryEntry) {
+        guard let localPath = entry.localPath,
+              FileManager.default.fileExists(atPath: localPath) else {
+            status = "No local file for this history item."
+            return
+        }
+        NSWorkspace.shared.open(URL(fileURLWithPath: localPath))
     }
 
     private func noteRecentActivity() {
@@ -4681,6 +5526,14 @@ struct ContentView: View {
         }
         .sheet(isPresented: $model.showsHostKeyPrompt) {
             HostKeyVerificationView(model: model)
+        }
+        .sheet(isPresented: $model.showsSyncPreview) {
+            SyncPreviewView(model: model)
+                .frame(width: 860, height: 560)
+        }
+        .sheet(isPresented: $model.showsRemoteSearch) {
+            RemoteSearchView(model: model)
+                .frame(width: 820, height: 540)
         }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)) { _ in
             model.prepareForTermination()
@@ -5095,6 +5948,173 @@ struct HostKeyVerificationView: View {
     }
 }
 
+struct SyncPreviewView: View {
+    @ObservedObject var model: AppModel
+
+    private var actionableCount: Int {
+        model.syncPlan?.items.filter { $0.isSelected }.count ?? 0
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Sync Preview")
+                        .font(.headline)
+                    if let plan = model.syncPlan {
+                        Text("\(plan.localRoot) -> \(plan.remoteRoot)")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+                }
+                Spacer()
+                Button("Cancel") {
+                    model.showsSyncPreview = false
+                }
+                Button("Run \(actionableCount) Actions") {
+                    model.executeSyncPlan()
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(actionableCount == 0)
+            }
+            .padding(14)
+            Divider()
+
+            if let plan = model.syncPlan {
+                ScrollView {
+                    LazyVStack(spacing: 2) {
+                        ForEach(plan.items) { item in
+                            syncRow(item)
+                        }
+                    }
+                    .padding(10)
+                }
+            } else {
+                ProgressView("Building sync preview")
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+        }
+    }
+
+    private func syncRow(_ item: SyncPlanItem) -> some View {
+        HStack(spacing: 10) {
+            Toggle("", isOn: Binding(
+                get: { item.isSelected },
+                set: { model.updateSyncPlanItemSelection(item.id, isSelected: $0) }
+            ))
+            .labelsHidden()
+            .disabled(item.action == .skip || item.action == .conflict || item.action == .remoteOnly)
+
+            Image(systemName: item.isDirectory ? "folder.fill" : "doc")
+                .foregroundStyle(item.isDirectory ? Color.accentColor : Color.secondary)
+                .frame(width: 18)
+            Text(item.relativePath)
+                .lineLimit(1)
+            Spacer(minLength: 12)
+            Text(item.action.rawValue)
+                .font(.caption)
+                .foregroundStyle(color(for: item.action))
+                .frame(width: 110, alignment: .trailing)
+            Text(sizeText(for: item))
+                .font(.caption2.monospacedDigit())
+                .foregroundStyle(.secondary)
+                .frame(width: 92, alignment: .trailing)
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
+        .background(
+            RoundedRectangle(cornerRadius: 6)
+                .fill(item.isSelected ? VoltTheme.selectedFill : Color.clear)
+        )
+    }
+
+    private func color(for action: SyncAction) -> Color {
+        switch action {
+        case .uploadNew, .createFolder: .green
+        case .replaceRemote: .orange
+        case .conflict: .red
+        default: .secondary
+        }
+    }
+
+    private func sizeText(for item: SyncPlanItem) -> String {
+        guard !item.isDirectory else { return "--" }
+        let local = item.localSize.map { ByteCountFormatter.string(fromByteCount: $0, countStyle: .file) } ?? "--"
+        let remote = item.remoteSize.map { ByteCountFormatter.string(fromByteCount: $0, countStyle: .file) } ?? "--"
+        return "\(local) / \(remote)"
+    }
+}
+
+struct RemoteSearchView: View {
+    @ObservedObject var model: AppModel
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 10) {
+                Picker("Mode", selection: $model.remoteSearchMode) {
+                    ForEach(RemoteSearchMode.allCases) { mode in
+                        Text(mode.rawValue).tag(mode)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .frame(width: 190)
+                TextField("Search remote", text: $model.remoteSearchText)
+                    .textFieldStyle(.roundedBorder)
+                    .onSubmit(model.performRemoteSearch)
+                Button("Search", action: model.performRemoteSearch)
+                    .disabled(model.remoteSearchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || model.isSearchingRemote)
+                Button("Close") {
+                    model.showsRemoteSearch = false
+                }
+            }
+            .padding(14)
+            Divider()
+
+            if model.isSearchingRemote {
+                ProgressView("Searching")
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if model.remoteSearchResults.isEmpty {
+                Text("No results")
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                List(model.remoteSearchResults) { result in
+                    HStack(spacing: 10) {
+                        Image(systemName: result.isDirectory ? "folder" : "doc.text")
+                            .foregroundStyle(result.isDirectory ? Color.accentColor : Color.secondary)
+                            .frame(width: 18)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(result.path)
+                                .lineLimit(1)
+                            if let line = result.line, let preview = result.preview {
+                                Text("\(line): \(preview)")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(1)
+                            }
+                        }
+                        Spacer()
+                        Button("Reveal") { model.openRemoteSearchResult(result) }
+                        Button("Download") { model.downloadRemoteSearchResult(result) }
+                            .disabled(result.isDirectory)
+                        Button("Tail") { model.tailRemoteSearchResult(result) }
+                            .disabled(result.isDirectory)
+                        Button {
+                            model.copyRemoteSearchResultPath(result)
+                        } label: {
+                            Image(systemName: "doc.on.doc")
+                        }
+                        .buttonStyle(.plain)
+                        .help("Copy path")
+                    }
+                    .padding(.vertical, 4)
+                }
+            }
+        }
+    }
+}
+
 @MainActor
 final class SecurePasswordFieldController: ObservableObject {
     fileprivate weak var textField: NSSecureTextField?
@@ -5299,6 +6319,8 @@ struct ConnectionEditor: View {
             )
 
             logBookmarkEditor
+
+            commandShortcutEditor
         }
         .padding(12)
         .onDisappear {
@@ -5366,6 +6388,43 @@ struct ConnectionEditor: View {
                     }
                     .buttonStyle(.plain)
                     .help("Remove log bookmark")
+                }
+            }
+        }
+    }
+
+    private var commandShortcutEditor: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            HStack {
+                Label("Commands", systemImage: "terminal")
+                    .foregroundStyle(.secondary)
+                    .frame(minWidth: 120, alignment: .leading)
+                Spacer()
+                Button("Add Command") {
+                    model.connectionDraft.commandShortcuts.append(CommandShortcut())
+                }
+            }
+            ForEach(model.connectionDraft.commandShortcuts.indices, id: \.self) { index in
+                HStack(spacing: 8) {
+                    TextField("Name", text: $model.connectionDraft.commandShortcuts[index].name)
+                        .textFieldStyle(.roundedBorder)
+                        .frame(width: 150)
+                    TextField("Command", text: $model.connectionDraft.commandShortcuts[index].command)
+                        .textFieldStyle(.roundedBorder)
+                    Picker("Confirm", selection: $model.connectionDraft.commandShortcuts[index].confirmationMode) {
+                        ForEach(CommandConfirmationMode.allCases) { mode in
+                            Text(mode.title).tag(mode)
+                        }
+                    }
+                    .labelsHidden()
+                    .frame(width: 150)
+                    Button {
+                        model.connectionDraft.commandShortcuts.remove(at: index)
+                    } label: {
+                        Image(systemName: "minus.circle")
+                    }
+                    .buttonStyle(.plain)
+                    .help("Remove command")
                 }
             }
         }
@@ -5579,6 +6638,10 @@ struct BrowserSplitView: View {
                 .disabled(model.selectedConnection == nil)
             Button("Open SSH Terminal", action: model.showTerminal)
                 .disabled(model.selectedConnection == nil)
+            Button("Sync Preview", action: model.showSyncPreview)
+                .disabled(model.selectedConnection == nil)
+            Button("Remote Search", action: model.showRemoteSearch)
+                .disabled(model.selectedConnection == nil)
             if let connection = model.selectedConnection, !connection.quickPaths.isEmpty {
                 Menu("Quick Paths") {
                     ForEach(connection.quickPaths) { quickPath in
@@ -5593,6 +6656,16 @@ struct BrowserSplitView: View {
                     Button("Download Log Bookmark...", action: model.downloadLogBookmark)
                     Button("Open Log Bookmark", action: model.openLogBookmark)
                     Button("Live Tail Log Bookmark", action: model.tailLogBookmark)
+                }
+            }
+            if let connection = model.selectedConnection, !connection.commandShortcuts.isEmpty {
+                Menu("Commands") {
+                    ForEach(connection.commandShortcuts) { shortcut in
+                        Button(shortcut.name) {
+                            model.runCommandShortcut(shortcut)
+                        }
+                        .disabled(shortcut.command.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    }
                 }
             }
             Divider()
