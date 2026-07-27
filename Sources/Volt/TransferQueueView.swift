@@ -274,17 +274,27 @@ struct TransferQueueView: View {
                     .lineLimit(1)
                     .foregroundStyle(.secondary)
             }
+            TableColumn("State") { session in
+                Text(session.state.rawValue)
+                    .foregroundStyle(session.state == .failed ? Color.red : .secondary)
+            }
+            .width(90)
             TableColumn("Action") { session in
                 HStack(spacing: 8) {
+                    Button("Diff") {
+                        model.showRemoteEditDiff(session)
+                    }
+                    .disabled(session.originalSnapshotPath.isEmpty)
                     Button("Upload Edited") {
                         model.uploadEditedRemoteFile(session)
                     }
+                    .disabled(session.state == .uploading)
                     Button("Discard") {
                         model.discardRemoteEditSession(session)
                     }
                 }
             }
-            .width(210)
+            .width(290)
         }
     }
 
@@ -642,9 +652,14 @@ struct TransferQueueView: View {
                     .lineLimit(1)
             }
             Spacer(minLength: 8)
+            Button("Diff") {
+                model.showRemoteEditDiff(session)
+            }
+            .disabled(session.originalSnapshotPath.isEmpty)
             Button("Upload") {
                 model.uploadEditedRemoteFile(session)
             }
+            .disabled(session.state == .uploading)
             Button("Discard") {
                 model.discardRemoteEditSession(session)
             }

@@ -85,6 +85,14 @@ struct SidebarView: View {
                         }
                     }
 
+                    if let connection = model.selectedConnection, !connection.quickPaths.isEmpty {
+                        sidebarSection("QUICK PATHS") {
+                            ForEach(connection.quickPaths) { quickPath in
+                                quickPathRow(quickPath)
+                            }
+                        }
+                    }
+
                     sidebarSection("RECENT", trailing: {
                         Button(action: model.clearRecents) {
                             Image(systemName: "xmark.circle")
@@ -294,6 +302,16 @@ struct SidebarView: View {
             Divider()
             Button("Remove") { model.removeConnection(id: connection.id) }
         }
+    }
+
+    private func quickPathRow(_ quickPath: RemoteQuickPath) -> some View {
+        Button {
+            model.openQuickPath(quickPath)
+        } label: {
+            sidebarRowContent(title: quickPath.name, subtitle: quickPath.path, systemImage: "arrow.turn.down.right", tint: .accentColor)
+        }
+        .buttonStyle(.plain)
+        .help(quickPath.path)
     }
 
     private func recentRow(title: String, subtitle: String, systemImage: String) -> some View {

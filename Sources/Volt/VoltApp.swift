@@ -74,6 +74,32 @@ enum ConnectionSafetyProfile: String, Codable, CaseIterable, Identifiable {
     }
 }
 
+struct RemoteQuickPath: Identifiable, Codable, Equatable {
+    var id = UUID()
+    var name: String = "Web Root"
+    var path: String = "/var/www"
+}
+
+struct RemoteLogBookmark: Identifiable, Codable, Equatable {
+    var id = UUID()
+    var name: String = "App Log"
+    var path: String = "/var/log/app.log"
+}
+
+enum RemoteEditUploadMode: String, Codable, CaseIterable, Identifiable {
+    case manual = "manual"
+    case askAfterSave = "askAfterSave"
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .manual: "Manual"
+        case .askAfterSave: "Ask After Save"
+        }
+    }
+}
+
 struct SavedConnection: Identifiable, Codable, Equatable {
     var id = UUID()
     var name: String = "My Server"
@@ -87,6 +113,10 @@ struct SavedConnection: Identifiable, Codable, Equatable {
     var permissionPreset: RemotePermissionPreset?
     var safetyProfile: ConnectionSafetyProfile = .standard
     var allowRootLoginOnImportantServer = false
+    var quickPaths: [RemoteQuickPath] = []
+    var logBookmarks: [RemoteLogBookmark] = []
+    var backupBeforeReplace = true
+    var remoteEditUploadMode: RemoteEditUploadMode = .askAfterSave
 
     var effectivePermissionPreset: RemotePermissionPreset {
         permissionPreset ?? .web
@@ -111,6 +141,10 @@ struct SavedConnection: Identifiable, Codable, Equatable {
         case permissionPreset
         case safetyProfile
         case allowRootLoginOnImportantServer
+        case quickPaths
+        case logBookmarks
+        case backupBeforeReplace
+        case remoteEditUploadMode
     }
 
     init(from decoder: Decoder) throws {
@@ -127,6 +161,10 @@ struct SavedConnection: Identifiable, Codable, Equatable {
         permissionPreset = try container.decodeIfPresent(RemotePermissionPreset.self, forKey: .permissionPreset)
         safetyProfile = try container.decodeIfPresent(ConnectionSafetyProfile.self, forKey: .safetyProfile) ?? .standard
         allowRootLoginOnImportantServer = try container.decodeIfPresent(Bool.self, forKey: .allowRootLoginOnImportantServer) ?? false
+        quickPaths = try container.decodeIfPresent([RemoteQuickPath].self, forKey: .quickPaths) ?? []
+        logBookmarks = try container.decodeIfPresent([RemoteLogBookmark].self, forKey: .logBookmarks) ?? []
+        backupBeforeReplace = try container.decodeIfPresent(Bool.self, forKey: .backupBeforeReplace) ?? true
+        remoteEditUploadMode = try container.decodeIfPresent(RemoteEditUploadMode.self, forKey: .remoteEditUploadMode) ?? .askAfterSave
     }
 }
 
@@ -413,12 +451,27 @@ actor TransferLimiter {
     }
 }
 
+enum RemoteEditState: String, Equatable {
+    case clean = "Clean"
+    case modified = "Modified"
+    case uploading = "Uploading"
+    case uploaded = "Uploaded"
+    case failed = "Failed"
+}
+
 struct RemoteEditSession: Identifiable, Equatable {
     let id = UUID()
     var remotePath: String
     var localPath: String
+    var originalSnapshotPath: String = ""
     var fileName: String
     var openedAt: Date = Date()
+    var state: RemoteEditState = .clean
+    var lastObservedSize: UInt64 = 0
+    var lastObservedModifiedAt: Date?
+    var pendingChangeSignature: String?
+    var pendingChangeDetectedAt: Date?
+    var lastPromptedChangeSignature: String?
 }
 
 struct BrowserTab: Identifiable, Equatable {
@@ -537,6 +590,7 @@ final class SSHTerminalSession: @unchecked Sendable {
         connection: SavedConnection,
         knownHostsPath: String,
         hostKeyAlgorithm: String?,
+        remoteCommand: String? = nil,
         onOutput: @escaping @Sendable (String) -> Void,
         onExit: @escaping @Sendable (Int32) -> Void
     ) throws {
@@ -546,7 +600,12 @@ final class SSHTerminalSession: @unchecked Sendable {
         guard !alreadyRunning else { return }
 
         let executable = "/usr/bin/ssh"
-        let arguments = try sshArguments(connection: connection, knownHostsPath: knownHostsPath, hostKeyAlgorithm: hostKeyAlgorithm)
+        let arguments = try sshArguments(
+            connection: connection,
+            knownHostsPath: knownHostsPath,
+            hostKeyAlgorithm: hostKeyAlgorithm,
+            remoteCommand: remoteCommand
+        )
         let argv = Self.makeArgv(executable: executable, arguments: arguments)
         guard let executablePointer = argv.executablePointer else {
             Self.freeArgv(argv)
@@ -656,7 +715,12 @@ final class SSHTerminalSession: @unchecked Sendable {
         return shouldNotify
     }
 
-    private func sshArguments(connection: SavedConnection, knownHostsPath: String, hostKeyAlgorithm: String?) throws -> [String] {
+    private func sshArguments(
+        connection: SavedConnection,
+        knownHostsPath: String,
+        hostKeyAlgorithm: String?,
+        remoteCommand: String?
+    ) throws -> [String] {
         var args = [
             "-F", "/dev/null",
             "-o", "BatchMode=no",
@@ -675,6 +739,9 @@ final class SSHTerminalSession: @unchecked Sendable {
         }
         args.append("--")
         args.append("\(connection.username)@\(connection.host)")
+        if let remoteCommand, !remoteCommand.isEmpty {
+            args.append(remoteCommand)
+        }
         return args
     }
 
@@ -1040,6 +1107,13 @@ enum AppPaths {
 
     static func editDirectory() throws -> URL {
         let directory = try supportDirectory().appendingPathComponent("Edits", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
+        return directory
+    }
+
+    static func logDownloadDirectory() throws -> URL {
+        let directory = try supportDirectory().appendingPathComponent("Logs", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
         return directory
@@ -1610,11 +1684,18 @@ final class AppModel: ObservableObject {
     private var lastTransferProgressUpdateByID: [UUID: Date] = [:]
     private var uploadConflictBatchPolicy: UploadConflictBatchPolicy?
     private var reservedUploadPaths: Set<String> = []
+    private var remoteEditMonitorTask: Task<Void, Never>?
     private var activeOperationCount = 0
     private var isRestoringTab = false
     private var isSuppressingSidebarSelection = false
     private var isSelectingConnection = false
     private let transferProgressMinimumInterval: TimeInterval = 0.08
+    private static let backupTimestampFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyyMMdd-HHmmss"
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        return formatter
+    }()
 
     var hasCompletedTransfers: Bool {
         transfers.contains { $0.state == .done || $0.state == .failed || $0.state == .cancelled }
@@ -1625,6 +1706,7 @@ final class AppModel: ObservableObject {
         refreshLocal()
         syncCurrentTab()
         loadStartupStorage()
+        startRemoteEditMonitor()
     }
 
     var selectedConnection: SavedConnection? {
@@ -2017,6 +2099,89 @@ final class AppModel: ObservableObject {
         refreshLocal()
     }
 
+    func openQuickPath(_ quickPath: RemoteQuickPath) {
+        guard selectedConnection != nil else {
+            status = "Choose a connection"
+            return
+        }
+        remotePath = normalizedRemotePath(quickPath.path)
+        selectedRemoteIDs.removeAll()
+        noteRecentActivity()
+        loadCurrentRemotePathUsingCache()
+    }
+
+    func downloadLogBookmark() {
+        guard selectedConnection != nil else {
+            status = "Choose a connection"
+            return
+        }
+        guard let bookmark = chooseLogBookmark(title: "Download Log Bookmark") else { return }
+        guard let destination = safeLocalDestination(
+            base: URL(fileURLWithPath: localPath, isDirectory: true),
+            name: logDownloadFileName(for: bookmark)
+        ) else {
+            status = "Refused unsafe log filename."
+            return
+        }
+        download(remotePath: bookmark.path, localPath: destination.path, refreshWhenDone: true)
+    }
+
+    func openLogBookmark() {
+        guard let connection = selectedConnection else {
+            status = "Choose a connection"
+            return
+        }
+        guard let bookmark = chooseLogBookmark(title: "Open Log Bookmark") else { return }
+        let credential = credentialForCurrentTab().clone()
+        let destination: URL
+        do {
+            let directory = try AppPaths.logDownloadDirectory().appendingPathComponent(UUID().uuidString, isDirectory: true)
+            try FileManager.default.createDirectory(
+                at: directory,
+                withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700]
+            )
+            destination = directory.appendingPathComponent(logDownloadFileName(for: bookmark))
+        } catch {
+            status = error.localizedDescription
+            return
+        }
+        let transferID = enqueue(direction: .download, source: bookmark.path, destination: destination.path)
+        guard let control = transferControls[transferID] else { return }
+        runBusy("Opening log", transferID: transferID) {
+            try await self.transferLimiter.withPermit {
+                guard !control.isCancelled else { throw AppError.commandFailed("Transfer cancelled.") }
+                await MainActor.run { self.markTransfer(transferID, .running, "") }
+                try await self.sftp.download(
+                    connection: connection,
+                    credential: credential,
+                    remotePath: bookmark.path,
+                    localPath: destination.path,
+                    policy: .createNew,
+                    control: control
+                )
+            }
+            await MainActor.run {
+                self.markTransfer(transferID, .done, "Opened log")
+                self.openFile(destination, with: nil)
+            }
+        }
+    }
+
+    func tailLogBookmark() {
+        guard let connection = selectedConnection else {
+            status = "Choose a connection"
+            return
+        }
+        guard let bookmark = chooseLogBookmark(title: "Live Tail Log Bookmark") else { return }
+        if usesPasswordSFTP(connection: connection) {
+            status = "Live tail requires SSH key or ssh-agent authentication."
+            return
+        }
+        let command = "tail -n 200 -f \(Self.shellQuoted(bookmark.path))"
+        startTerminal(remoteCommand: command, intro: "Tailing \(bookmark.path)")
+    }
+
     func removeConnection(id: UUID) {
         if selectedConnectionID == id {
             guard confirmDiscardEditSessions(remoteEditSessions, action: "remove this connection") else { return }
@@ -2268,10 +2433,22 @@ final class AppModel: ObservableObject {
         let credential = credentialForCurrentTab().clone()
         let transferID = enqueue(direction: .upload, source: session.localPath, destination: session.remotePath)
         guard let control = transferControls[transferID] else { return }
+        setRemoteEditState(session.id, .uploading)
         runBusy("Uploading edited file", transferID: transferID) {
             let warning = try await self.transferLimiter.withPermit {
                 guard !control.isCancelled else { throw AppError.commandFailed("Transfer cancelled.") }
                 await MainActor.run { self.markTransfer(transferID, .running, "") }
+                if let backupPath = try await self.backupRemoteFileIfNeeded(
+                    connection: connection,
+                    credential: credential,
+                    remotePath: session.remotePath,
+                    policy: .replace
+                ) {
+                    await MainActor.run {
+                        self.invalidateRemoteCacheForChangedItem(connectionID: connection.id, path: backupPath)
+                        self.markTransfer(transferID, .running, "Backed up existing file")
+                    }
+                }
                 return try await self.sftp.upload(
                     connection: connection,
                     credential: credential,
@@ -2289,6 +2466,8 @@ final class AppModel: ObservableObject {
                 self.syncCurrentTab()
                 self.refreshRemote()
             }
+        } onFailure: {
+            self.setRemoteEditState(session.id, .failed)
         }
     }
 
@@ -2360,6 +2539,17 @@ final class AppModel: ObservableObject {
                 await MainActor.run {
                     self.updateTransferDestination(transferID, destination)
                     self.markTransfer(transferID, .running, "")
+                }
+                if let backupPath = try await self.backupRemoteFileIfNeeded(
+                    connection: connection,
+                    credential: credential,
+                    remotePath: destination,
+                    policy: policy
+                ) {
+                    await MainActor.run {
+                        self.invalidateRemoteCacheForChangedItem(connectionID: connection.id, path: backupPath)
+                        self.markTransfer(transferID, .running, "Backed up existing file")
+                    }
                 }
                 return try await self.sftp.upload(connection: connection, credential: credential, localPath: localPath, remotePath: destination, policy: policy, control: control)
             }
@@ -2460,6 +2650,17 @@ final class AppModel: ObservableObject {
                 guard case let .upload(destination, policy) = resolution else {
                     summary.skippedItems += 1
                     continue
+                }
+                if let backupPath = try await backupRemoteFileIfNeeded(
+                    connection: connection,
+                    credential: credential,
+                    remotePath: destination,
+                    policy: policy
+                ) {
+                    await MainActor.run {
+                        self.invalidateRemoteCacheForChangedItem(connectionID: connection.id, path: backupPath)
+                        self.markTransfer(transferID, .running, "Backed up \(childURL.lastPathComponent)")
+                    }
                 }
                 _ = try await sftp.upload(
                     connection: connection,
@@ -2790,6 +2991,44 @@ final class AppModel: ObservableObject {
         }
 
         return summary
+    }
+
+    private func backupRemoteFileIfNeeded(
+        connection: SavedConnection,
+        credential: SensitiveCredential,
+        remotePath: String,
+        policy: UploadPublishPolicy
+    ) async throws -> String? {
+        guard connection.backupBeforeReplace else { return nil }
+        guard case .replace = policy else { return nil }
+        guard let existingEntry = try await remoteEntry(at: remotePath, connection: connection, credential: credential),
+              !existingEntry.isDirectory else { return nil }
+        let backupPath = try await availableRemoteBackupPath(
+            for: remotePath,
+            connection: connection,
+            credential: credential
+        )
+        try await sftp.rename(connection: connection, credential: credential, from: remotePath, to: backupPath)
+        return backupPath
+    }
+
+    private func availableRemoteBackupPath(
+        for path: String,
+        connection: SavedConnection,
+        credential: SensitiveCredential
+    ) async throws -> String {
+        guard let parent = remoteParentPath(path) else { return path + ".bak" }
+        let name = URL(fileURLWithPath: path).lastPathComponent
+        let timestamp = Self.backupTimestampFormatter.string(from: Date())
+        var index = 1
+        while true {
+            let suffix = index == 1 ? "" : "-\(index)"
+            let candidate = joinRemote(parent, "\(name).bak-\(timestamp)\(suffix)")
+            if try await remoteEntry(at: candidate, connection: connection, credential: credential) == nil {
+                return candidate
+            }
+            index += 1
+        }
     }
 
     private func resolveUploadConflict(
@@ -3524,7 +3763,18 @@ final class AppModel: ObservableObject {
                 throw error
             }
             await MainActor.run {
-                self.remoteEditSessions.insert(RemoteEditSession(remotePath: remoteItem.path, localPath: localURL.path, fileName: remoteItem.name), at: 0)
+                let snapshotURL = localURL.deletingLastPathComponent().appendingPathComponent(".original-\(remoteItem.name)")
+                try? FileManager.default.copyItem(at: localURL, to: snapshotURL)
+                let observed = self.localEditFileObservation(at: localURL.path)
+                self.remoteEditSessions.insert(RemoteEditSession(
+                    remotePath: remoteItem.path,
+                    localPath: localURL.path,
+                    originalSnapshotPath: snapshotURL.path,
+                    fileName: remoteItem.name,
+                    state: .clean,
+                    lastObservedSize: observed.size,
+                    lastObservedModifiedAt: observed.modifiedAt
+                ), at: 0)
                 self.markTransfer(transferID, .done, "Opened for edit")
                 self.showsTransfers = true
                 self.transferPanelTab = .remoteEdits
@@ -3538,6 +3788,126 @@ final class AppModel: ObservableObject {
         WorkspaceFileOpener.open(fileURL, with: appURL) { [weak self] message in
             self?.status = message
         }
+    }
+
+    func showRemoteEditDiff(_ session: RemoteEditSession) {
+        let originalPath = session.originalSnapshotPath
+        guard !originalPath.isEmpty,
+              FileManager.default.fileExists(atPath: originalPath),
+              FileManager.default.fileExists(atPath: session.localPath) else {
+            status = "Diff is unavailable for this edit session."
+            return
+        }
+        do {
+            let result = try CommandRunner().run(
+                "/usr/bin/diff",
+                arguments: ["-u", originalPath, session.localPath],
+                stdin: ""
+            )
+            let diffText: String
+            if result.status == 0 {
+                diffText = "No changes."
+            } else if result.status == 1 {
+                diffText = result.stdout.isEmpty ? "No text diff available." : result.stdout
+            } else {
+                diffText = result.stderr.isEmpty ? "Diff failed." : result.stderr
+            }
+            showTextAlert(title: "Diff: \(session.fileName)", text: diffText)
+        } catch {
+            status = error.localizedDescription
+        }
+    }
+
+    private func showTextAlert(title: String, text: String) {
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.addButton(withTitle: "Done")
+
+        let scrollView = NSScrollView(frame: NSRect(x: 0, y: 0, width: 720, height: 420))
+        scrollView.hasVerticalScroller = true
+        scrollView.hasHorizontalScroller = true
+        let textView = NSTextView(frame: scrollView.bounds)
+        textView.isEditable = false
+        textView.isSelectable = true
+        textView.isRichText = false
+        textView.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
+        textView.string = text
+        textView.autoresizingMask = [.width, .height]
+        scrollView.documentView = textView
+        alert.accessoryView = scrollView
+        alert.runModal()
+    }
+
+    private func startRemoteEditMonitor() {
+        remoteEditMonitorTask?.cancel()
+        remoteEditMonitorTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .milliseconds(700))
+                self?.inspectRemoteEditFiles()
+            }
+        }
+    }
+
+    private func inspectRemoteEditFiles() {
+        guard selectedConnection?.remoteEditUploadMode == .askAfterSave else { return }
+        guard !remoteEditSessions.isEmpty else { return }
+
+        for session in remoteEditSessions {
+            guard let observed = optionalLocalEditFileObservation(at: session.localPath) else { continue }
+            let signature = "\(observed.size):\(observed.modifiedAt?.timeIntervalSince1970 ?? 0)"
+            guard let index = remoteEditSessions.firstIndex(where: { $0.id == session.id }) else { continue }
+            let previousSignature = "\(remoteEditSessions[index].lastObservedSize):\(remoteEditSessions[index].lastObservedModifiedAt?.timeIntervalSince1970 ?? 0)"
+
+            if signature != previousSignature {
+                if remoteEditSessions[index].pendingChangeSignature == signature,
+                   let detectedAt = remoteEditSessions[index].pendingChangeDetectedAt,
+                   Date().timeIntervalSince(detectedAt) >= 1.0,
+                   remoteEditSessions[index].lastPromptedChangeSignature != signature {
+                    remoteEditSessions[index].state = .modified
+                    remoteEditSessions[index].lastObservedSize = observed.size
+                    remoteEditSessions[index].lastObservedModifiedAt = observed.modifiedAt
+                    remoteEditSessions[index].lastPromptedChangeSignature = signature
+                    remoteEditSessions[index].pendingChangeSignature = nil
+                    remoteEditSessions[index].pendingChangeDetectedAt = nil
+                    let updatedSession = remoteEditSessions[index]
+                    syncCurrentTab()
+                    promptForRemoteEditUpload(updatedSession)
+                } else if remoteEditSessions[index].pendingChangeSignature != signature {
+                    remoteEditSessions[index].pendingChangeSignature = signature
+                    remoteEditSessions[index].pendingChangeDetectedAt = Date()
+                    syncCurrentTab()
+                }
+            }
+        }
+    }
+
+    private func promptForRemoteEditUpload(_ session: RemoteEditSession) {
+        guard remoteEditSessions.contains(where: { $0.id == session.id }) else { return }
+        let alert = NSAlert()
+        alert.messageText = "Upload saved changes to \"\(session.fileName)\"?"
+        alert.informativeText = "Volt noticed the temporary edit file changed."
+        alert.addButton(withTitle: "Upload")
+        alert.addButton(withTitle: "Later")
+        if alert.runModal() == .alertFirstButtonReturn {
+            uploadEditedRemoteFile(session)
+        }
+    }
+
+    private func setRemoteEditState(_ id: RemoteEditSession.ID, _ state: RemoteEditState) {
+        guard let index = remoteEditSessions.firstIndex(where: { $0.id == id }) else { return }
+        remoteEditSessions[index].state = state
+        syncCurrentTab()
+    }
+
+    private func localEditFileObservation(at path: String) -> (size: UInt64, modifiedAt: Date?) {
+        optionalLocalEditFileObservation(at: path) ?? (0, nil)
+    }
+
+    private func optionalLocalEditFileObservation(at path: String) -> (size: UInt64, modifiedAt: Date?)? {
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: path) else { return nil }
+        let size = (attributes[.size] as? NSNumber)?.uint64Value ?? 0
+        let modifiedAt = attributes[.modificationDate] as? Date
+        return (size, modifiedAt)
     }
 
     private func cleanupEditSessions(_ sessions: [RemoteEditSession]) {
@@ -3570,7 +3940,12 @@ final class AppModel: ObservableObject {
         return panel.runModal() == .OK ? panel.url : nil
     }
 
-    private func runBusy(_ label: String, transferID: UUID? = nil, operation: @escaping @Sendable () async throws -> Void) {
+    private func runBusy(
+        _ label: String,
+        transferID: UUID? = nil,
+        operation: @escaping @Sendable () async throws -> Void,
+        onFailure: (@MainActor () -> Void)? = nil
+    ) {
         activeOperationCount += 1
         isBusy = true
         status = label
@@ -3578,6 +3953,7 @@ final class AppModel: ObservableObject {
             do {
                 try await operation()
             } catch {
+                onFailure?()
                 if let transferID {
                     let wasCancelled = transferControls[transferID]?.isCancelled == true
                     markTransfer(
@@ -3671,6 +4047,10 @@ final class AppModel: ObservableObject {
     }
 
     func startTerminal() {
+        startTerminal(remoteCommand: nil, intro: nil)
+    }
+
+    private func startTerminal(remoteCommand: String?, intro: String?) {
         guard let selectedTabID else { return }
         guard let connection = selectedConnection else {
             status = "Choose a connection"
@@ -3681,6 +4061,9 @@ final class AppModel: ObservableObject {
             return
         }
         terminalStatus = .connecting
+        if let intro {
+            appendTerminalOutput("\(intro)\n")
+        }
         appendTerminalOutput("Connecting to \(connection.username)@\(connection.host):\(connection.port)...\n")
         syncCurrentTab()
         showTerminal()
@@ -3698,6 +4081,7 @@ final class AppModel: ObservableObject {
                     connection: connection,
                     knownHostsPath: knownHostsPath,
                     hostKeyAlgorithm: openSSHHostKeyAlgorithm(for: probe.keyType),
+                    remoteCommand: remoteCommand,
                     onOutput: { [weak self] text in
                         Task { @MainActor [weak self] in
                             self?.appendTerminalOutput(text, tabID: tabID)
@@ -3785,6 +4169,8 @@ final class AppModel: ObservableObject {
 
     func prepareForTermination() {
         for control in transferControls.values { control.cancel() }
+        remoteEditMonitorTask?.cancel()
+        remoteEditMonitorTask = nil
         for session in terminalSessions.values { session.terminate() }
         terminalSessions.removeAll()
         Task { await sftp.closeAllPooledSessions() }
@@ -3803,6 +4189,51 @@ final class AppModel: ObservableObject {
         input.stringValue = defaultValue
         alert.accessoryView = input
         return alert.runModal() == .alertFirstButtonReturn ? input.stringValue.trimmingCharacters(in: .whitespacesAndNewlines) : ""
+    }
+
+    private func chooseLogBookmark(title: String) -> RemoteLogBookmark? {
+        guard let connection = selectedConnection else { return nil }
+        guard !connection.logBookmarks.isEmpty else {
+            status = "Add a log bookmark in connection settings first."
+            return nil
+        }
+
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = "Choose a saved log path for \(connection.name)."
+        alert.addButton(withTitle: "Choose")
+        alert.addButton(withTitle: "Cancel")
+
+        let menu = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 360, height: 28), pullsDown: false)
+        for bookmark in connection.logBookmarks {
+            menu.addItem(withTitle: "\(bookmark.name)  \(bookmark.path)")
+        }
+        alert.accessoryView = menu
+
+        guard alert.runModal() == .alertFirstButtonReturn,
+              connection.logBookmarks.indices.contains(menu.indexOfSelectedItem)
+        else { return nil }
+        return connection.logBookmarks[menu.indexOfSelectedItem]
+    }
+
+    private func logDownloadFileName(for bookmark: RemoteLogBookmark) -> String {
+        let name = URL(fileURLWithPath: bookmark.path).lastPathComponent
+        return name.isEmpty ? "\(bookmark.name).log" : name
+    }
+
+    private func normalizedRemotePath(_ path: String) -> String {
+        let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return "/" }
+        return trimmed.hasPrefix("/") ? trimmed : "/" + trimmed
+    }
+
+    private func usesPasswordSFTP(connection: SavedConnection) -> Bool {
+        connection.privateKeyPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && !credentialForCurrentTab().isEmpty
+    }
+
+    private static func shellQuoted(_ value: String) -> String {
+        "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
 
     private func confirmImportantServerAction(
@@ -4842,10 +5273,101 @@ struct ConnectionEditor: View {
                 }
                 Spacer(minLength: 0)
             }
+
+            HStack(spacing: 12) {
+                Text("Workflow")
+                    .foregroundStyle(.secondary)
+                    .frame(minWidth: 120, alignment: .leading)
+                Toggle("Backup before replace", isOn: $model.connectionDraft.backupBeforeReplace)
+                    .toggleStyle(.checkbox)
+                Picker("Remote edit upload", selection: $model.connectionDraft.remoteEditUploadMode) {
+                    ForEach(RemoteEditUploadMode.allCases) { mode in
+                        Text(mode.title).tag(mode)
+                    }
+                }
+                .labelsHidden()
+                .pickerStyle(.segmented)
+                .frame(width: 240)
+                Spacer(minLength: 0)
+            }
+
+            bookmarkEditor(
+                title: "Quick paths",
+                systemImage: "arrow.turn.down.right",
+                addTitle: "Add Path",
+                rows: $model.connectionDraft.quickPaths
+            )
+
+            logBookmarkEditor
         }
         .padding(12)
         .onDisappear {
             passwordController.clear()
+        }
+    }
+
+    private func bookmarkEditor(
+        title: String,
+        systemImage: String,
+        addTitle: String,
+        rows: Binding<[RemoteQuickPath]>
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 7) {
+            HStack {
+                Label(title, systemImage: systemImage)
+                    .foregroundStyle(.secondary)
+                    .frame(minWidth: 120, alignment: .leading)
+                Spacer()
+                Button(addTitle) {
+                    rows.wrappedValue.append(RemoteQuickPath())
+                }
+            }
+            ForEach(rows.wrappedValue.indices, id: \.self) { index in
+                HStack(spacing: 8) {
+                    TextField("Name", text: rows[index].name)
+                        .textFieldStyle(.roundedBorder)
+                        .frame(width: 160)
+                    TextField("Remote path", text: rows[index].path)
+                        .textFieldStyle(.roundedBorder)
+                    Button {
+                        rows.wrappedValue.remove(at: index)
+                    } label: {
+                        Image(systemName: "minus.circle")
+                    }
+                    .buttonStyle(.plain)
+                    .help("Remove quick path")
+                }
+            }
+        }
+    }
+
+    private var logBookmarkEditor: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            HStack {
+                Label("Log bookmarks", systemImage: "doc.text.magnifyingglass")
+                    .foregroundStyle(.secondary)
+                    .frame(minWidth: 120, alignment: .leading)
+                Spacer()
+                Button("Add Log") {
+                    model.connectionDraft.logBookmarks.append(RemoteLogBookmark())
+                }
+            }
+            ForEach(model.connectionDraft.logBookmarks.indices, id: \.self) { index in
+                HStack(spacing: 8) {
+                    TextField("Name", text: $model.connectionDraft.logBookmarks[index].name)
+                        .textFieldStyle(.roundedBorder)
+                        .frame(width: 160)
+                    TextField("Remote log path", text: $model.connectionDraft.logBookmarks[index].path)
+                        .textFieldStyle(.roundedBorder)
+                    Button {
+                        model.connectionDraft.logBookmarks.remove(at: index)
+                    } label: {
+                        Image(systemName: "minus.circle")
+                    }
+                    .buttonStyle(.plain)
+                    .help("Remove log bookmark")
+                }
+            }
         }
     }
 }
@@ -5057,6 +5579,22 @@ struct BrowserSplitView: View {
                 .disabled(model.selectedConnection == nil)
             Button("Open SSH Terminal", action: model.showTerminal)
                 .disabled(model.selectedConnection == nil)
+            if let connection = model.selectedConnection, !connection.quickPaths.isEmpty {
+                Menu("Quick Paths") {
+                    ForEach(connection.quickPaths) { quickPath in
+                        Button(quickPath.name) {
+                            model.openQuickPath(quickPath)
+                        }
+                    }
+                }
+            }
+            if let connection = model.selectedConnection, !connection.logBookmarks.isEmpty {
+                Menu("Log Bookmarks") {
+                    Button("Download Log Bookmark...", action: model.downloadLogBookmark)
+                    Button("Open Log Bookmark", action: model.openLogBookmark)
+                    Button("Live Tail Log Bookmark", action: model.tailLogBookmark)
+                }
+            }
             Divider()
             Button("Download Selected", action: model.downloadSelected)
                 .disabled(model.selectedRemoteItems.isEmpty)
