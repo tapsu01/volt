@@ -137,7 +137,6 @@ struct SavedConnection: Identifiable, Codable, Equatable {
     var quickPaths: [RemoteQuickPath] = []
     var logBookmarks: [RemoteLogBookmark] = []
     var commandShortcuts: [CommandShortcut] = []
-    var backupBeforeReplace = true
     var remoteEditUploadMode: RemoteEditUploadMode = .askAfterSave
 
     var effectivePermissionPreset: RemotePermissionPreset {
@@ -166,7 +165,6 @@ struct SavedConnection: Identifiable, Codable, Equatable {
         case quickPaths
         case logBookmarks
         case commandShortcuts
-        case backupBeforeReplace
         case remoteEditUploadMode
     }
 
@@ -187,7 +185,6 @@ struct SavedConnection: Identifiable, Codable, Equatable {
         quickPaths = try container.decodeIfPresent([RemoteQuickPath].self, forKey: .quickPaths) ?? []
         logBookmarks = try container.decodeIfPresent([RemoteLogBookmark].self, forKey: .logBookmarks) ?? []
         commandShortcuts = try container.decodeIfPresent([CommandShortcut].self, forKey: .commandShortcuts) ?? []
-        backupBeforeReplace = try container.decodeIfPresent(Bool.self, forKey: .backupBeforeReplace) ?? true
         remoteEditUploadMode = try container.decodeIfPresent(RemoteEditUploadMode.self, forKey: .remoteEditUploadMode) ?? .askAfterSave
     }
 }
@@ -1872,12 +1869,6 @@ final class AppModel: ObservableObject {
     private var isSuppressingSidebarSelection = false
     private var isSelectingConnection = false
     private let transferProgressMinimumInterval: TimeInterval = 0.08
-    private static let backupTimestampFormatter: DateFormatter = {
-        let formatter = DateFormatter()
-        formatter.dateFormat = "yyyyMMdd-HHmmss"
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        return formatter
-    }()
 
     var hasCompletedTransfers: Bool {
         transfers.contains { $0.state == .done || $0.state == .failed || $0.state == .cancelled }
@@ -2597,11 +2588,6 @@ final class AppModel: ObservableObject {
             status = "No sync actions selected"
             return
         }
-        if selectedItems.contains(where: { $0.action == .replaceRemote }),
-           !confirmImportantServerAction(connection: connection, action: "replace remote files during sync", remotePath: plan.remoteRoot, confirmation: "SYNC") {
-            return
-        }
-
         let credential = credentialForCurrentTab().clone()
         let transferID = enqueue(direction: .upload, source: plan.localRoot, destination: plan.remoteRoot)
         guard let control = transferControls[transferID] else { return }
@@ -2627,11 +2613,6 @@ final class AppModel: ObservableObject {
                 guard !control.isCancelled else { throw AppError.commandFailed("Transfer cancelled.") }
                 guard let localPath = item.localPath else { continue }
                 let policy: UploadPublishPolicy = item.action == .replaceRemote ? .replace : .createNew
-                if let backupPath = try await self.backupRemoteFileIfNeeded(connection: connection, credential: credential, remotePath: item.remotePath, policy: policy) {
-                    await MainActor.run {
-                        self.invalidateRemoteCacheForChangedItem(connectionID: connection.id, path: backupPath)
-                    }
-                }
                 _ = try await self.sftp.upload(connection: connection, credential: credential, localPath: localPath, remotePath: item.remotePath, policy: policy, control: control)
                 completed += 1
                 await MainActor.run {
@@ -3017,12 +2998,6 @@ final class AppModel: ObservableObject {
 
     func uploadEditedRemoteFile(_ session: RemoteEditSession) {
         guard let connection = selectedConnection else { return }
-        guard confirmImportantServerAction(
-            connection: connection,
-            action: "replace the edited remote file",
-            remotePath: session.remotePath,
-            confirmation: "REPLACE"
-        ) else { return }
         let credential = credentialForCurrentTab().clone()
         let transferID = enqueue(
             direction: .upload,
@@ -3036,17 +3011,6 @@ final class AppModel: ObservableObject {
             let warning = try await self.transferLimiter.withPermit {
                 guard !control.isCancelled else { throw AppError.commandFailed("Transfer cancelled.") }
                 await MainActor.run { self.markTransfer(transferID, .running, "") }
-                if let backupPath = try await self.backupRemoteFileIfNeeded(
-                    connection: connection,
-                    credential: credential,
-                    remotePath: session.remotePath,
-                    policy: .replace
-                ) {
-                    await MainActor.run {
-                        self.invalidateRemoteCacheForChangedItem(connectionID: connection.id, path: backupPath)
-                        self.markTransfer(transferID, .running, "Backed up existing file")
-                    }
-                }
                 return try await self.sftp.upload(
                     connection: connection,
                     credential: credential,
@@ -3144,17 +3108,6 @@ final class AppModel: ObservableObject {
                 await MainActor.run {
                     self.updateTransferDestination(transferID, destination)
                     self.markTransfer(transferID, .running, "")
-                }
-                if let backupPath = try await self.backupRemoteFileIfNeeded(
-                    connection: connection,
-                    credential: credential,
-                    remotePath: destination,
-                    policy: policy
-                ) {
-                    await MainActor.run {
-                        self.invalidateRemoteCacheForChangedItem(connectionID: connection.id, path: backupPath)
-                        self.markTransfer(transferID, .running, "Backed up existing file")
-                    }
                 }
                 return try await self.sftp.upload(connection: connection, credential: credential, localPath: localPath, remotePath: destination, policy: policy, control: control)
             }
@@ -3266,17 +3219,6 @@ final class AppModel: ObservableObject {
                 guard case let .upload(destination, policy) = resolution else {
                     summary.skippedItems += 1
                     continue
-                }
-                if let backupPath = try await backupRemoteFileIfNeeded(
-                    connection: connection,
-                    credential: credential,
-                    remotePath: destination,
-                    policy: policy
-                ) {
-                    await MainActor.run {
-                        self.invalidateRemoteCacheForChangedItem(connectionID: connection.id, path: backupPath)
-                        self.markTransfer(transferID, .running, "Backed up \(childURL.lastPathComponent)")
-                    }
                 }
                 _ = try await sftp.upload(
                     connection: connection,
@@ -3665,45 +3607,6 @@ final class AppModel: ObservableObject {
         return summary
     }
 
-    private func backupRemoteFileIfNeeded(
-        connection: SavedConnection,
-        credential: SensitiveCredential,
-        remotePath: String,
-        policy: UploadPublishPolicy
-    ) async throws -> String? {
-        guard connection.backupBeforeReplace else { return nil }
-        guard case .replace = policy else { return nil }
-        guard let existingEntry = try await remoteEntry(at: remotePath, connection: connection, credential: credential),
-              !existingEntry.isDirectory else { return nil }
-        let backupPath = try await availableRemoteBackupPath(
-            for: remotePath,
-            connection: connection,
-            credential: credential
-        )
-        try await sftp.rename(connection: connection, credential: credential, from: remotePath, to: backupPath)
-        recordHistory(kind: .backup, result: .success, remotePath: remotePath, backupPath: backupPath, message: "Created backup before replace")
-        return backupPath
-    }
-
-    private func availableRemoteBackupPath(
-        for path: String,
-        connection: SavedConnection,
-        credential: SensitiveCredential
-    ) async throws -> String {
-        guard let parent = remoteParentPath(path) else { return path + ".bak" }
-        let name = URL(fileURLWithPath: path).lastPathComponent
-        let timestamp = Self.backupTimestampFormatter.string(from: Date())
-        var index = 1
-        while true {
-            let suffix = index == 1 ? "" : "-\(index)"
-            let candidate = joinRemote(parent, "\(name).bak-\(timestamp)\(suffix)")
-            if try await remoteEntry(at: candidate, connection: connection, credential: credential) == nil {
-                return candidate
-            }
-            index += 1
-        }
-    }
-
     private func resolveUploadConflict(
         connection: SavedConnection,
         credential: SensitiveCredential,
@@ -3894,16 +3797,6 @@ final class AppModel: ObservableObject {
         case .alertThirdButtonReturn:
             choice = .skip
         default:
-            choice = .cancel
-        }
-
-        if choice == .replace,
-           !confirmImportantServerAction(
-                connection: connection,
-                action: primaryActionTitle.lowercased() == "merge" ? "merge into the existing remote folder" : "replace the remote item",
-                remotePath: remotePath,
-                confirmation: primaryActionTitle.uppercased()
-           ) {
             choice = .cancel
         }
 
@@ -4257,12 +4150,6 @@ final class AppModel: ObservableObject {
         guard !newName.isEmpty, newName != item.name else { return }
         
         let newPath = joinRemote(remotePath, newName)
-        guard confirmImportantServerAction(
-            connection: connection,
-            action: "move the remote item",
-            remotePath: "\(item.path) -> \(newPath)",
-            confirmation: "MOVE"
-        ) else { return }
         let credential = credentialForCurrentTab().clone()
         runBusy("Moving remote item") {
             try await self.sftp.rename(connection: connection, credential: credential, from: item.path, to: newPath)
@@ -4295,22 +4182,13 @@ final class AppModel: ObservableObject {
 
     func deleteRemoteSelected() {
         guard let connection = selectedConnection, let item = selectedRemote else { return }
-        if connection.requiresImportantServerGuards {
-            guard confirmImportantServerAction(
-                connection: connection,
-                action: "permanently delete the remote item",
-                remotePath: item.path,
-                confirmation: "DELETE"
-            ) else { return }
-        } else {
-            let alert = NSAlert()
-            alert.messageText = "Delete \"\(item.name)\"?"
-            alert.informativeText = "This remote item will be permanently deleted."
-            alert.alertStyle = .warning
-            alert.addButton(withTitle: "Delete")
-            alert.addButton(withTitle: "Cancel")
-            guard alert.runModal() == .alertFirstButtonReturn else { return }
-        }
+        let alert = NSAlert()
+        alert.messageText = "Delete \"\(item.name)\"?"
+        alert.informativeText = "This remote item will be permanently deleted."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Delete")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
         let credential = credentialForCurrentTab().clone()
         runBusy("Deleting remote item") {
             try await self.sftp.remove(connection: connection, credential: credential, path: item.path, isDirectory: item.isDirectory)
@@ -4355,12 +4233,6 @@ final class AppModel: ObservableObject {
         let newName = prompt("Rename Remote Item", defaultValue: item.name, actionTitle: "Rename")
         guard !newName.isEmpty, newName != item.name else { return }
         let destination = remoteParentPath(item.path).map { joinRemote($0, newName) } ?? joinRemote(remotePath, newName)
-        guard confirmImportantServerAction(
-            connection: connection,
-            action: "rename the remote item",
-            remotePath: "\(item.path) -> \(destination)",
-            confirmation: "RENAME"
-        ) else { return }
         let credential = credentialForCurrentTab().clone()
         runBusy("Renaming remote item") {
             try await self.sftp.rename(connection: connection, credential: credential, from: item.path, to: destination)
@@ -5032,40 +4904,6 @@ final class AppModel: ObservableObject {
 
     private static func shellQuoted(_ value: String) -> String {
         "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
-    }
-
-    private func confirmImportantServerAction(
-        connection: SavedConnection,
-        action: String,
-        remotePath: String,
-        confirmation: String
-    ) -> Bool {
-        guard connection.requiresImportantServerGuards else { return true }
-
-        let alert = NSAlert()
-        alert.messageText = "Confirm Important Server action"
-        alert.informativeText = """
-        You are about to \(action).
-
-        \(remoteActionContext(connection: connection, remotePath: remotePath))
-
-        Type \(confirmation) to continue.
-        """
-        alert.alertStyle = .critical
-        alert.addButton(withTitle: "Confirm")
-        alert.addButton(withTitle: "Cancel")
-
-        let input = NSTextField(frame: NSRect(x: 0, y: 0, width: 320, height: 24))
-        input.placeholderString = confirmation
-        alert.accessoryView = input
-
-        guard alert.runModal() == .alertFirstButtonReturn,
-              input.stringValue.trimmingCharacters(in: .whitespacesAndNewlines) == confirmation
-        else {
-            status = "Important Server action cancelled"
-            return false
-        }
-        return true
     }
 
     private func confirmImportantServerPasswordUse(connection: SavedConnection) -> Bool {
@@ -6298,8 +6136,6 @@ struct ConnectionEditor: View {
                 Text("Workflow")
                     .foregroundStyle(.secondary)
                     .frame(minWidth: 120, alignment: .leading)
-                Toggle("Backup before replace", isOn: $model.connectionDraft.backupBeforeReplace)
-                    .toggleStyle(.checkbox)
                 Picker("Remote edit upload", selection: $model.connectionDraft.remoteEditUploadMode) {
                     ForEach(RemoteEditUploadMode.allCases) { mode in
                         Text(mode.title).tag(mode)

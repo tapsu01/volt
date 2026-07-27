@@ -182,8 +182,7 @@ server refuses the requested permission change.
 
 ## Important Servers
 
-Saved connections can be marked as `Important Server`. This mode adds extra
-confirmation around destructive remote actions and overwrite uploads, disables
+Saved connections can be marked as `Important Server`. This mode disables
 apply-to-all replace decisions for upload conflicts, warns before password SFTP
 use, and blocks `root` login unless an explicit root override is enabled.
 
