@@ -1856,6 +1856,7 @@ final class AppModel: ObservableObject {
     private var terminalSessions: [BrowserTab.ID: SSHTerminalSession] = [:]
     private var verifiedHostProbes: [String: HostKeyProbe] = [:]
     private var remoteDirectoryCache: [String: RemoteDirectoryCacheEntry] = [:]
+    private var pendingConnectAfterEditorDismiss: (tabID: BrowserTab.ID, connectionID: UUID)?
 
     private let sftp = SFTPClient()
     private let transferLimiter = TransferLimiter(limit: TransferTuning.maxConcurrentTransfers)
@@ -2193,11 +2194,13 @@ final class AppModel: ObservableObject {
     }
 
     func showConnectionEditor() {
+        pendingConnectAfterEditorDismiss = nil
         showsConnectionEditor = true
         syncCurrentTab()
     }
 
     func hideConnectionEditor() {
+        pendingConnectAfterEditorDismiss = nil
         showsConnectionEditor = false
         syncCurrentTab()
     }
@@ -2238,6 +2241,7 @@ final class AppModel: ObservableObject {
     }
 
     func editConnection(_ connection: SavedConnection) {
+        pendingConnectAfterEditorDismiss = nil
         selectOrCreateTab(for: connection)
         if selectedConnectionID != connection.id {
             guard confirmDiscardEditSessions(remoteEditSessions, action: "edit another connection") else { return }
@@ -2305,13 +2309,30 @@ final class AppModel: ObservableObject {
         remotePath = connectionDraft.remotePath.isEmpty ? "/" : connectionDraft.remotePath
         capturePasswordInput(password)
         saveDraft()
+        if let selectedTabID, let selectedConnectionID {
+            pendingConnectAfterEditorDismiss = (tabID: selectedTabID, connectionID: selectedConnectionID)
+            status = "Preparing connection"
+        }
         showsConnectionEditor = false
         syncCurrentTab()
+    }
+
+    func connectAfterConnectionEditorDismissed() {
+        guard let pending = pendingConnectAfterEditorDismiss else { return }
+        guard !showsConnectionEditor,
+              selectedTabID == pending.tabID,
+              selectedConnectionID == pending.connectionID
+        else {
+            pendingConnectAfterEditorDismiss = nil
+            return
+        }
+        pendingConnectAfterEditorDismiss = nil
         refreshRemote()
     }
 
     func newConnection() {
         guard confirmDiscardEditSessions(remoteEditSessions, action: "create a new connection") else { return }
+        pendingConnectAfterEditorDismiss = nil
         cleanupEditSessions(remoteEditSessions)
         if let selectedTabID { stopTerminal(for: selectedTabID) }
         let previousConnectionID = selectedConnectionID
@@ -5353,7 +5374,9 @@ struct ContentView: View {
         // (khong bi day xuong thanh 2 dong).
         .ignoresSafeArea(.container, edges: .top)
         .background(WindowConfigurator(appAppearance: appAppearance.wrappedValue))
-        .sheet(isPresented: $model.showsConnectionEditor) {
+        .sheet(isPresented: $model.showsConnectionEditor, onDismiss: {
+            model.connectAfterConnectionEditorDismissed()
+        }) {
             ConnectionEditor(model: model)
                 .padding(4)
                 .frame(width: 820)

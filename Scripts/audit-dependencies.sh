@@ -11,9 +11,16 @@ else
   exit 1
 fi
 
+set +e
 OUTDATED="$($BREW outdated --formula libssh2 openssl@3)"
+OUTDATED_STATUS=$?
+set -e
 if [ -n "$OUTDATED" ]; then
   /usr/bin/printf 'Security dependencies need review/update:\n%s\n' "$OUTDATED" >&2
+  exit 1
+fi
+if [ "$OUTDATED_STATUS" -ne 0 ]; then
+  /usr/bin/printf 'Could not audit Homebrew dependency freshness.\n' >&2
   exit 1
 fi
 

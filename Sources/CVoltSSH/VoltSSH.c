@@ -823,6 +823,16 @@ int volt_sftp_upload(const char *host, int port, const char *username, const cha
             overwrite ? LIBSSH2_SFTP_RENAME_OVERWRITE : 0
         );
     }
+    if (rename_result != 0 && overwrite && libssh2_sftp_unlink(session.sftp, remote_path) == 0) {
+        rename_result = libssh2_sftp_rename_ex(
+            session.sftp,
+            temp_path,
+            (unsigned int)strlen(temp_path),
+            remote_path,
+            (unsigned int)strlen(remote_path),
+            0
+        );
+    }
     if (rename_result != 0) {
         libssh2_sftp_unlink(session.sftp, temp_path);
         set_session_error(session.session, error, error_len, "Could not publish completed remote upload.");
