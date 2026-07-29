@@ -60,20 +60,6 @@ enum RemotePermissionPreset: String, Codable, CaseIterable, Identifiable {
     }
 }
 
-enum ConnectionSafetyProfile: String, Codable, CaseIterable, Identifiable {
-    case standard = "standard"
-    case important = "important"
-
-    var id: String { rawValue }
-
-    var title: String {
-        switch self {
-        case .standard: "Standard"
-        case .important: "Important Server"
-        }
-    }
-}
-
 struct RemoteQuickPath: Identifiable, Codable, Equatable {
     var id = UUID()
     var name: String = "Web Root"
@@ -132,8 +118,6 @@ struct SavedConnection: Identifiable, Codable, Equatable {
     var privateKeyPath: String = ""
     var privateKeyBookmark: Data?
     var permissionPreset: RemotePermissionPreset?
-    var safetyProfile: ConnectionSafetyProfile = .standard
-    var allowRootLoginOnImportantServer = false
     var quickPaths: [RemoteQuickPath] = []
     var logBookmarks: [RemoteLogBookmark] = []
     var commandShortcuts: [CommandShortcut] = []
@@ -141,10 +125,6 @@ struct SavedConnection: Identifiable, Codable, Equatable {
 
     var effectivePermissionPreset: RemotePermissionPreset {
         permissionPreset ?? .web
-    }
-
-    var requiresImportantServerGuards: Bool {
-        safetyProfile == .important
     }
 
     init() {}
@@ -160,8 +140,6 @@ struct SavedConnection: Identifiable, Codable, Equatable {
         case privateKeyPath
         case privateKeyBookmark
         case permissionPreset
-        case safetyProfile
-        case allowRootLoginOnImportantServer
         case quickPaths
         case logBookmarks
         case commandShortcuts
@@ -180,8 +158,6 @@ struct SavedConnection: Identifiable, Codable, Equatable {
         privateKeyPath = try container.decodeIfPresent(String.self, forKey: .privateKeyPath) ?? ""
         privateKeyBookmark = try container.decodeIfPresent(Data.self, forKey: .privateKeyBookmark)
         permissionPreset = try container.decodeIfPresent(RemotePermissionPreset.self, forKey: .permissionPreset)
-        safetyProfile = try container.decodeIfPresent(ConnectionSafetyProfile.self, forKey: .safetyProfile) ?? .standard
-        allowRootLoginOnImportantServer = try container.decodeIfPresent(Bool.self, forKey: .allowRootLoginOnImportantServer) ?? false
         quickPaths = try container.decodeIfPresent([RemoteQuickPath].self, forKey: .quickPaths) ?? []
         logBookmarks = try container.decodeIfPresent([RemoteLogBookmark].self, forKey: .logBookmarks) ?? []
         commandShortcuts = try container.decodeIfPresent([CommandShortcut].self, forKey: .commandShortcuts) ?? []
@@ -2301,11 +2277,6 @@ final class AppModel: ObservableObject {
             status = validationError
             return
         }
-        if shouldWarnAboutImportantServerPassword(connectionDraft, password: password),
-           !confirmImportantServerPasswordUse(connection: connectionDraft) {
-            status = "Connection cancelled"
-            return
-        }
         remotePath = connectionDraft.remotePath.isEmpty ? "/" : connectionDraft.remotePath
         capturePasswordInput(password)
         saveDraft()
@@ -2388,14 +2359,6 @@ final class AppModel: ObservableObject {
     }
 
     func connectWithPassword(_ password: String) {
-        if shouldWarnAboutImportantServerPassword(connectionDraft, password: password),
-           !confirmImportantServerPasswordUse(connection: connectionDraft) {
-            credentialForCurrentTab().clear()
-            showsPasswordPrompt = false
-            syncCurrentTab()
-            status = "Connection cancelled"
-            return
-        }
         capturePasswordInput(password)
         showsPasswordPrompt = false
         syncCurrentTab()
@@ -2518,8 +2481,8 @@ final class AppModel: ObservableObject {
             recordHistory(kind: .command, result: .failed, remotePath: command, message: status)
             return
         }
-        if shouldConfirmCommand(shortcut, command: command, connection: connection),
-           !confirmCommandShortcut(shortcut, command: command, connection: connection) {
+        if shouldConfirmCommand(shortcut, command: command),
+           !confirmCommandShortcut(shortcut, command: command) {
             status = "Command cancelled"
             recordHistory(kind: .command, result: .cancelled, remotePath: command, message: "Command cancelled")
             return
@@ -2528,8 +2491,8 @@ final class AppModel: ObservableObject {
         startTerminal(remoteCommand: command, intro: "Running \(shortcut.name)")
     }
 
-    private func shouldConfirmCommand(_ shortcut: CommandShortcut, command: String, connection: SavedConnection) -> Bool {
-        if connection.requiresImportantServerGuards || shortcut.confirmationMode == .always { return true }
+    private func shouldConfirmCommand(_ shortcut: CommandShortcut, command: String) -> Bool {
+        if shortcut.confirmationMode == .always { return true }
         let lowered = command.lowercased()
         let riskyTokens = [" rm ", " rm -", "sudo ", "reboot", "shutdown", "systemctl restart", "service "]
         return riskyTokens.contains { token in
@@ -2537,13 +2500,11 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private func confirmCommandShortcut(_ shortcut: CommandShortcut, command: String, connection: SavedConnection) -> Bool {
+    private func confirmCommandShortcut(_ shortcut: CommandShortcut, command: String) -> Bool {
         let alert = NSAlert()
         alert.messageText = "Run command shortcut \"\(shortcut.name)\"?"
-        alert.informativeText = connection.requiresImportantServerGuards
-            ? "Important Server: \(remoteActionContext(connection: connection, remotePath: command))"
-            : command
-        alert.alertStyle = connection.requiresImportantServerGuards ? .critical : .warning
+        alert.informativeText = command
+        alert.alertStyle = .warning
         alert.addButton(withTitle: "Run")
         alert.addButton(withTitle: "Cancel")
         return alert.runModal() == .alertFirstButtonReturn
@@ -3645,11 +3606,11 @@ final class AppModel: ObservableObject {
             return .upload(path: remotePath, policy: .createNew)
         }
 
-        if let uploadConflictBatchPolicy, !connection.requiresImportantServerGuards {
+        if let uploadConflictBatchPolicy {
             return try await uploadResolution(for: uploadConflictBatchPolicy, remotePath: remotePath, connection: connection, credential: credential)
         }
 
-        let promptResult = promptUploadConflict(remotePath: remotePath, connection: connection)
+        let promptResult = promptUploadConflict(remotePath: remotePath)
         if let batchPolicy = promptResult.applyToAllPolicy {
             uploadConflictBatchPolicy = batchPolicy
         }
@@ -3686,7 +3647,7 @@ final class AppModel: ObservableObject {
             return remotePath
         }
 
-        if let uploadConflictBatchPolicy, !connection.requiresImportantServerGuards {
+        if let uploadConflictBatchPolicy {
             return try await folderUploadResolution(
                 for: uploadConflictBatchPolicy,
                 existingEntry: existingEntry,
@@ -3697,7 +3658,7 @@ final class AppModel: ObservableObject {
         }
 
         guard existingEntry.isDirectory else {
-            let promptResult = promptFolderUploadBlockedByFile(remotePath: remotePath, connection: connection)
+            let promptResult = promptFolderUploadBlockedByFile(remotePath: remotePath)
             if let batchPolicy = promptResult.applyToAllPolicy {
                 uploadConflictBatchPolicy = batchPolicy
             }
@@ -3718,7 +3679,6 @@ final class AppModel: ObservableObject {
 
         let promptResult = promptUploadConflict(
             remotePath: remotePath,
-            connection: connection,
             primaryActionTitle: "Merge"
         )
         if let batchPolicy = promptResult.applyToAllPolicy {
@@ -3786,27 +3746,20 @@ final class AppModel: ObservableObject {
 
     private func promptUploadConflict(
         remotePath: String,
-        connection: SavedConnection,
         primaryActionTitle: String = "Replace"
     ) -> (choice: UploadConflictChoice, applyToAllPolicy: UploadConflictBatchPolicy?) {
         let name = URL(fileURLWithPath: remotePath).lastPathComponent
         let alert = NSAlert()
         alert.messageText = "An item named \"\(name)\" already exists on the server."
-        alert.informativeText = connection.requiresImportantServerGuards
-            ? "Important Server: \(remoteActionContext(connection: connection, remotePath: remotePath))\nChoose what Volt should do before uploading."
-            : "Choose what Volt should do before uploading."
+        alert.informativeText = "Choose what Volt should do before uploading."
         alert.alertStyle = .warning
         alert.addButton(withTitle: primaryActionTitle)
         alert.addButton(withTitle: "Keep Both")
         alert.addButton(withTitle: "Skip")
         alert.addButton(withTitle: "Cancel")
 
-        let checkboxTitle = connection.requiresImportantServerGuards
-            ? "Apply to all upload conflicts (disabled for Important Server)"
-            : "Apply to all upload conflicts"
-        let checkbox = NSButton(checkboxWithTitle: checkboxTitle, target: nil, action: nil)
+        let checkbox = NSButton(checkboxWithTitle: "Apply to all upload conflicts", target: nil, action: nil)
         checkbox.state = .off
-        checkbox.isEnabled = !connection.requiresImportantServerGuards
         alert.accessoryView = checkbox
 
         var choice: UploadConflictChoice
@@ -3840,24 +3793,18 @@ final class AppModel: ObservableObject {
         return (choice, applyToAllPolicy)
     }
 
-    private func promptFolderUploadBlockedByFile(remotePath: String, connection: SavedConnection) -> (choice: UploadConflictChoice, applyToAllPolicy: UploadConflictBatchPolicy?) {
+    private func promptFolderUploadBlockedByFile(remotePath: String) -> (choice: UploadConflictChoice, applyToAllPolicy: UploadConflictBatchPolicy?) {
         let name = URL(fileURLWithPath: remotePath).lastPathComponent
         let alert = NSAlert()
         alert.messageText = "A file named \"\(name)\" already exists on the server."
-        alert.informativeText = connection.requiresImportantServerGuards
-            ? "Important Server: \(remoteActionContext(connection: connection, remotePath: remotePath))\nA folder cannot be merged into that file. Choose a new folder name or skip it."
-            : "A folder cannot be merged into that file. Choose a new folder name or skip it."
+        alert.informativeText = "A folder cannot be merged into that file. Choose a new folder name or skip it."
         alert.alertStyle = .warning
         alert.addButton(withTitle: "Keep Both")
         alert.addButton(withTitle: "Skip")
         alert.addButton(withTitle: "Cancel")
 
-        let checkboxTitle = connection.requiresImportantServerGuards
-            ? "Apply to all upload conflicts (disabled for Important Server)"
-            : "Apply to all upload conflicts"
-        let checkbox = NSButton(checkboxWithTitle: checkboxTitle, target: nil, action: nil)
+        let checkbox = NSButton(checkboxWithTitle: "Apply to all upload conflicts", target: nil, action: nil)
         checkbox.state = .off
-        checkbox.isEnabled = !connection.requiresImportantServerGuards
         alert.accessoryView = checkbox
 
         let choice: UploadConflictChoice
@@ -4927,24 +4874,6 @@ final class AppModel: ObservableObject {
         "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
 
-    private func confirmImportantServerPasswordUse(connection: SavedConnection) -> Bool {
-        let alert = NSAlert()
-        alert.messageText = "Use password authentication for Important Server?"
-        alert.informativeText = """
-        \(remoteActionContext(connection: connection, remotePath: connection.remotePath))
-
-        SSH key or ssh-agent authentication is recommended for long-lived server access. Password SFTP is allowed, but keep this connection limited and verify the host key fingerprint out of band.
-        """
-        alert.alertStyle = .warning
-        alert.addButton(withTitle: "Continue")
-        alert.addButton(withTitle: "Cancel")
-        return alert.runModal() == .alertFirstButtonReturn
-    }
-
-    private func remoteActionContext(connection: SavedConnection, remotePath: String) -> String {
-        "Server: \(connection.username)@\(connection.host):\(connection.port)\nRemote path: \(remotePath)"
-    }
-
     private func remoteParentPath(_ path: String) -> String? {
         let parent = URL(fileURLWithPath: path).deletingLastPathComponent().path
         return parent.isEmpty ? "/" : parent
@@ -5058,18 +4987,7 @@ final class AppModel: ObservableObject {
         if !(1...65_535).contains(connection.port) {
             return "SSH port must be between 1 and 65535."
         }
-        if connection.requiresImportantServerGuards,
-           username == "root",
-           !connection.allowRootLoginOnImportantServer {
-            return "Important Server blocks root login unless the explicit root override is enabled."
-        }
         return nil
-    }
-
-    private func shouldWarnAboutImportantServerPassword(_ connection: SavedConnection, password: String) -> Bool {
-        connection.requiresImportantServerGuards
-            && connection.privateKeyPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            && !password.trimmingCharacters(in: .newlines).isEmpty
     }
 
     private func credentialForCurrentTab() -> SensitiveCredential {
@@ -6137,25 +6055,6 @@ struct ConnectionEditor: View {
             }
 
             HStack(spacing: 12) {
-                Text("Safety")
-                    .foregroundStyle(.secondary)
-                    .frame(minWidth: 120, alignment: .leading)
-                Picker("Safety", selection: $model.connectionDraft.safetyProfile) {
-                    ForEach(ConnectionSafetyProfile.allCases) { profile in
-                        Text(profile.title).tag(profile)
-                    }
-                }
-                .labelsHidden()
-                .pickerStyle(.segmented)
-                .frame(width: 260)
-                if model.connectionDraft.requiresImportantServerGuards {
-                    Toggle("Allow root login", isOn: $model.connectionDraft.allowRootLoginOnImportantServer)
-                        .toggleStyle(.checkbox)
-                }
-                Spacer(minLength: 0)
-            }
-
-            HStack(spacing: 12) {
                 Text("Workflow")
                     .foregroundStyle(.secondary)
                     .frame(minWidth: 120, alignment: .leading)
@@ -6302,13 +6201,6 @@ struct PasswordPromptView: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
-            if model.connectionDraft.requiresImportantServerGuards,
-               model.connectionDraft.privateKeyPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                Text("Important Server: SSH key or ssh-agent authentication is recommended.")
-                    .font(.caption)
-                    .foregroundStyle(.orange)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
             SecurePasswordField(controller: passwordController, placeholder: "Password") { password in
                 model.connectWithPassword(password)
             }

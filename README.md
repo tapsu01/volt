@@ -180,17 +180,6 @@ created remote files and folders.
 Volt reports a warning when a transfer or create operation succeeds but the
 server refuses the requested permission change.
 
-## Important Servers
-
-Saved connections can be marked as `Important Server`. This mode disables
-apply-to-all replace decisions for upload conflicts, warns before password SFTP
-use, and blocks `root` login unless an explicit root override is enabled.
-
-For important VPSes, build from a clean working tree, run
-`Scripts/verify-self-build.sh`, verify the SSH host-key fingerprint outside
-Volt, and keep a server snapshot or backup before large delete, rename, move, or
-replace operations.
-
 ## Security Model
 
 - SFTP transport and authentication are implemented with libssh2.
@@ -203,6 +192,8 @@ replace operations.
   to Keychain, UserDefaults, connection files, or command arguments.
 - Saved connection metadata uses `0600`; application support and temporary edit
   directories use `0700`.
+- Verify SSH host-key fingerprints outside Volt and keep a server snapshot or
+  backup before large delete, rename, move, or replace operations.
 - Connection and host-key probes have a 15-second timeout.
 - Downloaded and temporary edit files are created with restrictive permissions.
 - Remote directory entries with unsafe or invalid names are skipped before they
