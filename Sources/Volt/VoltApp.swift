@@ -300,7 +300,7 @@ private enum TransferTuning {
     static let maxParallelFileDownloadSessions = 4
 }
 
-enum FileBrowserViewMode: String, Codable, CaseIterable, Identifiable {
+enum FileBrowserViewMode: String, Codable, CaseIterable, Identifiable, Sendable {
     case icons
     case list
     case columns
@@ -317,7 +317,7 @@ enum FileBrowserViewMode: String, Codable, CaseIterable, Identifiable {
     }
 }
 
-enum FileBrowserColumn: String, Codable, CaseIterable, Identifiable {
+enum FileBrowserColumn: String, Codable, CaseIterable, Identifiable, Sendable {
     case size = "Size"
     case date = "Date"
     case kind = "Kind"
@@ -337,11 +337,11 @@ enum FileBrowserColumn: String, Codable, CaseIterable, Identifiable {
     }
 }
 
-enum FileBrowserSortField: String, Codable {
+enum FileBrowserSortField: String, Codable, Sendable {
     case name, size, date, kind, owner, group, permissions
 }
 
-struct FileBrowserPreferences: Codable, Equatable {
+struct FileBrowserPreferences: Codable, Equatable, Sendable {
     var viewMode: FileBrowserViewMode = .list
     var visibleColumns: [FileBrowserColumn] = [.size, .date]
     var nameColumnWidth: CGFloat = 360
@@ -1822,17 +1822,21 @@ final class AppModel: ObservableObject {
     @Published var showsSyncPreview = false
     @Published var syncPlan: SyncPlan?
     @Published var isBuildingSyncPlan = false
+    @Published var syncPreviewStatus = ""
     @Published var showsRemoteSearch = false
     @Published var remoteSearchText = ""
     @Published var remoteSearchMode: RemoteSearchMode = .filename
     @Published var remoteSearchResults: [RemoteSearchResult] = []
     @Published var isSearchingRemote = false
+    @Published var remoteSearchStatus = ""
     private var hostKeyConfirmationContinuation: CheckedContinuation<Bool, Never>?
     private var tabCredentials: [BrowserTab.ID: SensitiveCredential] = [:]
     private var terminalSessions: [BrowserTab.ID: SSHTerminalSession] = [:]
     private var verifiedHostProbes: [String: HostKeyProbe] = [:]
     private var remoteDirectoryCache: [String: RemoteDirectoryCacheEntry] = [:]
     private var pendingConnectAfterEditorDismiss: (tabID: BrowserTab.ID, connectionID: UUID)?
+    private var syncPreviewTask: Task<Void, Never>?
+    private var remoteSearchTask: Task<Void, Never>?
 
     private let sftp = SFTPClient()
     private let transferLimiter = TransferLimiter(limit: TransferTuning.maxConcurrentTransfers)
@@ -2008,18 +2012,34 @@ final class AppModel: ObservableObject {
         credential: SensitiveCredential,
         root: String
     ) async throws -> [SyncPlanItem] {
-        try await collectRemoteSyncEntries(connection: connection, credential: credential, root: root, path: root)
+        let state = RemoteTraversalState()
+        return try await collectRemoteSyncEntries(
+            connection: connection,
+            credential: credential,
+            root: root,
+            path: root,
+            state: state,
+            depth: 0
+        )
     }
 
     private func collectRemoteSyncEntries(
         connection: SavedConnection,
         credential: SensitiveCredential,
         root: String,
-        path: String
+        path: String,
+        state: RemoteTraversalState,
+        depth: Int
     ) async throws -> [SyncPlanItem] {
+        try state.visitDirectory(path: path, depth: depth)
+        if state.shouldPublishProgress() {
+            syncPreviewStatus = "Scanned \(state.visitedDirectories) folders, \(state.visitedEntries) items"
+        }
         let result = try await sftp.list(connection: connection, credential: credential, path: path)
+        try state.visitEntries(result.items.count)
         var entries: [SyncPlanItem] = []
         for item in result.items {
+            try Task.checkCancellation()
             let relativePath = Self.relativePathForSync(item.path, root: root)
             entries.append(SyncPlanItem(
                 localPath: nil,
@@ -2038,7 +2058,9 @@ final class AppModel: ObservableObject {
                     connection: connection,
                     credential: credential,
                     root: root,
-                    path: item.path
+                    path: item.path,
+                    state: state,
+                    depth: depth + 1
                 ))
             }
         }
@@ -2526,34 +2548,63 @@ final class AppModel: ObservableObject {
 
     private func buildSyncPlan(localRoot: String, remoteRoot: String) {
         guard let connection = selectedConnection else { return }
+        syncPreviewTask?.cancel()
         let credential = credentialForCurrentTab().clone()
+        syncPlan = nil
         isBuildingSyncPlan = true
+        showsSyncPreview = true
+        syncPreviewStatus = "Scanning local files"
         status = "Building sync preview"
-        Task {
+        syncPreviewTask = Task {
             do {
                 let localEntries = try await Task.detached(priority: .userInitiated) {
-                    try AppModel.collectLocalSyncEntries(root: localRoot)
+                    try Task.checkCancellation()
+                    return try AppModel.collectLocalSyncEntries(root: localRoot)
                 }.value
+                try Task.checkCancellation()
+                await MainActor.run {
+                    self.syncPreviewStatus = "Scanning remote files"
+                }
                 let remoteEntries = try await collectRemoteSyncEntries(
                     connection: connection,
                     credential: credential,
                     root: remoteRoot
                 )
+                try Task.checkCancellation()
                 let plan = makeSyncPlan(localRoot: localRoot, remoteRoot: remoteRoot, localEntries: localEntries, remoteEntries: remoteEntries)
                 await MainActor.run {
                     self.syncPlan = plan
                     self.showsSyncPreview = true
                     self.isBuildingSyncPlan = false
+                    self.syncPreviewStatus = "\(plan.items.count) items compared"
                     self.status = "Sync preview ready"
+                    self.syncPreviewTask = nil
+                }
+            } catch is CancellationError {
+                await MainActor.run {
+                    self.isBuildingSyncPlan = false
+                    self.syncPreviewStatus = "Sync preview cancelled"
+                    self.status = "Sync preview cancelled"
+                    self.syncPreviewTask = nil
                 }
             } catch {
                 await MainActor.run {
                     self.isBuildingSyncPlan = false
+                    self.syncPreviewStatus = error.localizedDescription
                     self.status = error.localizedDescription
                     self.recordHistory(kind: .sync, result: .failed, localPath: localRoot, remotePath: remoteRoot, message: error.localizedDescription)
+                    self.syncPreviewTask = nil
                 }
             }
         }
+    }
+
+    func cancelSyncPreview() {
+        syncPreviewTask?.cancel()
+        syncPreviewTask = nil
+        isBuildingSyncPlan = false
+        syncPreviewStatus = "Sync preview cancelled"
+        status = "Sync preview cancelled"
     }
 
     func updateSyncPlanItemSelection(_ id: SyncPlanItem.ID, isSelected: Bool) {
@@ -2619,9 +2670,12 @@ final class AppModel: ObservableObject {
             status = "Choose a connection"
             return
         }
+        remoteSearchTask?.cancel()
         remoteSearchResults = []
         remoteSearchText = ""
         remoteSearchMode = .filename
+        remoteSearchStatus = ""
+        isSearchingRemote = false
         showsRemoteSearch = true
     }
 
@@ -2629,39 +2683,69 @@ final class AppModel: ObservableObject {
         let query = remoteSearchText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !query.isEmpty else { return }
         guard let connection = selectedConnection else { return }
+        remoteSearchTask?.cancel()
         let credential = credentialForCurrentTab().clone()
+        let searchRoot = remotePath
+        let searchMode = remoteSearchMode
+        remoteSearchResults = []
         isSearchingRemote = true
+        remoteSearchStatus = "Searching \(searchRoot)"
         status = "Searching remote files"
 
-        Task {
+        remoteSearchTask = Task {
             do {
                 let results: [RemoteSearchResult]
-                switch self.remoteSearchMode {
+                switch searchMode {
                 case .filename:
-                    let items = try await self.collectRemoteSearchItems(connection: connection, credential: credential, path: self.remotePath)
-                    results = items
-                        .filter { $0.name.localizedCaseInsensitiveContains(query) || $0.path.localizedCaseInsensitiveContains(query) }
-                        .map { RemoteSearchResult(path: $0.path, name: $0.name, isDirectory: $0.isDirectory, line: nil, preview: nil) }
+                    let state = RemoteTraversalState()
+                    results = try await self.collectRemoteSearchResults(
+                        connection: connection,
+                        credential: credential,
+                        path: searchRoot,
+                        query: query,
+                        state: state,
+                        depth: 0
+                    )
                 case .text:
                     if self.usesPasswordSFTP(connection: connection) {
                         throw AppError.unsupportedPasswordAuth
                     }
-                    results = try await self.runRemoteTextSearch(connection: connection, query: query, root: self.remotePath)
+                    results = try await self.runRemoteTextSearch(connection: connection, query: query, root: searchRoot)
                 }
+                try Task.checkCancellation()
                 await MainActor.run {
                     self.remoteSearchResults = results
                     self.isSearchingRemote = false
+                    self.remoteSearchStatus = "Found \(results.count) result\(results.count == 1 ? "" : "s")"
                     self.status = "Found \(results.count) result\(results.count == 1 ? "" : "s")"
-                    self.recordHistory(kind: .search, result: .success, remotePath: self.remotePath, message: "\(self.remoteSearchMode.rawValue) search: \(query)")
+                    self.recordHistory(kind: .search, result: .success, remotePath: searchRoot, message: "\(searchMode.rawValue) search: \(query)")
+                    self.remoteSearchTask = nil
+                }
+            } catch is CancellationError {
+                await MainActor.run {
+                    self.isSearchingRemote = false
+                    self.remoteSearchStatus = "Search cancelled"
+                    self.status = "Search cancelled"
+                    self.remoteSearchTask = nil
                 }
             } catch {
                 await MainActor.run {
                     self.isSearchingRemote = false
+                    self.remoteSearchStatus = error.localizedDescription
                     self.status = error.localizedDescription
-                    self.recordHistory(kind: .search, result: .failed, remotePath: self.remotePath, message: error.localizedDescription)
+                    self.recordHistory(kind: .search, result: .failed, remotePath: searchRoot, message: error.localizedDescription)
+                    self.remoteSearchTask = nil
                 }
             }
         }
+    }
+
+    func cancelRemoteSearch() {
+        remoteSearchTask?.cancel()
+        remoteSearchTask = nil
+        isSearchingRemote = false
+        remoteSearchStatus = "Search cancelled"
+        status = "Search cancelled"
     }
 
     func openRemoteSearchResult(_ result: RemoteSearchResult) {
@@ -2701,17 +2785,40 @@ final class AppModel: ObservableObject {
         showsRemoteSearch = false
     }
 
-    private func collectRemoteSearchItems(
+    private func collectRemoteSearchResults(
         connection: SavedConnection,
         credential: SensitiveCredential,
-        path: String
-    ) async throws -> [FileItem] {
-        let result = try await sftp.list(connection: connection, credential: credential, path: path)
-        var items = result.items
-        for item in result.items where item.isDirectory {
-            items.append(contentsOf: try await collectRemoteSearchItems(connection: connection, credential: credential, path: item.path))
+        path: String,
+        query: String,
+        state: RemoteTraversalState,
+        depth: Int
+    ) async throws -> [RemoteSearchResult] {
+        try state.visitDirectory(path: path, depth: depth)
+        if state.shouldPublishProgress() {
+            remoteSearchStatus = "Scanned \(state.visitedDirectories) folders, \(state.visitedEntries) items"
         }
-        return items
+        let result = try await sftp.list(connection: connection, credential: credential, path: path)
+        try state.visitEntries(result.items.count)
+        var results: [RemoteSearchResult] = []
+        results.reserveCapacity(min(result.items.count, RemoteTraversalTuning.maxSearchResults))
+        for item in result.items {
+            try Task.checkCancellation()
+            if item.name.localizedCaseInsensitiveContains(query) || item.path.localizedCaseInsensitiveContains(query) {
+                try state.recordMatch()
+                results.append(RemoteSearchResult(path: item.path, name: item.name, isDirectory: item.isDirectory, line: nil, preview: nil))
+            }
+        }
+        for item in result.items where item.isDirectory {
+            results.append(contentsOf: try await collectRemoteSearchResults(
+                connection: connection,
+                credential: credential,
+                path: item.path,
+                query: query,
+                state: state,
+                depth: depth + 1
+            ))
+        }
+        return results
     }
 
     private func runRemoteTextSearch(connection: SavedConnection, query: String, root: String) async throws -> [RemoteSearchResult] {
@@ -4764,6 +4871,8 @@ final class AppModel: ObservableObject {
     }
 
     func prepareForTermination() {
+        syncPreviewTask?.cancel()
+        remoteSearchTask?.cancel()
         for control in transferControls.values { control.cancel() }
         remoteEditMonitorTask?.cancel()
         remoteEditMonitorTask = nil
@@ -5749,13 +5858,16 @@ struct SyncPreviewView: View {
                 }
                 Spacer()
                 Button("Cancel") {
+                    if model.isBuildingSyncPlan {
+                        model.cancelSyncPreview()
+                    }
                     model.showsSyncPreview = false
                 }
                 Button("Run \(actionableCount) Actions") {
                     model.executeSyncPlan()
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(actionableCount == 0)
+                .disabled(actionableCount == 0 || model.isBuildingSyncPlan)
             }
             .padding(14)
             Divider()
@@ -5770,8 +5882,22 @@ struct SyncPreviewView: View {
                     .padding(10)
                 }
             } else {
-                ProgressView("Building sync preview")
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                VStack(spacing: 10) {
+                    ProgressView("Building sync preview")
+                    if !model.syncPreviewStatus.isEmpty {
+                        Text(model.syncPreviewStatus)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    Button("Cancel", action: model.cancelSyncPreview)
+                        .disabled(!model.isBuildingSyncPlan)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+        }
+        .onDisappear {
+            if model.isBuildingSyncPlan {
+                model.cancelSyncPreview()
             }
         }
     }
@@ -5843,7 +5969,13 @@ struct RemoteSearchView: View {
                     .onSubmit(model.performRemoteSearch)
                 Button("Search", action: model.performRemoteSearch)
                     .disabled(model.remoteSearchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || model.isSearchingRemote)
+                if model.isSearchingRemote {
+                    Button("Cancel", action: model.cancelRemoteSearch)
+                }
                 Button("Close") {
+                    if model.isSearchingRemote {
+                        model.cancelRemoteSearch()
+                    }
                     model.showsRemoteSearch = false
                 }
             }
@@ -5851,11 +5983,24 @@ struct RemoteSearchView: View {
             Divider()
 
             if model.isSearchingRemote {
-                ProgressView("Searching")
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                VStack(spacing: 10) {
+                    ProgressView("Searching")
+                    if !model.remoteSearchStatus.isEmpty {
+                        Text(model.remoteSearchStatus)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else if model.remoteSearchResults.isEmpty {
-                Text("No results")
-                    .foregroundStyle(.secondary)
+                VStack(spacing: 8) {
+                    Text("No results")
+                    if !model.remoteSearchStatus.isEmpty {
+                        Text(model.remoteSearchStatus)
+                            .font(.caption)
+                    }
+                }
+                .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 List(model.remoteSearchResults) { result in
@@ -5889,6 +6034,11 @@ struct RemoteSearchView: View {
                     }
                     .padding(.vertical, 4)
                 }
+            }
+        }
+        .onDisappear {
+            if model.isSearchingRemote {
+                model.cancelRemoteSearch()
             }
         }
     }
@@ -6784,6 +6934,7 @@ struct FilePane<ToolbarContent: View, ContextMenuContent: View, BackgroundContex
     @State private var anchorSelectionID: FileItem.ID?
     @State private var columnResizeDraft: ColumnResizeDraft?
     @State private var visibleItems: [FileItem] = []
+    @State private var visibleItemsTask: Task<Void, Never>?
 
     private let listColumnSpacing: CGFloat = 12
     private let listHorizontalInset: CGFloat = 20
@@ -6791,11 +6942,21 @@ struct FilePane<ToolbarContent: View, ContextMenuContent: View, BackgroundContex
     private let listMaximumNameColumnShare: CGFloat = 0.48
 
     private func recomputeVisibleItems() {
-        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
-        visibleItems = items
-            .filter { preferences.showHiddenFiles || !$0.isHidden }
-            .filter { query.isEmpty || $0.name.localizedCaseInsensitiveContains(query) || $0.path.localizedCaseInsensitiveContains(query) }
-            .sorted(by: sortsBefore)
+        visibleItemsTask?.cancel()
+        let itemsSnapshot = items
+        let preferencesSnapshot = preferences
+        let searchTextSnapshot = searchText
+        visibleItemsTask = Task {
+            let computedItems = await Task.detached(priority: .userInitiated) {
+                filteredSortedFileItems(
+                    items: itemsSnapshot,
+                    preferences: preferencesSnapshot,
+                    searchText: searchTextSnapshot
+                )
+            }.value
+            guard !Task.isCancelled else { return }
+            visibleItems = computedItems
+        }
     }
 
     var body: some View {
@@ -6818,6 +6979,9 @@ struct FilePane<ToolbarContent: View, ContextMenuContent: View, BackgroundContex
         .onChange(of: items) { _, _ in recomputeVisibleItems() }
         .onChange(of: preferences) { _, _ in recomputeVisibleItems() }
         .onChange(of: searchText) { _, _ in recomputeVisibleItems() }
+        .onDisappear {
+            visibleItemsTask?.cancel()
+        }
     }
 
     private func paneHeader(displayedItems: [FileItem]) -> some View {
@@ -7360,23 +7524,6 @@ struct FilePane<ToolbarContent: View, ContextMenuContent: View, BackgroundContex
         anchorSelectionID = item.id
     }
 
-    private func sortsBefore(_ lhs: FileItem, _ rhs: FileItem) -> Bool {
-        if preferences.foldersFirst && lhs.isDirectory != rhs.isDirectory { return lhs.isDirectory }
-        let order: ComparisonResult = switch preferences.sortField {
-        case .name: lhs.name.localizedStandardCompare(rhs.name)
-        case .size: compare(lhs.size ?? -1, rhs.size ?? -1)
-        case .date: compare(lhs.modified ?? .distantPast, rhs.modified ?? .distantPast)
-        case .kind: lhs.kind.localizedStandardCompare(rhs.kind)
-        case .owner: (lhs.owner ?? "").localizedStandardCompare(rhs.owner ?? "")
-        case .group: (lhs.group ?? "").localizedStandardCompare(rhs.group ?? "")
-        case .permissions: compare(lhs.permissions ?? 0, rhs.permissions ?? 0)
-        }
-        if order == .orderedSame { return lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending }
-        return preferences.sortAscending ? order == .orderedAscending : order == .orderedDescending
-    }
-
-    private func compare<T: Comparable>(_ lhs: T, _ rhs: T) -> ComparisonResult { lhs == rhs ? .orderedSame : (lhs < rhs ? .orderedAscending : .orderedDescending) }
-
     private func text(for column: FileBrowserColumn, item: FileItem) -> String {
         switch column {
         case .size: return item.isDirectory ? "--" : ByteCountFormatter.string(fromByteCount: item.size ?? 0, countStyle: .file)
@@ -7399,14 +7546,15 @@ private final class ThumbnailCache {
 
     private init() {
         cache.countLimit = 512
+        cache.totalCostLimit = 96 * 1024 * 1024
     }
 
     func image(forKey key: NSString) -> NSImage? {
         cache.object(forKey: key)
     }
 
-    func insert(_ image: NSImage, forKey key: NSString) {
-        cache.setObject(image, forKey: key)
+    func insert(_ image: NSImage, forKey key: NSString, pixelCost: Int) {
+        cache.setObject(image, forKey: key, cost: pixelCost)
     }
 
     func key(for item: FileItem) -> NSString {
@@ -7438,6 +7586,11 @@ private struct FileThumbnailView: View {
                 image = cachedImage
                 return
             }
+            await ThumbnailGenerationGate.shared.acquire()
+            guard !Task.isCancelled else {
+                await ThumbnailGenerationGate.shared.release()
+                return
+            }
             let thumbnailSize = CGSize(width: 256, height: 192)
             let thumbnailScale = NSScreen.main?.backingScaleFactor ?? 2
             let request = QLThumbnailGenerator.Request(fileAt: URL(fileURLWithPath: item.path), size: thumbnailSize, scale: thumbnailScale, representationTypes: .thumbnail)
@@ -7446,6 +7599,7 @@ private struct FileThumbnailView: View {
                     continuation.resume(returning: representation?.cgImage)
                 }
             }
+            await ThumbnailGenerationGate.shared.release()
             guard !Task.isCancelled, let generatedCGImage else { return }
             let generatedImage = NSImage(
                 cgImage: generatedCGImage,
@@ -7454,7 +7608,8 @@ private struct FileThumbnailView: View {
                     height: CGFloat(generatedCGImage.height) / thumbnailScale
                 )
             )
-            ThumbnailCache.shared.insert(generatedImage, forKey: cacheKey)
+            let pixelCost = generatedCGImage.bytesPerRow * generatedCGImage.height
+            ThumbnailCache.shared.insert(generatedImage, forKey: cacheKey, pixelCost: pixelCost)
             image = generatedImage
         }
     }
