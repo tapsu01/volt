@@ -1,7 +1,10 @@
 #include "VoltSSH.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+
+_Static_assert(sizeof(VoltSFTPItem) <= 64, "VoltSFTPItem must remain compact");
 
 // Dùng byte array tường minh thay cho string literal có \x / \0:
 // trong C, \x ăn hết chữ số hex kế tiếp ("a\x01b" -> 'a' + MỘT byte 0x1b, sai ý), và \0 phụ thuộc chuỗi.
@@ -54,6 +57,22 @@ int main(void) {
     // Tên chứa dấu chấm nhưng hợp lệ.
     if (volt_is_safe_entry_name("..hidden", 8) != 1) return 14;
     if (volt_is_safe_entry_name("archive.tar.gz", 14) != 1) return 15;
+
+    VoltSFTPItem *items = calloc(2, sizeof(VoltSFTPItem));
+    if (!items) return 16;
+    items[0].name = malloc(9);
+    items[0].path = malloc(14);
+    items[1].name = malloc(10);
+    items[1].path = malloc(15);
+    if (!items[0].name || !items[0].path || !items[1].name || !items[1].path) return 17;
+    memcpy(items[0].name, "file.txt", 9);
+    memcpy(items[0].path, "/tmp/file.txt", 14);
+    memcpy(items[1].name, "other.txt", 10);
+    memcpy(items[1].path, "/tmp/other.txt", 15);
+    if (strcmp(volt_sftp_item_name(items, 0), "file.txt") != 0) return 18;
+    if (strcmp(volt_sftp_item_path(items, 1), "/tmp/other.txt") != 0) return 19;
+    volt_sftp_free_items(items, 2);
+    volt_sftp_free_items(NULL, 0);
 
     puts("Entry name validation security test passed.");
     return 0;

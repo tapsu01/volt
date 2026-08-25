@@ -9,8 +9,8 @@ extern "C" {
 #endif
 
 typedef struct VoltSFTPItem {
-    char name[1024];
-    char path[4096];
+    char *name;
+    char *path;
     int is_directory;
     int64_t size;
     int64_t modified;
@@ -53,13 +53,13 @@ int volt_is_safe_entry_name(const char *name, size_t len);
 int volt_session_open(const char *host, int port, const char *username, const char *password, const char *private_key_path, const char *known_hosts_path, VoltSessionHandle **out, char *error, size_t error_len);
 void volt_session_close(VoltSessionHandle *handle);
 
-int volt_sftp_list_on(VoltSessionHandle *handle, const char *remote_path, VoltSFTPItem **items, int *count, int *skipped_unsafe_count, char *error, size_t error_len);
+int volt_sftp_list_on(VoltSessionHandle *handle, const char *remote_path, int max_items, VoltSFTPItem **items, int *count, int *skipped_unsafe_count, int *truncated, char *error, size_t error_len);
 int volt_sftp_mkdir_on(VoltSessionHandle *handle, const char *remote_path, uint32_t mode, char *error, size_t error_len);
 int volt_sftp_create_empty_file_on(VoltSessionHandle *handle, const char *remote_path, uint32_t mode, char *error, size_t error_len);
 int volt_sftp_rename_on(VoltSessionHandle *handle, const char *from_path, const char *to_path, char *error, size_t error_len);
 int volt_sftp_remove_on(VoltSessionHandle *handle, const char *remote_path, int is_directory, char *error, size_t error_len);
 
-int volt_sftp_list(const char *host, int port, const char *username, const char *password, const char *private_key_path, const char *known_hosts_path, const char *remote_path, VoltSFTPItem **items, int *count, int *skipped_unsafe_count, char *error, size_t error_len);
+int volt_sftp_list(const char *host, int port, const char *username, const char *password, const char *private_key_path, const char *known_hosts_path, const char *remote_path, int max_items, VoltSFTPItem **items, int *count, int *skipped_unsafe_count, int *truncated, char *error, size_t error_len);
 int volt_sftp_upload(const char *host, int port, const char *username, const char *password, const char *private_key_path, const char *known_hosts_path, const char *local_path, const char *remote_path, uint32_t mode, int overwrite, VoltSFTPProgressCallback progress, void *progress_context, char *error, size_t error_len);
 int volt_sftp_download(const char *host, int port, const char *username, const char *password, const char *private_key_path, const char *known_hosts_path, const char *remote_path, const char *local_path, int overwrite, VoltSFTPProgressCallback progress, void *progress_context, char *error, size_t error_len);
 int volt_sftp_download_resume(const char *host, int port, const char *username, const char *password, const char *private_key_path, const char *known_hosts_path, const char *remote_path, const char *partial_path, const char *local_path, int overwrite, int64_t expected_size, int64_t expected_modified, VoltSFTPProgressCallback progress, void *progress_context, char *error, size_t error_len);
@@ -71,7 +71,7 @@ int volt_sftp_mkdir(const char *host, int port, const char *username, const char
 int volt_sftp_create_empty_file(const char *host, int port, const char *username, const char *password, const char *private_key_path, const char *known_hosts_path, const char *remote_path, uint32_t mode, char *error, size_t error_len);
 int volt_sftp_rename(const char *host, int port, const char *username, const char *password, const char *private_key_path, const char *known_hosts_path, const char *from_path, const char *to_path, char *error, size_t error_len);
 int volt_sftp_remove(const char *host, int port, const char *username, const char *password, const char *private_key_path, const char *known_hosts_path, const char *remote_path, int is_directory, char *error, size_t error_len);
-void volt_sftp_free_items(VoltSFTPItem *items);
+void volt_sftp_free_items(VoltSFTPItem *items, int count);
 const char *volt_sftp_item_name(const VoltSFTPItem *items, int index);
 const char *volt_sftp_item_path(const VoltSFTPItem *items, int index);
 int volt_sftp_item_is_directory(const VoltSFTPItem *items, int index);

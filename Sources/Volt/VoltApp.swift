@@ -237,11 +237,13 @@ private func defaultItemSort(_ lhs: FileItem, _ rhs: FileItem) -> Bool {
 struct RemoteListingResult {
     let items: [FileItem]
     let skippedUnsafeCount: Int
+    let isTruncated: Bool
 }
 
 struct RemoteDirectoryCacheEntry {
-    var items: [FileItem]
+    var listing: RemoteListingResult
     var loadedAt: Date
+    var estimatedCost: Int
 }
 
 struct FolderDownloadSummary {
@@ -619,17 +621,32 @@ enum AppError: LocalizedError {
     }
 }
 
-@MainActor
 // Password is entered at connection time via a prompt dialog (no Keychain storage).
 
-struct CommandResult {
+struct CommandResult: Sendable {
     var stdout: String
     var stderr: String
     var status: Int32
+    var stdoutTruncated: Bool
+    var stderrTruncated: Bool
 }
 
-final class CommandRunner: @unchecked Sendable {
-    func run(_ executable: String, arguments: [String], stdin: String? = nil, environment: [String: String] = [:]) throws -> CommandResult {
+private struct BoundedProcessOutput: Sendable {
+    var data: Data
+    var isTruncated: Bool
+}
+
+struct CommandRunner: Sendable {
+    private static let defaultMaximumOutputBytes = 2 * 1024 * 1024
+    private static let readChunkSize = 64 * 1024
+
+    func run(
+        _ executable: String,
+        arguments: [String],
+        stdin: String? = nil,
+        environment: [String: String] = [:],
+        maximumOutputBytes: Int = Self.defaultMaximumOutputBytes
+    ) async throws -> CommandResult {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: executable)
         process.arguments = arguments
@@ -640,20 +657,70 @@ final class CommandRunner: @unchecked Sendable {
         process.standardOutput = output
         process.standardError = error
 
-        if let stdin {
-            let input = Pipe()
+        let input = stdin.map { _ in Pipe() }
+        if let input {
             process.standardInput = input
-            try process.run()
-            input.fileHandleForWriting.write(Data(stdin.utf8))
-            try? input.fileHandleForWriting.close()
-        } else {
-            try process.run()
         }
 
-        process.waitUntilExit()
-        let stdout = String(data: output.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-        let stderr = String(data: error.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-        return CommandResult(stdout: stdout, stderr: stderr, status: process.terminationStatus)
+        try process.run()
+
+        let retainedByteLimit = max(0, maximumOutputBytes)
+        let stdoutTask = Task.detached(priority: .utility) {
+            Self.drain(output.fileHandleForReading, retainingAtMost: retainedByteLimit)
+        }
+        let stderrTask = Task.detached(priority: .utility) {
+            Self.drain(error.fileHandleForReading, retainingAtMost: retainedByteLimit)
+        }
+        let waitTask = Task.detached(priority: .utility) {
+            process.waitUntilExit()
+            return process.terminationStatus
+        }
+
+        if let stdin, let input {
+            try input.fileHandleForWriting.write(contentsOf: Data(stdin.utf8))
+            try? input.fileHandleForWriting.close()
+        }
+
+        let status = await withTaskCancellationHandler {
+            await waitTask.value
+        } onCancel: {
+            if process.isRunning {
+                process.terminate()
+            }
+        }
+        let stdout = await stdoutTask.value
+        let stderr = await stderrTask.value
+        try Task.checkCancellation()
+        return CommandResult(
+            stdout: String(decoding: stdout.data, as: UTF8.self),
+            stderr: String(decoding: stderr.data, as: UTF8.self),
+            status: status,
+            stdoutTruncated: stdout.isTruncated,
+            stderrTruncated: stderr.isTruncated
+        )
+    }
+
+    private static func drain(_ handle: FileHandle, retainingAtMost limit: Int) -> BoundedProcessOutput {
+        var retained = Data()
+        retained.reserveCapacity(min(limit, readChunkSize))
+        var isTruncated = false
+        while true {
+            let chunk: Data
+            do {
+                chunk = try handle.read(upToCount: readChunkSize) ?? Data()
+            } catch {
+                break
+            }
+            guard !chunk.isEmpty else { break }
+            let remaining = max(0, limit - retained.count)
+            if remaining > 0 {
+                retained.append(chunk.prefix(remaining))
+            }
+            if chunk.count > remaining {
+                isTruncated = true
+            }
+        }
+        return BoundedProcessOutput(data: retained, isTruncated: isTruncated)
     }
 }
 
@@ -1336,6 +1403,7 @@ private final class SFTPListOutput: @unchecked Sendable {
     var items: UnsafeMutablePointer<VoltSFTPItem>?
     var count: Int32 = 0
     var skippedUnsafe: Int32 = 0
+    var truncated: Int32 = 0
 }
 
 final class SFTPClient: @unchecked Sendable {
@@ -1411,16 +1479,30 @@ final class SFTPClient: @unchecked Sendable {
             let output = SFTPListOutput()
             _ = try await self.callOnPooledSession(connection: connection, credential: credential) { handle, error, errorLength in
                 path.withCString { remotePath in
-                    volt_sftp_list_on(handle, remotePath, &output.items, &output.count, &output.skippedUnsafe, error, errorLength)
+                    volt_sftp_list_on(
+                        handle,
+                        remotePath,
+                        Int32(RemoteListingTuning.maxItemsPerDirectory),
+                        &output.items,
+                        &output.count,
+                        &output.skippedUnsafe,
+                        &output.truncated,
+                        error,
+                        errorLength
+                    )
                 }
             }
             defer {
                 if let items = output.items {
-                    volt_sftp_free_items(items)
+                    volt_sftp_free_items(items, output.count)
                 }
             }
             guard let items = output.items else {
-                return RemoteListingResult(items: [], skippedUnsafeCount: Int(output.skippedUnsafe))
+                return RemoteListingResult(
+                    items: [],
+                    skippedUnsafeCount: Int(output.skippedUnsafe),
+                    isTruncated: output.truncated != 0
+                )
             }
             var parsed: [FileItem] = []
             var swiftSkipped = 0
@@ -1455,7 +1537,11 @@ final class SFTPClient: @unchecked Sendable {
                 if lhs.isDirectory != rhs.isDirectory { return lhs.isDirectory }
                 return lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
             }
-            return RemoteListingResult(items: parsed, skippedUnsafeCount: Int(output.skippedUnsafe) + swiftSkipped)
+            return RemoteListingResult(
+                items: parsed,
+                skippedUnsafeCount: Int(output.skippedUnsafe) + swiftSkipped,
+                isTruncated: output.truncated != 0
+            )
         }.value
     }
 
@@ -1832,8 +1918,10 @@ final class AppModel: ObservableObject {
     private var hostKeyConfirmationContinuation: CheckedContinuation<Bool, Never>?
     private var tabCredentials: [BrowserTab.ID: SensitiveCredential] = [:]
     private var terminalSessions: [BrowserTab.ID: SSHTerminalSession] = [:]
+    private var pendingTerminalOutputByTab: [BrowserTab.ID: String] = [:]
+    private var terminalOutputFlushTasks: [BrowserTab.ID: Task<Void, Never>] = [:]
     private var verifiedHostProbes: [String: HostKeyProbe] = [:]
-    private var remoteDirectoryCache: [String: RemoteDirectoryCacheEntry] = [:]
+    private var remoteDirectoryCache = RemoteDirectoryCache()
     private var pendingConnectAfterEditorDismiss: (tabID: BrowserTab.ID, connectionID: UUID)?
     private var syncPreviewTask: Task<Void, Never>?
     private var remoteSearchTask: Task<Void, Never>?
@@ -1914,7 +2002,7 @@ final class AppModel: ObservableObject {
             let runner = CommandRunner()
             let executable = "/usr/bin/du"
             let args = ["-sk", item.path]
-            if let result = try? runner.run(executable, arguments: args, stdin: "", environment: [:]),
+            if let result = try? await runner.run(executable, arguments: args, stdin: "", environment: [:]),
                result.status == 0,
                let sizeStr = result.stdout.split(separator: "\t").first,
                let sizeKB = Int64(sizeStr) {
@@ -1943,7 +2031,7 @@ final class AppModel: ObservableObject {
                     }
                 }
             } catch {
-                // Ignore failure
+                status = error.localizedDescription
             }
         }
     }
@@ -1956,28 +2044,61 @@ final class AppModel: ObservableObject {
         if !item.isDirectory {
             return item.size ?? 0
         }
-        return try await remoteRecursiveSize(connection: connection, credential: credential, path: item.path)
+        let state = TraversalState(scope: "Remote size calculation")
+        return try await remoteRecursiveSize(
+            connection: connection,
+            credential: credential,
+            path: item.path,
+            state: state,
+            depth: 0
+        )
     }
 
     private func remoteRecursiveSize(
         connection: SavedConnection,
         credential: SensitiveCredential,
-        path: String
+        path: String,
+        state: TraversalState,
+        depth: Int
     ) async throws -> Int64 {
+        try state.visitDirectory(depth: depth)
         let result = try await sftp.list(connection: connection, credential: credential, path: path)
+        try requireCompleteListing(result, path: path, operation: "Remote size calculation")
+        try state.visitEntries(result.items.count)
         var total: Int64 = 0
         for child in result.items {
+            try Task.checkCancellation()
+            let childSize: Int64
             if child.isDirectory {
-                total += try await remoteRecursiveSize(connection: connection, credential: credential, path: child.path)
+                childSize = try await remoteRecursiveSize(
+                    connection: connection,
+                    credential: credential,
+                    path: child.path,
+                    state: state,
+                    depth: depth + 1
+                )
             } else if child.isRegularFile {
-                total += child.size ?? 0
+                childSize = child.size ?? 0
+            } else {
+                continue
             }
+            let (nextTotal, overflow) = total.addingReportingOverflow(childSize)
+            guard !overflow else {
+                throw AppError.commandFailed("Remote size calculation exceeded the supported size range.")
+            }
+            total = nextTotal
         }
         return total
     }
 
-    private nonisolated static func collectLocalSyncEntries(root: String) throws -> [SyncPlanItem] {
+    nonisolated static func collectLocalSyncEntries(
+        root: String,
+        limits: TraversalLimits = .standard
+    ) throws -> [SyncPlanItem] {
         let rootURL = URL(fileURLWithPath: root, isDirectory: true).standardizedFileURL
+        let rootComponentCount = rootURL.pathComponents.count
+        let state = TraversalState(scope: "Local sync scan", limits: limits)
+        try state.visitDirectory(depth: 0)
         let keys: Set<URLResourceKey> = [.isDirectoryKey, .isRegularFileKey, .fileSizeKey, .contentModificationDateKey]
         guard let enumerator = FileManager.default.enumerator(
             at: rootURL,
@@ -1987,8 +2108,14 @@ final class AppModel: ObservableObject {
 
         var entries: [SyncPlanItem] = []
         for case let url as URL in enumerator {
+            try Task.checkCancellation()
             let values = try url.resourceValues(forKeys: keys)
             guard values.isDirectory == true || values.isRegularFile == true else { continue }
+            try state.visitEntries(1)
+            if values.isDirectory == true {
+                let depth = max(1, url.standardizedFileURL.pathComponents.count - rootComponentCount)
+                try state.visitDirectory(depth: depth)
+            }
             let relativePath = relativePathForSync(url.path, root: rootURL.path)
             guard !relativePath.isEmpty else { continue }
             entries.append(SyncPlanItem(
@@ -2012,7 +2139,7 @@ final class AppModel: ObservableObject {
         credential: SensitiveCredential,
         root: String
     ) async throws -> [SyncPlanItem] {
-        let state = RemoteTraversalState()
+        let state = RemoteTraversalState(scope: "Remote sync scan")
         return try await collectRemoteSyncEntries(
             connection: connection,
             credential: credential,
@@ -2031,11 +2158,12 @@ final class AppModel: ObservableObject {
         state: RemoteTraversalState,
         depth: Int
     ) async throws -> [SyncPlanItem] {
-        try state.visitDirectory(path: path, depth: depth)
+        try state.visitDirectory(depth: depth)
         if state.shouldPublishProgress() {
             syncPreviewStatus = "Scanned \(state.visitedDirectories) folders, \(state.visitedEntries) items"
         }
         let result = try await sftp.list(connection: connection, credential: credential, path: path)
+        try requireCompleteListing(result, path: path, operation: "Remote sync scan")
         try state.visitEntries(result.items.count)
         var entries: [SyncPlanItem] = []
         for item in result.items {
@@ -2557,10 +2685,15 @@ final class AppModel: ObservableObject {
         status = "Building sync preview"
         syncPreviewTask = Task {
             do {
-                let localEntries = try await Task.detached(priority: .userInitiated) {
+                let localScanTask = Task.detached(priority: .userInitiated) {
                     try Task.checkCancellation()
                     return try AppModel.collectLocalSyncEntries(root: localRoot)
-                }.value
+                }
+                let localEntries = try await withTaskCancellationHandler {
+                    try await localScanTask.value
+                } onCancel: {
+                    localScanTask.cancel()
+                }
                 try Task.checkCancellation()
                 await MainActor.run {
                     self.syncPreviewStatus = "Scanning remote files"
@@ -2697,7 +2830,7 @@ final class AppModel: ObservableObject {
                 let results: [RemoteSearchResult]
                 switch searchMode {
                 case .filename:
-                    let state = RemoteTraversalState()
+                    let state = RemoteTraversalState(scope: "Remote search")
                     results = try await self.collectRemoteSearchResults(
                         connection: connection,
                         credential: credential,
@@ -2793,11 +2926,12 @@ final class AppModel: ObservableObject {
         state: RemoteTraversalState,
         depth: Int
     ) async throws -> [RemoteSearchResult] {
-        try state.visitDirectory(path: path, depth: depth)
+        try state.visitDirectory(depth: depth)
         if state.shouldPublishProgress() {
             remoteSearchStatus = "Scanned \(state.visitedDirectories) folders, \(state.visitedEntries) items"
         }
         let result = try await sftp.list(connection: connection, credential: credential, path: path)
+        try requireCompleteListing(result, path: path, operation: "Remote search")
         try state.visitEntries(result.items.count)
         var results: [RemoteSearchResult] = []
         results.reserveCapacity(min(result.items.count, RemoteTraversalTuning.maxSearchResults))
@@ -2940,10 +3074,8 @@ final class AppModel: ObservableObject {
                       self.tabs[tabIndex].remotePath == path
                 else { return }
 
-                self.storeRemoteListing(result.items, connectionID: connection.id, path: path)
-                let statusText = result.skippedUnsafeCount > 0
-                    ? "\(result.skippedUnsafeCount) unsafe remote entries were hidden."
-                    : finalStatus
+                self.storeRemoteListing(result, connectionID: connection.id, path: path)
+                let statusText = self.remoteListingStatus(result, fallback: finalStatus)
 
                 if self.selectedTabID == operationTabID {
                     self.remoteItems = result.items
@@ -2978,9 +3110,9 @@ final class AppModel: ObservableObject {
 
     private func loadCurrentRemotePathUsingCache() {
         if let connection = selectedConnection,
-           let cachedItems = cachedRemoteItems(connectionID: connection.id, path: remotePath) {
-            remoteItems = cachedItems
-            status = "Remote folder loaded"
+           let cachedListing = cachedRemoteListing(connectionID: connection.id, path: remotePath) {
+            remoteItems = cachedListing.items
+            status = remoteListingStatus(cachedListing, fallback: "Remote folder loaded")
             syncCurrentTab()
             refreshRemote(finalStatus: "Remote folder updated", mode: .background)
             return
@@ -3399,6 +3531,7 @@ final class AppModel: ObservableObject {
         runBusy("Downloading folder", transferID: transferID) {
             guard !control.isCancelled else { throw AppError.commandFailed("Transfer cancelled.") }
             await MainActor.run { self.markTransfer(transferID, .running, "Preparing folder") }
+            let traversalState = TraversalState(scope: "Remote folder download")
             let plan = try await self.planRemoteFolderDownload(
                 connection: connection,
                 credential: credential,
@@ -3406,7 +3539,9 @@ final class AppModel: ObservableObject {
                 localURL: URL(fileURLWithPath: destination, isDirectory: true),
                 control: control,
                 transferID: transferID,
-                reuseCompletedFiles: reuseCompletedFiles
+                reuseCompletedFiles: reuseCompletedFiles,
+                state: traversalState,
+                depth: 0
             )
             let summary = try await self.downloadPlannedFolderFiles(
                 connection: connection,
@@ -3500,9 +3635,12 @@ final class AppModel: ObservableObject {
         localURL: URL,
         control: TransferControl,
         transferID: UUID,
-        reuseCompletedFiles: Bool
+        reuseCompletedFiles: Bool,
+        state: TraversalState,
+        depth: Int
     ) async throws -> FolderDownloadPlan {
         guard !control.isCancelled else { throw AppError.commandFailed("Transfer cancelled.") }
+        try state.visitDirectory(depth: depth)
         await MainActor.run {
             self.markTransfer(transferID, .running, "Listing \(URL(fileURLWithPath: remotePath).lastPathComponent)")
         }
@@ -3510,6 +3648,8 @@ final class AppModel: ObservableObject {
         var plan = FolderDownloadPlan()
         plan.directories.append(localURL.path)
         let result = try await sftp.list(connection: connection, credential: credential, path: remotePath)
+        try requireCompleteListing(result, path: remotePath, operation: "Remote folder download")
+        try state.visitEntries(result.items.count)
         for child in result.items {
             guard !control.isCancelled else { throw AppError.commandFailed("Transfer cancelled.") }
             guard let childURL = safeLocalDestination(base: localURL, name: child.name) else {
@@ -3524,7 +3664,9 @@ final class AppModel: ObservableObject {
                     localURL: childURL,
                     control: control,
                     transferID: transferID,
-                    reuseCompletedFiles: reuseCompletedFiles
+                    reuseCompletedFiles: reuseCompletedFiles,
+                    state: state,
+                    depth: depth + 1
                 )
                 plan.files.append(contentsOf: childPlan.files)
                 plan.directories.append(contentsOf: childPlan.directories)
@@ -3950,15 +4092,26 @@ final class AppModel: ObservableObject {
         let name = URL(fileURLWithPath: path).lastPathComponent
 
         if selectedConnectionID == connection.id && parent == remotePath {
-            return remoteItems.first { $0.name == name }
+            if let item = remoteItems.first(where: { $0.name == name }) {
+                return item
+            }
+            if let currentListing = cachedRemoteListing(connectionID: connection.id, path: parent) {
+                try requireCompleteListing(currentListing, path: parent, operation: "Remote name check")
+            }
+            return nil
         }
 
-        if let cachedItems = cachedRemoteItems(connectionID: connection.id, path: parent) {
-            return cachedItems.first { $0.name == name }
+        if let cachedListing = cachedRemoteListing(connectionID: connection.id, path: parent) {
+            if let item = cachedListing.items.first(where: { $0.name == name }) {
+                return item
+            }
+            try requireCompleteListing(cachedListing, path: parent, operation: "Remote name check")
+            return nil
         }
 
         let result = try await sftp.list(connection: connection, credential: credential, path: parent)
-        storeRemoteListing(result.items, connectionID: connection.id, path: parent)
+        storeRemoteListing(result, connectionID: connection.id, path: parent)
+        try requireCompleteListing(result, path: parent, operation: "Remote name check")
         return result.items.first { $0.name == name }
     }
 
@@ -4210,7 +4363,7 @@ final class AppModel: ObservableObject {
             let quotedDst = "'" + newPath.replacingOccurrences(of: "'", with: "'\\''") + "'"
             args.append("cp -r \(quotedSrc) \(quotedDst)")
 
-            _ = try runner.run(executable, arguments: args, stdin: "")
+            _ = try await runner.run(executable, arguments: args, stdin: "")
             
             await MainActor.run {
                 self.invalidateRemoteCacheForChangedItem(connectionID: connection.id, path: newPath, wasDirectory: item.isDirectory)
@@ -4431,23 +4584,33 @@ final class AppModel: ObservableObject {
             status = "Diff is unavailable for this edit session."
             return
         }
-        do {
-            let result = try CommandRunner().run(
-                "/usr/bin/diff",
-                arguments: ["-u", originalPath, session.localPath],
-                stdin: ""
-            )
-            let diffText: String
-            if result.status == 0 {
-                diffText = "No changes."
-            } else if result.status == 1 {
-                diffText = result.stdout.isEmpty ? "No text diff available." : result.stdout
-            } else {
-                diffText = result.stderr.isEmpty ? "Diff failed." : result.stderr
+        status = "Preparing diff"
+        Task {
+            do {
+                let result = try await CommandRunner().run(
+                    "/usr/bin/diff",
+                    arguments: ["-u", originalPath, session.localPath],
+                    stdin: ""
+                )
+                var diffText: String
+                if result.status == 0 {
+                    diffText = "No changes."
+                } else if result.status == 1 {
+                    diffText = result.stdout.isEmpty ? "No text diff available." : result.stdout
+                    if result.stdoutTruncated {
+                        diffText += "\n\n[Diff output was truncated after 2 MiB.]"
+                    }
+                } else {
+                    diffText = result.stderr.isEmpty ? "Diff failed." : result.stderr
+                    if result.stderrTruncated {
+                        diffText += "\n\n[Error output was truncated after 2 MiB.]"
+                    }
+                }
+                showTextAlert(title: "Diff: \(session.fileName)", text: diffText)
+                status = "Diff ready"
+            } catch {
+                status = error.localizedDescription
             }
-            showTextAlert(title: "Diff: \(session.fileName)", text: diffText)
-        } catch {
-            status = error.localizedDescription
         }
     }
 
@@ -4816,6 +4979,10 @@ final class AppModel: ObservableObject {
     }
 
     func clearTerminal() {
+        if let selectedTabID {
+            terminalOutputFlushTasks.removeValue(forKey: selectedTabID)?.cancel()
+            pendingTerminalOutputByTab.removeValue(forKey: selectedTabID)
+        }
         terminalOutput = ""
         syncCurrentTab()
     }
@@ -4833,18 +5000,26 @@ final class AppModel: ObservableObject {
     private func appendTerminalOutput(_ text: String, tabID: BrowserTab.ID? = nil) {
         let targetTabID = tabID ?? selectedTabID
         guard let targetTabID else { return }
-        let limit = 80_000
-        if targetTabID == selectedTabID {
-            terminalOutput.append(text)
-            if terminalOutput.count > limit {
-                terminalOutput.removeFirst(terminalOutput.count - limit)
+        pendingTerminalOutputByTab[targetTabID, default: ""].append(text)
+        guard terminalOutputFlushTasks[targetTabID] == nil else { return }
+        terminalOutputFlushTasks[targetTabID] = Task { @MainActor [weak self] in
+            do {
+                try await Task.sleep(for: .milliseconds(50))
+            } catch {
+                return
             }
+            self?.flushTerminalOutput(for: targetTabID)
+        }
+    }
+
+    private func flushTerminalOutput(for tabID: BrowserTab.ID) {
+        terminalOutputFlushTasks.removeValue(forKey: tabID)
+        guard let text = pendingTerminalOutputByTab.removeValue(forKey: tabID), !text.isEmpty else { return }
+        if tabID == selectedTabID {
+            appendBoundedTerminalOutput(text, to: &terminalOutput)
             syncCurrentTab()
-        } else if let index = tabs.firstIndex(where: { $0.id == targetTabID }) {
-            tabs[index].terminalOutput.append(text)
-            if tabs[index].terminalOutput.count > limit {
-                tabs[index].terminalOutput.removeFirst(tabs[index].terminalOutput.count - limit)
-            }
+        } else if let index = tabs.firstIndex(where: { $0.id == tabID }) {
+            appendBoundedTerminalOutput(text, to: &tabs[index].terminalOutput)
         }
     }
 
@@ -4866,6 +5041,8 @@ final class AppModel: ObservableObject {
     }
 
     private func stopTerminal(for tabID: BrowserTab.ID) {
+        terminalOutputFlushTasks.removeValue(forKey: tabID)?.cancel()
+        flushTerminalOutput(for: tabID)
         terminalSessions.removeValue(forKey: tabID)?.terminate()
         setTerminalStatus(.idle, tabID: tabID)
     }
@@ -4878,6 +5055,9 @@ final class AppModel: ObservableObject {
         remoteEditMonitorTask = nil
         for session in terminalSessions.values { session.terminate() }
         terminalSessions.removeAll()
+        for task in terminalOutputFlushTasks.values { task.cancel() }
+        terminalOutputFlushTasks.removeAll()
+        pendingTerminalOutputByTab.removeAll()
         Task { await sftp.closeAllPooledSessions() }
         for credential in tabCredentials.values { credential.clear() }
         tabCredentials.removeAll()
@@ -4942,27 +5122,25 @@ final class AppModel: ObservableObject {
         let knownHostsPath = try terminalKnownHostsPath(for: connection, probe: probe)
         let hostKeyAlgorithm = openSSHHostKeyAlgorithm(for: probe.keyType)
         let keyPath = try shellPrivateKeyPath(for: connection)
-        return try await Task.detached {
-            var args = [
-                "-F", "/dev/null",
-                "-oBatchMode=yes",
-                "-oStrictHostKeyChecking=yes",
-                "-oUserKnownHostsFile=\(knownHostsPath)",
-                "-oGlobalKnownHostsFile=/dev/null",
-                "-oClearAllForwardings=yes",
-                "-p", "\(connection.port)"
-            ]
-            if let hostKeyAlgorithm {
-                args.append(contentsOf: ["-oHostKeyAlgorithms=\(hostKeyAlgorithm)"])
-            }
-            if !keyPath.isEmpty {
-                args.append(contentsOf: ["-i", keyPath])
-            }
-            args.append("--")
-            args.append("\(connection.username)@\(connection.host)")
-            args.append(command)
-            return try CommandRunner().run("/usr/bin/ssh", arguments: args, stdin: "")
-        }.value
+        var args = [
+            "-F", "/dev/null",
+            "-oBatchMode=yes",
+            "-oStrictHostKeyChecking=yes",
+            "-oUserKnownHostsFile=\(knownHostsPath)",
+            "-oGlobalKnownHostsFile=/dev/null",
+            "-oClearAllForwardings=yes",
+            "-p", "\(connection.port)"
+        ]
+        if let hostKeyAlgorithm {
+            args.append(contentsOf: ["-oHostKeyAlgorithms=\(hostKeyAlgorithm)"])
+        }
+        if !keyPath.isEmpty {
+            args.append(contentsOf: ["-i", keyPath])
+        }
+        args.append("--")
+        args.append("\(connection.username)@\(connection.host)")
+        args.append(command)
+        return try await CommandRunner().run("/usr/bin/ssh", arguments: args, stdin: "")
     }
 
     private func shellPrivateKeyPath(for connection: SavedConnection) throws -> String {
@@ -5192,12 +5370,15 @@ final class AppModel: ObservableObject {
     }
 
     private func cachedRemoteItems(connectionID: UUID, path: String) -> [FileItem]? {
-        remoteDirectoryCache[remoteCacheKey(connectionID: connectionID, path: path)]?.items
+        cachedRemoteListing(connectionID: connectionID, path: path)?.items
     }
 
-    private func storeRemoteListing(_ items: [FileItem], connectionID: UUID, path: String) {
-        remoteDirectoryCache[remoteCacheKey(connectionID: connectionID, path: path)] = RemoteDirectoryCacheEntry(items: items, loadedAt: Date())
-        pruneRemoteDirectoryCache(maxEntries: 200)
+    private func cachedRemoteListing(connectionID: UUID, path: String) -> RemoteListingResult? {
+        remoteDirectoryCache.listing(for: remoteCacheKey(connectionID: connectionID, path: path))
+    }
+
+    private func storeRemoteListing(_ listing: RemoteListingResult, connectionID: UUID, path: String) {
+        remoteDirectoryCache.store(listing, for: remoteCacheKey(connectionID: connectionID, path: path))
     }
 
     private func invalidateRemoteCache(connectionID: UUID, path: String) {
@@ -5213,15 +5394,22 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private func pruneRemoteDirectoryCache(maxEntries: Int) {
-        guard remoteDirectoryCache.count > maxEntries else { return }
-        let overflow = remoteDirectoryCache.count - maxEntries
-        let staleKeys = remoteDirectoryCache
-            .sorted { $0.value.loadedAt < $1.value.loadedAt }
-            .prefix(overflow)
-            .map(\.key)
-        for key in staleKeys {
-            remoteDirectoryCache.removeValue(forKey: key)
+    private func remoteListingStatus(_ listing: RemoteListingResult, fallback: String) -> String {
+        var notices: [String] = []
+        if listing.isTruncated {
+            notices.append("Showing the first \(RemoteListingTuning.maxItemsPerDirectory) remote items. Narrow this folder for complete results.")
+        }
+        if listing.skippedUnsafeCount > 0 {
+            notices.append("\(listing.skippedUnsafeCount) unsafe remote entries were hidden.")
+        }
+        return notices.isEmpty ? fallback : notices.joined(separator: " ")
+    }
+
+    private func requireCompleteListing(_ listing: RemoteListingResult, path: String, operation: String) throws {
+        guard !listing.isTruncated else {
+            throw AppError.commandFailed(
+                "\(operation) stopped because \(path) contains more than \(RemoteListingTuning.maxItemsPerDirectory) items. Narrow the folder and try again."
+            )
         }
     }
 
@@ -6935,27 +7123,35 @@ struct FilePane<ToolbarContent: View, ContextMenuContent: View, BackgroundContex
     @State private var columnResizeDraft: ColumnResizeDraft?
     @State private var visibleItems: [FileItem] = []
     @State private var visibleItemsTask: Task<Void, Never>?
+    @State private var itemComputationCoordinator = FileItemComputationCoordinator()
 
     private let listColumnSpacing: CGFloat = 12
     private let listHorizontalInset: CGFloat = 20
     private let listHeaderHeight: CGFloat = 38
     private let listMaximumNameColumnShare: CGFloat = 0.48
 
-    private func recomputeVisibleItems() {
+    private func recomputeVisibleItems(debounce: Bool = false) {
         visibleItemsTask?.cancel()
         let itemsSnapshot = items
         let preferencesSnapshot = preferences
         let searchTextSnapshot = searchText
         visibleItemsTask = Task {
-            let computedItems = await Task.detached(priority: .userInitiated) {
-                filteredSortedFileItems(
+            do {
+                if debounce {
+                    try await Task.sleep(for: .milliseconds(120))
+                }
+                let computedItems = try await itemComputationCoordinator.compute(
                     items: itemsSnapshot,
                     preferences: preferencesSnapshot,
                     searchText: searchTextSnapshot
                 )
-            }.value
-            guard !Task.isCancelled else { return }
-            visibleItems = computedItems
+                try Task.checkCancellation()
+                visibleItems = computedItems
+            } catch is CancellationError {
+                return
+            } catch {
+                return
+            }
         }
     }
 
@@ -6975,10 +7171,10 @@ struct FilePane<ToolbarContent: View, ContextMenuContent: View, BackgroundContex
         }
         .frame(minWidth: 300)
         .background(VoltTheme.paneBackground)
-        .onAppear(perform: recomputeVisibleItems)
+        .onAppear { recomputeVisibleItems() }
         .onChange(of: items) { _, _ in recomputeVisibleItems() }
         .onChange(of: preferences) { _, _ in recomputeVisibleItems() }
-        .onChange(of: searchText) { _, _ in recomputeVisibleItems() }
+        .onChange(of: searchText) { _, _ in recomputeVisibleItems(debounce: true) }
         .onDisappear {
             visibleItemsTask?.cancel()
         }

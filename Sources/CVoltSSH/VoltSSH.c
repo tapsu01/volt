@@ -625,10 +625,24 @@ int volt_is_safe_entry_name(const char *name, size_t len) {
     return 1;
 }
 
-static int volt_sftp_list_with_session(VoltSession *session, const char *remote_path, VoltSFTPItem **items, int *count, int *skipped_unsafe_count, char *error, size_t error_len) {
+static void free_sftp_items(VoltSFTPItem *items, int count) {
+    if (!items) return;
+    for (int index = 0; index < count; index++) {
+        free(items[index].name);
+        free(items[index].path);
+    }
+    free(items);
+}
+
+static int volt_sftp_list_with_session(VoltSession *session, const char *remote_path, int max_items, VoltSFTPItem **items, int *count, int *skipped_unsafe_count, int *truncated, char *error, size_t error_len) {
+    if (!items || !count || !skipped_unsafe_count || !truncated || max_items <= 0) {
+        set_error(error, error_len, "Invalid remote listing request.");
+        return -1;
+    }
     *items = NULL;
     *count = 0;
     *skipped_unsafe_count = 0;
+    *truncated = 0;
 
     LIBSSH2_SFTP_HANDLE *dir = libssh2_sftp_opendir(session->sftp, remote_path);
     if (!dir) {
@@ -636,7 +650,7 @@ static int volt_sftp_list_with_session(VoltSession *session, const char *remote_
         return -1;
     }
 
-    int capacity = 64;
+    int capacity = max_items < 64 ? max_items : 64;
     int used = 0;
     VoltSFTPItem *list = calloc((size_t)capacity, sizeof(VoltSFTPItem));
     if (!list) {
@@ -659,25 +673,42 @@ static int volt_sftp_list_with_session(VoltSession *session, const char *remote_
             }
             name[rc] = '\0'; // An toàn: readdir_ex gọi với sizeof(name) - 1 nên rc < sizeof(name).
             if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) continue; // Silent-skip, KHÔNG đếm.
+            if (used >= max_items) {
+                *truncated = 1;
+                break;
+            }
             if (used == capacity) {
-                capacity *= 2;
-                VoltSFTPItem *grown = realloc(list, (size_t)capacity * sizeof(VoltSFTPItem));
+                int next_capacity = capacity > max_items / 2 ? max_items : capacity * 2;
+                VoltSFTPItem *grown = realloc(list, (size_t)next_capacity * sizeof(VoltSFTPItem));
                 if (!grown) {
-                    free(list);
+                    free_sftp_items(list, used);
                     libssh2_sftp_closedir(dir);
                     set_error(error, error_len, "Out of memory.");
                     return -1;
                 }
                 list = grown;
+                capacity = next_capacity;
             }
             memset(&list[used], 0, sizeof(VoltSFTPItem));
-            snprintf(list[used].name, sizeof(list[used].name), "%s", name);
-            if (join_path(remote_path, name, list[used].path, sizeof(list[used].path)) != 0) {
-                free(list);
+            char item_path[4096];
+            if (join_path(remote_path, name, item_path, sizeof(item_path)) != 0) {
+                free_sftp_items(list, used);
                 libssh2_sftp_closedir(dir);
                 set_error(error, error_len, "Remote path exceeds Volt's safety limit.");
                 return -1;
             }
+            char *stored_name = strdup(name);
+            char *stored_path = strdup(item_path);
+            if (!stored_name || !stored_path) {
+                free(stored_name);
+                free(stored_path);
+                free_sftp_items(list, used);
+                libssh2_sftp_closedir(dir);
+                set_error(error, error_len, "Out of memory.");
+                return -1;
+            }
+            list[used].name = stored_name;
+            list[used].path = stored_path;
             list[used].is_directory = (attrs.flags & LIBSSH2_SFTP_ATTR_PERMISSIONS) && LIBSSH2_SFTP_S_ISDIR(attrs.permissions);
             list[used].size = (attrs.flags & LIBSSH2_SFTP_ATTR_SIZE) ? (int64_t)attrs.filesize : -1;
             list[used].modified = (attrs.flags & LIBSSH2_SFTP_ATTR_ACMODTIME) ? (int64_t)attrs.mtime : 0;
@@ -688,7 +719,7 @@ static int volt_sftp_list_with_session(VoltSession *session, const char *remote_
         } else if (rc == 0) {
             break;
         } else {
-            free(list);
+            free_sftp_items(list, used);
             libssh2_sftp_closedir(dir);
             set_error(error, error_len, "Could not read remote directory.");
             return -1;
@@ -701,18 +732,18 @@ static int volt_sftp_list_with_session(VoltSession *session, const char *remote_
     return 0;
 }
 
-int volt_sftp_list_on(VoltSessionHandle *handle, const char *remote_path, VoltSFTPItem **items, int *count, int *skipped_unsafe_count, char *error, size_t error_len) {
+int volt_sftp_list_on(VoltSessionHandle *handle, const char *remote_path, int max_items, VoltSFTPItem **items, int *count, int *skipped_unsafe_count, int *truncated, char *error, size_t error_len) {
     if (!handle) {
         set_error(error, error_len, "SFTP session is not open.");
         return -1;
     }
-    return volt_sftp_list_with_session(&handle->session, remote_path, items, count, skipped_unsafe_count, error, error_len);
+    return volt_sftp_list_with_session(&handle->session, remote_path, max_items, items, count, skipped_unsafe_count, truncated, error, error_len);
 }
 
-int volt_sftp_list(const char *host, int port, const char *username, const char *password, const char *private_key_path, const char *known_hosts_path, const char *remote_path, VoltSFTPItem **items, int *count, int *skipped_unsafe_count, char *error, size_t error_len) {
+int volt_sftp_list(const char *host, int port, const char *username, const char *password, const char *private_key_path, const char *known_hosts_path, const char *remote_path, int max_items, VoltSFTPItem **items, int *count, int *skipped_unsafe_count, int *truncated, char *error, size_t error_len) {
     VoltSession session;
     if (open_session(host, port, username, password, private_key_path, known_hosts_path, &session, error, error_len) != 0) return -1;
-    int result = volt_sftp_list_with_session(&session, remote_path, items, count, skipped_unsafe_count, error, error_len);
+    int result = volt_sftp_list_with_session(&session, remote_path, max_items, items, count, skipped_unsafe_count, truncated, error, error_len);
     close_session(&session);
     return result;
 }
@@ -1538,8 +1569,8 @@ int volt_sftp_remove(const char *host, int port, const char *username, const cha
     return result;
 }
 
-void volt_sftp_free_items(VoltSFTPItem *items) {
-    free(items);
+void volt_sftp_free_items(VoltSFTPItem *items, int count) {
+    free_sftp_items(items, count < 0 ? 0 : count);
 }
 
 const char *volt_sftp_item_name(const VoltSFTPItem *items, int index) {

@@ -37,7 +37,7 @@ let package = Package(
         ),
         .testTarget(
             name: "VoltTests",
-            dependencies: ["VoltCore"],
+            dependencies: ["VoltCore", "Volt"],
             path: "Tests/VoltTests"
         )
     ]

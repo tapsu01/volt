@@ -1,17 +1,69 @@
 import Foundation
 
+enum RemoteListingTuning {
+    static let maxItemsPerDirectory = 20_000
+}
+
+struct TraversalLimits: Sendable, Equatable {
+    var maxDepth: Int
+    var maxDirectories: Int
+    var maxEntries: Int
+    var maxSearchResults: Int
+
+    static let standard = TraversalLimits(
+        maxDepth: 64,
+        maxDirectories: 2_000,
+        maxEntries: 100_000,
+        maxSearchResults: 500
+    )
+}
+
 func filteredSortedFileItems(
     items: [FileItem],
     preferences: FileBrowserPreferences,
     searchText: String
-) -> [FileItem] {
+) throws -> [FileItem] {
     let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
-    return items
-        .filter { preferences.showHiddenFiles || !$0.isHidden }
-        .filter { query.isEmpty || $0.name.localizedCaseInsensitiveContains(query) || $0.path.localizedCaseInsensitiveContains(query) }
-        .sorted { lhs, rhs in
-            fileItemsSortBefore(lhs, rhs, preferences: preferences)
+    var filtered: [FileItem] = []
+    filtered.reserveCapacity(items.count)
+    for (index, item) in items.enumerated() {
+        if index.isMultiple(of: 256) {
+            try Task.checkCancellation()
         }
+        guard preferences.showHiddenFiles || !item.isHidden else { continue }
+        guard query.isEmpty || item.name.localizedCaseInsensitiveContains(query) || item.path.localizedCaseInsensitiveContains(query) else { continue }
+        filtered.append(item)
+    }
+    try Task.checkCancellation()
+    filtered.sort { lhs, rhs in
+        fileItemsSortBefore(lhs, rhs, preferences: preferences)
+    }
+    try Task.checkCancellation()
+    return filtered
+}
+
+actor FileItemComputationCoordinator {
+    func compute(
+        items: [FileItem],
+        preferences: FileBrowserPreferences,
+        searchText: String
+    ) throws -> [FileItem] {
+        try filteredSortedFileItems(items: items, preferences: preferences, searchText: searchText)
+    }
+}
+
+func appendBoundedTerminalOutput(
+    _ newText: String,
+    to output: inout String,
+    retainedCount: Int = 80_000,
+    trimThreshold: Int = 100_000
+) {
+    output.append(newText)
+    let safeRetainedCount = max(1, retainedCount)
+    let safeTrimThreshold = max(safeRetainedCount, trimThreshold)
+    if output.count > safeTrimThreshold {
+        output = String(output.suffix(safeRetainedCount))
+    }
 }
 
 private func fileItemsSortBefore(_ lhs: FileItem, _ rhs: FileItem, preferences: FileBrowserPreferences) -> Bool {
@@ -34,42 +86,51 @@ private func compareFileItemValues<T: Comparable>(_ lhs: T, _ rhs: T) -> Compari
 }
 
 enum RemoteTraversalTuning {
-    static let maxDepth = 64
-    static let maxDirectories = 2_000
-    static let maxEntries = 100_000
-    static let maxSearchResults = 500
+    static let maxDepth = TraversalLimits.standard.maxDepth
+    static let maxDirectories = TraversalLimits.standard.maxDirectories
+    static let maxEntries = TraversalLimits.standard.maxEntries
+    static let maxSearchResults = TraversalLimits.standard.maxSearchResults
 }
 
-final class RemoteTraversalState {
+final class TraversalState: @unchecked Sendable {
+    let limits: TraversalLimits
+    let scope: String
     private(set) var visitedDirectories = 0
     private(set) var visitedEntries = 0
     private(set) var matchedResults = 0
     private var lastProgressUpdate = Date.distantPast
 
-    func visitDirectory(path: String, depth: Int) throws {
+    init(scope: String, limits: TraversalLimits = .standard) {
+        self.scope = scope
+        self.limits = limits
+    }
+
+    func visitDirectory(depth: Int) throws {
         try Task.checkCancellation()
-        guard depth <= RemoteTraversalTuning.maxDepth else {
-            throw AppError.commandFailed("Remote traversal stopped at depth \(RemoteTraversalTuning.maxDepth). Narrow the folder and try again.")
+        guard depth <= limits.maxDepth else {
+            throw AppError.commandFailed("\(scope) stopped at depth \(limits.maxDepth). Narrow the folder and try again.")
         }
         visitedDirectories += 1
-        guard visitedDirectories <= RemoteTraversalTuning.maxDirectories else {
-            throw AppError.commandFailed("Remote traversal stopped after \(RemoteTraversalTuning.maxDirectories) folders. Narrow the folder and try again.")
+        guard visitedDirectories <= limits.maxDirectories else {
+            throw AppError.commandFailed("\(scope) stopped after \(limits.maxDirectories) folders. Narrow the folder and try again.")
         }
     }
 
     func visitEntries(_ count: Int) throws {
         try Task.checkCancellation()
-        visitedEntries += count
-        guard visitedEntries <= RemoteTraversalTuning.maxEntries else {
-            throw AppError.commandFailed("Remote traversal stopped after \(RemoteTraversalTuning.maxEntries) items. Narrow the folder and try again.")
+        guard count >= 0,
+              visitedEntries <= limits.maxEntries,
+              count <= limits.maxEntries - visitedEntries else {
+            throw AppError.commandFailed("\(scope) stopped after \(limits.maxEntries) items. Narrow the folder and try again.")
         }
+        visitedEntries += count
     }
 
     func recordMatch() throws {
-        matchedResults += 1
-        guard matchedResults <= RemoteTraversalTuning.maxSearchResults else {
-            throw AppError.commandFailed("Search stopped after \(RemoteTraversalTuning.maxSearchResults) results. Narrow the query and try again.")
+        guard matchedResults < limits.maxSearchResults else {
+            throw AppError.commandFailed("Search stopped after \(limits.maxSearchResults) results. Narrow the query and try again.")
         }
+        matchedResults += 1
     }
 
     func shouldPublishProgress() -> Bool {
@@ -77,6 +138,70 @@ final class RemoteTraversalState {
         guard now.timeIntervalSince(lastProgressUpdate) >= 0.2 else { return false }
         lastProgressUpdate = now
         return true
+    }
+}
+
+typealias RemoteTraversalState = TraversalState
+
+struct RemoteDirectoryCache {
+    private(set) var storage: [String: RemoteDirectoryCacheEntry] = [:]
+    let maxDirectories: Int
+    let maxItems: Int
+    let maxEstimatedCost: Int
+
+    init(maxDirectories: Int = 100, maxItems: Int = 50_000, maxEstimatedCost: Int = 64 * 1024 * 1024) {
+        self.maxDirectories = max(1, maxDirectories)
+        self.maxItems = max(1, maxItems)
+        self.maxEstimatedCost = max(1, maxEstimatedCost)
+    }
+
+    mutating func listing(for key: String, now: Date = Date()) -> RemoteListingResult? {
+        guard var entry = storage[key] else { return nil }
+        entry.loadedAt = now
+        storage[key] = entry
+        return entry.listing
+    }
+
+    mutating func store(_ listing: RemoteListingResult, for key: String, now: Date = Date()) {
+        storage[key] = RemoteDirectoryCacheEntry(
+            listing: listing,
+            loadedAt: now,
+            estimatedCost: Self.estimatedCost(of: listing.items)
+        )
+        prune()
+    }
+
+    mutating func removeValue(forKey key: String) {
+        storage.removeValue(forKey: key)
+    }
+
+    mutating func removeAll() {
+        storage.removeAll()
+    }
+
+    private mutating func prune() {
+        var itemCount = storage.values.reduce(0) { $0 + $1.listing.items.count }
+        var estimatedCost = storage.values.reduce(0) { $0 + $1.estimatedCost }
+        while storage.count > maxDirectories || itemCount > maxItems || estimatedCost > maxEstimatedCost {
+            guard let oldest = storage.min(by: { $0.value.loadedAt < $1.value.loadedAt }) else { break }
+            itemCount -= oldest.value.listing.items.count
+            estimatedCost -= oldest.value.estimatedCost
+            storage.removeValue(forKey: oldest.key)
+        }
+    }
+
+    static func estimatedCost(of items: [FileItem]) -> Int {
+        var total = 0
+        for item in items {
+            var itemCost = 256
+            itemCost += item.name.utf8.count
+            itemCost += item.path.utf8.count
+            itemCost += item.kind.utf8.count
+            itemCost += item.owner?.utf8.count ?? 0
+            itemCost += item.group?.utf8.count ?? 0
+            total += itemCost
+        }
+        return total
     }
 }
 
