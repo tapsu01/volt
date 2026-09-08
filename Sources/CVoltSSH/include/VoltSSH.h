@@ -53,6 +53,7 @@ int volt_is_safe_entry_name(const char *name, size_t len);
 int volt_session_open(const char *host, int port, const char *username, const char *password, const char *private_key_path, const char *known_hosts_path, VoltSessionHandle **out, char *error, size_t error_len);
 void volt_session_close(VoltSessionHandle *handle);
 
+int volt_sftp_upload_on(VoltSessionHandle *handle, const char *local_path, const char *remote_path, uint32_t mode, int overwrite, VoltSFTPProgressCallback progress, void *progress_context, char *error, size_t error_len);
 int volt_sftp_list_on(VoltSessionHandle *handle, const char *remote_path, int max_items, VoltSFTPItem **items, int *count, int *skipped_unsafe_count, int *truncated, char *error, size_t error_len);
 int volt_sftp_mkdir_on(VoltSessionHandle *handle, const char *remote_path, uint32_t mode, char *error, size_t error_len);
 int volt_sftp_create_empty_file_on(VoltSessionHandle *handle, const char *remote_path, uint32_t mode, char *error, size_t error_len);

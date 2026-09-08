@@ -1,3 +1,4 @@
+#if canImport(XCTest)
 import Foundation
 import XCTest
 @testable import VoltCore
@@ -56,3 +57,7 @@ final class PathSafetyTests: XCTestCase {
         XCTAssertEqual(safeLocalDestination(base: base2, name: "file.txt")?.path, "/tmp/base2/file.txt")
     }
 }
+
+#else
+#warning("XCTest is unavailable: run this legacy suite with a full Xcode toolchain. UploadTests uses Swift Testing.")
+#endif

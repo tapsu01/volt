@@ -1,4 +1,5 @@
 #include "VoltSSH.h"
+#include "UploadPublish.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -748,39 +749,60 @@ int volt_sftp_list(const char *host, int port, const char *username, const char 
     return result;
 }
 
-int volt_sftp_upload(const char *host, int port, const char *username, const char *password, const char *private_key_path, const char *known_hosts_path, const char *local_path, const char *remote_path, uint32_t mode, int overwrite, VoltSFTPProgressCallback progress, void *progress_context, char *error, size_t error_len) {
-    VoltSession session;
-    if (open_session(host, port, username, password, private_key_path, known_hosts_path, &session, error, error_len) != 0) return -1;
-    FILE *input = fopen(local_path, "rb");
+static int upload_rename(void *context, const char *temporary_path, const char *destination, int overwrite) {
+    VoltSession *session = context;
+    int result = overwrite
+        ? libssh2_sftp_posix_rename(session->sftp, temporary_path, destination)
+        : libssh2_sftp_rename_ex(session->sftp, temporary_path, (unsigned int)strlen(temporary_path),
+                                destination, (unsigned int)strlen(destination), 0);
+    if (result == 0) return VOLT_UPLOAD_PUBLISHED;
+    if (result == LIBSSH2_ERROR_SFTP_PROTOCOL || result == LIBSSH2_ERROR_METHOD_NOT_SUPPORTED)
+        return VOLT_UPLOAD_REJECTED;
+    return VOLT_UPLOAD_UNCERTAIN;
+}
+
+static void upload_cleanup(void *context, const char *temporary_path) {
+    VoltSession *session = context;
+    libssh2_sftp_unlink(session->sftp, temporary_path);
+}
+
+static int upload_file_with_session(VoltSession *session, const char *local_path, const char *remote_path, uint32_t mode, int overwrite, VoltSFTPProgressCallback progress, void *progress_context, char *error, size_t error_len) {
+    if (progress && progress(0, 0, progress_context) != 0) {
+        set_error(error, error_len, "Transfer cancelled.");
+        return -1;
+    }
+    int input_fd = open(local_path, O_RDONLY | O_NOFOLLOW);
+    FILE *input = input_fd >= 0 ? fdopen(input_fd, "rb") : NULL;
+    if (!input && input_fd >= 0) close(input_fd);
     if (!input) {
         set_error(error, error_len, strerror(errno));
-        close_session(&session);
         return -1;
     }
     struct stat input_stat;
-    uint64_t total_size = fstat(fileno(input), &input_stat) == 0 && input_stat.st_size > 0
-        ? (uint64_t)input_stat.st_size
-        : 0;
+    if (fstat(fileno(input), &input_stat) != 0 || !S_ISREG(input_stat.st_mode)) {
+        fclose(input);
+        set_error(error, error_len, "Upload source must be a regular file, not a symbolic link.");
+        return -1;
+    }
+    uint64_t total_size = input_stat.st_size > 0 ? (uint64_t)input_stat.st_size : 0;
     uint64_t transferred = 0;
     char temp_path[4096];
     int temp_path_length = snprintf(temp_path, sizeof(temp_path), "%s.volt-part-%ld-%08x", remote_path, (long)getpid(), arc4random());
     if (temp_path_length < 0 || (size_t)temp_path_length >= sizeof(temp_path)) {
         fclose(input);
         set_error(error, error_len, "Remote upload path is too long.");
-        close_session(&session);
         return -1;
     }
     mode_t safe_mode = (mode_t)(mode & 0777U);
     LIBSSH2_SFTP_HANDLE *file = libssh2_sftp_open(
-        session.sftp,
+        session->sftp,
         temp_path,
         LIBSSH2_FXF_WRITE | LIBSSH2_FXF_CREAT | LIBSSH2_FXF_TRUNC | LIBSSH2_FXF_EXCL,
         safe_mode
     );
     if (!file) {
         fclose(input);
-        set_session_error(session.session, error, error_len, "Could not create temporary remote upload file.");
-        close_session(&session);
+        set_session_error(session->session, error, error_len, "Could not create temporary remote upload file.");
         return -1;
     }
     char buffer[VOLT_SFTP_TRANSFER_BUFFER_SIZE];
@@ -789,13 +811,19 @@ int volt_sftp_upload(const char *host, int port, const char *username, const cha
         char *ptr = buffer;
         size_t left = n;
         while (left > 0) {
+            if (progress && progress(transferred + n - left, total_size, progress_context) != 0) {
+                libssh2_sftp_close(file);
+                libssh2_sftp_unlink(session->sftp, temp_path);
+                fclose(input);
+                set_error(error, error_len, "Transfer cancelled.");
+                return -1;
+            }
             ssize_t written = libssh2_sftp_write(file, ptr, left);
             if (written <= 0) {
                 libssh2_sftp_close(file);
-                libssh2_sftp_unlink(session.sftp, temp_path);
+                libssh2_sftp_unlink(session->sftp, temp_path);
                 fclose(input);
-                set_session_error(session.session, error, error_len, "SFTP write failed.");
-                close_session(&session);
+                set_session_error(session->session, error, error_len, "SFTP write failed.");
                 return -1;
             }
             ptr += written;
@@ -804,19 +832,17 @@ int volt_sftp_upload(const char *host, int port, const char *username, const cha
         transferred += (uint64_t)n;
         if (progress && progress(transferred, total_size, progress_context) != 0) {
             libssh2_sftp_close(file);
-            libssh2_sftp_unlink(session.sftp, temp_path);
+            libssh2_sftp_unlink(session->sftp, temp_path);
             fclose(input);
             set_error(error, error_len, "Transfer cancelled.");
-            close_session(&session);
             return -1;
         }
     }
     if (ferror(input)) {
         libssh2_sftp_close(file);
-        libssh2_sftp_unlink(session.sftp, temp_path);
+        libssh2_sftp_unlink(session->sftp, temp_path);
         fclose(input);
         set_error(error, error_len, "Could not read the local upload file.");
-        close_session(&session);
         return -1;
     }
     LIBSSH2_SFTP_ATTRIBUTES permission_attrs;
@@ -827,55 +853,53 @@ int volt_sftp_upload(const char *host, int port, const char *username, const cha
     int close_result = libssh2_sftp_close(file);
     fclose(input);
     if (close_result != 0) {
-        libssh2_sftp_unlink(session.sftp, temp_path);
-        set_session_error(session.session, error, error_len, "Could not finalize temporary remote upload file.");
-        close_session(&session);
+        libssh2_sftp_unlink(session->sftp, temp_path);
+        set_session_error(session->session, error, error_len, "Could not finalize temporary remote upload file.");
         return -1;
     }
 
-    long rename_flags = overwrite
-        ? (LIBSSH2_SFTP_RENAME_OVERWRITE | LIBSSH2_SFTP_RENAME_ATOMIC | LIBSSH2_SFTP_RENAME_NATIVE)
-        : (LIBSSH2_SFTP_RENAME_ATOMIC | LIBSSH2_SFTP_RENAME_NATIVE);
-    int rename_result = libssh2_sftp_rename_ex(
-        session.sftp,
-        temp_path,
-        (unsigned int)strlen(temp_path),
-        remote_path,
-        (unsigned int)strlen(remote_path),
-        rename_flags
-    );
-    if (rename_result != 0) {
-        rename_result = libssh2_sftp_rename_ex(
-            session.sftp,
-            temp_path,
-            (unsigned int)strlen(temp_path),
-            remote_path,
-            (unsigned int)strlen(remote_path),
-            overwrite ? LIBSSH2_SFTP_RENAME_OVERWRITE : 0
-        );
-    }
-    if (rename_result != 0 && overwrite && libssh2_sftp_unlink(session.sftp, remote_path) == 0) {
-        rename_result = libssh2_sftp_rename_ex(
-            session.sftp,
-            temp_path,
-            (unsigned int)strlen(temp_path),
-            remote_path,
-            (unsigned int)strlen(remote_path),
-            0
-        );
-    }
-    if (rename_result != 0) {
-        libssh2_sftp_unlink(session.sftp, temp_path);
-        set_session_error(session.session, error, error_len, "Could not publish completed remote upload.");
-        close_session(&session);
+    if (progress && progress(transferred, total_size, progress_context) != 0) {
+        libssh2_sftp_unlink(session->sftp, temp_path);
+        set_error(error, error_len, "Transfer cancelled before publish.");
         return -1;
     }
-    close_session(&session);
+    int publish_result = volt_upload_publish(session, temp_path, remote_path, overwrite,
+                                             upload_rename, upload_cleanup);
+    if (publish_result != VOLT_UPLOAD_PUBLISHED) {
+        if (publish_result == VOLT_UPLOAD_UNCERTAIN) {
+            snprintf(error, error_len, "Upload publish outcome is unknown. Inspect destination and temporary file %s before retrying.", temp_path);
+        } else {
+            set_error(error, error_len, overwrite
+                ? "Server rejected safe replacement. The existing file was not removed."
+                : "Server rejected upload publish. The destination may already exist.");
+        }
+        return -1;
+    }
     if (permission_result != 0) {
         set_error(error, error_len, "Uploaded, but could not apply requested permissions.");
         return VOLT_SFTP_PERMISSION_WARNING;
     }
     return 0;
+}
+
+int volt_sftp_upload_on(VoltSessionHandle *handle, const char *local_path, const char *remote_path, uint32_t mode, int overwrite, VoltSFTPProgressCallback progress, void *progress_context, char *error, size_t error_len) {
+    if (!handle) {
+        set_error(error, error_len, "SFTP session is not open.");
+        return -1;
+    }
+    return upload_file_with_session(&handle->session, local_path, remote_path, mode, overwrite, progress, progress_context, error, error_len);
+}
+
+int volt_sftp_upload(const char *host, int port, const char *username, const char *password, const char *private_key_path, const char *known_hosts_path, const char *local_path, const char *remote_path, uint32_t mode, int overwrite, VoltSFTPProgressCallback progress, void *progress_context, char *error, size_t error_len) {
+    VoltSession session;
+    if (progress && progress(0, 0, progress_context) != 0) {
+        set_error(error, error_len, "Transfer cancelled.");
+        return -1;
+    }
+    if (open_session(host, port, username, password, private_key_path, known_hosts_path, &session, error, error_len) != 0) return -1;
+    int result = upload_file_with_session(&session, local_path, remote_path, mode, overwrite, progress, progress_context, error, error_len);
+    close_session(&session);
+    return result;
 }
 
 static int download_file_with_session(VoltSession *session, const char *remote_path, const char *local_path, int overwrite, VoltSFTPProgressCallback progress, void *progress_context, char *error, size_t error_len) {

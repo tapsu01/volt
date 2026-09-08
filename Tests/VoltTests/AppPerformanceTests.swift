@@ -1,3 +1,4 @@
+#if canImport(XCTest)
 import Foundation
 import XCTest
 @testable import Volt
@@ -94,3 +95,7 @@ final class AppPerformanceTests: XCTestCase {
         )
     }
 }
+
+#else
+#warning("XCTest is unavailable: run this legacy suite with a full Xcode toolchain. UploadTests uses Swift Testing.")
+#endif

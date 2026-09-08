@@ -65,10 +65,25 @@ configuration files.
 
 - Upload and download with a visible, cancellable transfer queue.
 - Folder upload and folder download support.
+- Folder uploads reuse up to four worker sessions, with cancellable background
+  scanning and aggregate byte/file progress. One folder plan is active at a time
+  to bound memory when multiple folders are selected.
 - Parallel transfer tuning for larger download workloads.
 - Remote editing with a selectable macOS application, followed by explicit
   upload or discard.
 - Configurable permission presets for newly created or uploaded remote items.
+
+Uploads are published from a temporary file in the destination directory.
+Replacing an existing file requires the server's POSIX rename extension; Volt
+reports an error if safe replacement is rejected and never deletes the existing
+file as a fallback. If the connection is lost during publication, the outcome
+is reported as unknown and the temporary path is shown for inspection before
+retrying. There is no automatic retry of an uncertain publish.
+
+Folder upload scanning skips hidden entries and symbolic links and stops above
+64 levels, 2,000 directories, or 100,000 entries. Cancellation or failure can
+leave files that were already successfully published; the queue reports the
+completed count and refreshes affected directories after the upload batch ends.
 
 ### Authentication
 
@@ -219,8 +234,31 @@ Run Swift unit tests when using a full Xcode toolchain with XCTest available:
 swift test
 ```
 
-Run security-focused C tests for host-key storage and remote entry-name
-validation:
+Run the upload suite with Swift Testing, including on Command Line Tools-only
+installations:
+
+```bash
+./Scripts/test-upload.sh
+```
+
+The legacy XCTest suites require full Xcode and emit explicit build warnings
+when unavailable. The upload suite covers batch completion, tab/connection
+scope, worker limits, cancellation, traversal limits, and a 10,000-file scan.
+
+Run an isolated localhost SFTP transport benchmark against the earlier revision:
+
+```bash
+./Scripts/benchmark-upload.py --baseline-commit caffbb6 --files 1000
+```
+
+This generates temporary SSH keys and an unprivileged loopback-only sshd,
+compares uploaded contents with SHA-256, checks replacement/cancellation,
+and writes `build/upload-benchmark.json`. It measures the C transport driver;
+GUI responsiveness, Swift preparation time, and WAN latency are separate checks.
+Temporary server processes and keys are removed when the script exits.
+
+Run security-focused C tests for host-key storage, remote entry-name validation,
+and upload publish failures (including lost replies and cancellation):
 
 ```bash
 ./Scripts/test-security.sh

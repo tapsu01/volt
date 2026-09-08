@@ -46,3 +46,13 @@ NAME_OUTPUT="${TMPDIR:-/tmp}/volt-entry-name-validation-test"
 
 ASAN_OPTIONS="$ASAN_OPTIONS_VALUE" UBSAN_OPTIONS="$UBSAN_OPTIONS_VALUE" DYLD_LIBRARY_PATH="$LIBSSH2_PREFIX/lib:$OPENSSL_PREFIX/lib" "$NAME_OUTPUT"
 /bin/rm -f "$NAME_OUTPUT"
+
+UPLOAD_OUTPUT="${TMPDIR:-/tmp}/volt-upload-publish-test"
+/usr/bin/clang \
+  $SANITIZER_FLAGS \
+  -I"$LIBSSH2_PREFIX/include" \
+  -I"$ROOT_DIR/Sources/CVoltSSH/include" \
+  "$ROOT_DIR/Tests/upload_publish_test.c" \
+  -L"$LIBSSH2_PREFIX/lib" -lssh2 -o "$UPLOAD_OUTPUT"
+ASAN_OPTIONS="$ASAN_OPTIONS_VALUE" UBSAN_OPTIONS="$UBSAN_OPTIONS_VALUE" DYLD_LIBRARY_PATH="$LIBSSH2_PREFIX/lib:$OPENSSL_PREFIX/lib" "$UPLOAD_OUTPUT"
+/bin/rm -f "$UPLOAD_OUTPUT"

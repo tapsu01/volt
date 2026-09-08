@@ -290,11 +290,6 @@ actor FolderDownloadProgress {
     }
 }
 
-struct FolderUploadSummary {
-    var uploadedFiles = 0
-    var skippedItems = 0
-}
-
 private enum TransferTuning {
     static let maxConcurrentTransfers = 4
     static let maxConcurrentFolderDownloads = 4
@@ -515,6 +510,21 @@ actor TransferLimiter {
             release()
             throw error
         }
+    }
+
+    func withPermit<T: Sendable>(control: TransferControl, _ operation: @Sendable () async throws -> T) async throws -> T {
+        // Cancellation-aware waiting also handles the UI's TransferControl, whose
+        // cancellation is independent of Swift task cancellation.
+        while availablePermits == 0 {
+            try Task.checkCancellation()
+            guard !control.isCancelled else { throw CancellationError() }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        try Task.checkCancellation()
+        guard !control.isCancelled else { throw CancellationError() }
+        availablePermits -= 1
+        defer { release() }
+        return try await operation()
     }
 
     private func acquire() async {
@@ -1066,12 +1076,6 @@ enum UploadPublishPolicy: Sendable {
     case createNew
 }
 
-private enum UploadConflictBatchPolicy {
-    case replace
-    case keepBoth
-    case skip
-}
-
 private enum UploadConflictChoice: Equatable {
     case replace
     case keepBoth
@@ -1165,7 +1169,7 @@ final class TransferControl: @unchecked Sendable {
     var isCancelled: Bool {
         lock.lock()
         defer { lock.unlock() }
-        return cancelled
+        return cancelled || parent?.isCancelled == true
     }
 
     func report(transferred: UInt64, total: UInt64) -> Bool {
@@ -1555,6 +1559,17 @@ final class SFTPClient: @unchecked Sendable {
         }.value
     }
 
+    func uploadUsingSession(connection: SavedConnection, credential: SensitiveCredential, file: PlannedUploadFile, control: TransferControl) async throws -> String? {
+        guard !control.isCancelled else { throw CancellationError() }
+        return try await callOnPooledSession(connection: connection, credential: credential) { handle, error, errorLength in
+            let context = Unmanaged.passRetained(control).toOpaque()
+            defer { Unmanaged<TransferControl>.fromOpaque(context).release() }
+            return volt_sftp_upload_on(handle, file.localPath, file.remotePath,
+                connection.effectivePermissionPreset.fileMode, file.policy == .replace ? 1 : 0,
+                transferProgressCallback, context, error, errorLength)
+        }
+    }
+
     func download(connection: SavedConnection, credential: SensitiveCredential, remotePath: String, localPath: String, policy: DownloadPublishPolicy, control: TransferControl) async throws {
         try await Task.detached {
             let context = Unmanaged.passRetained(control).toOpaque()
@@ -1922,16 +1937,19 @@ final class AppModel: ObservableObject {
     private var terminalOutputFlushTasks: [BrowserTab.ID: Task<Void, Never>] = [:]
     private var verifiedHostProbes: [String: HostKeyProbe] = [:]
     private var remoteDirectoryCache = RemoteDirectoryCache()
+    private var remoteRefreshRequests: [UUID: UUID] = [:]
     private var pendingConnectAfterEditorDismiss: (tabID: BrowserTab.ID, connectionID: UUID)?
     private var syncPreviewTask: Task<Void, Never>?
     private var remoteSearchTask: Task<Void, Never>?
 
     private let sftp = SFTPClient()
     private let transferLimiter = TransferLimiter(limit: TransferTuning.maxConcurrentTransfers)
+    private let folderUploadLimiter = TransferLimiter(limit: 1)
     private var transferControls: [UUID: TransferControl] = [:]
     private var lastTransferProgressUpdateByID: [UUID: Date] = [:]
-    private var uploadConflictBatchPolicy: UploadConflictBatchPolicy?
-    private var reservedUploadPaths: Set<String> = []
+    private var uploadRefreshTasks: [UploadRefreshKey: Task<Void, Never>] = [:]
+    private var pendingUploadRefreshPaths: [UploadRefreshKey: Set<String>] = [:]
+    private var uploadOrigins: [UUID: (connection: SavedConnection, tabID: UUID?, root: String)] = [:]
     private var remoteEditMonitorTask: Task<Void, Never>?
     private var activeOperationCount = 0
     private var isRestoringTab = false
@@ -2779,7 +2797,9 @@ final class AppModel: ObservableObject {
                 guard !control.isCancelled else { throw AppError.commandFailed("Transfer cancelled.") }
                 guard let localPath = item.localPath else { continue }
                 let policy: UploadPublishPolicy = item.action == .replaceRemote ? .replace : .createNew
-                _ = try await self.sftp.upload(connection: connection, credential: credential, localPath: localPath, remotePath: item.remotePath, policy: policy, control: control)
+                _ = try await self.transferLimiter.withPermit(control: control) {
+                    try await self.sftp.upload(connection: connection, credential: credential, localPath: localPath, remotePath: item.remotePath, policy: policy, control: control)
+                }
                 completed += 1
                 await MainActor.run {
                     self.markTransfer(transferID, .running, "Uploaded \(item.relativePath)")
@@ -3052,6 +3072,8 @@ final class AppModel: ObservableObject {
         let path = remotePath
         let credential = credentialForCurrentTab().clone()
         let operationTabID = selectedTabID
+        let requestID = UUID()
+        if let operationTabID { remoteRefreshRequests[operationTabID] = requestID }
         let operation: @Sendable () async throws -> Void = {
             let result: RemoteListingResult
             do {
@@ -3071,9 +3093,11 @@ final class AppModel: ObservableObject {
                 guard let operationTabID,
                       let tabIndex = self.tabs.firstIndex(where: { $0.id == operationTabID }),
                       self.tabs[tabIndex].connectionID == connection.id,
-                      self.tabs[tabIndex].remotePath == path
+                      self.tabs[tabIndex].remotePath == path,
+                      self.remoteRefreshRequests[operationTabID] == requestID
                 else { return }
 
+                self.remoteRefreshRequests.removeValue(forKey: operationTabID)
                 self.storeRemoteListing(result, connectionID: connection.id, path: path)
                 let statusText = self.remoteListingStatus(result, fallback: finalStatus)
 
@@ -3189,15 +3213,43 @@ final class AppModel: ObservableObject {
         syncCurrentTab()
     }
 
+    private func makeUploadBatch(remoteRoot: String? = nil) -> UploadBatchContext? {
+        guard let connection = selectedConnection else { return nil }
+        return UploadBatchContext(connection: connection, credential: credentialForCurrentTab().clone(),
+                                  tabID: selectedTabID, remoteRoot: remoteRoot ?? remotePath)
+    }
+
+    private func registerUpload(_ id: UUID, batch: UploadBatchContext) {
+        batch.register(id)
+        uploadOrigins[id] = (batch.connection, batch.tabID, batch.remoteRoot)
+    }
+
+    private func finishUpload(_ id: UUID, batch: UploadBatchContext) {
+        // Invalidate even on failure: directories or earlier files may already exist.
+        for path in batch.dirtyDirectories {
+            invalidateRemoteCache(connectionID: batch.connection.id, path: path)
+        }
+        guard batch.finish(id), !batch.dirtyDirectories.isEmpty, let tabID = batch.tabID else { return }
+        let key = UploadRefreshKey(tabID: tabID, connectionID: batch.connection.id)
+        pendingUploadRefreshPaths[key, default: []].formUnion(batch.dirtyDirectories.union([batch.remoteRoot]))
+        uploadRefreshTasks[key]?.cancel()
+        uploadRefreshTasks[key] = Task { @MainActor [weak self] in
+            do { try await Task.sleep(for: .milliseconds(150)) } catch { return }
+            guard let self else { return }
+            self.uploadRefreshTasks.removeValue(forKey: key)
+            let paths = self.pendingUploadRefreshPaths.removeValue(forKey: key) ?? []
+            guard self.selectedConnection == batch.connection,
+                  key.matches(tabID: self.selectedTabID, connectionID: self.selectedConnectionID,
+                              path: self.remotePath, dirtyPaths: paths) else { return }
+            self.refreshRemote(finalStatus: "Upload results updated", mode: .background)
+        }
+    }
+
     func uploadSelected() {
-        guard selectedConnection != nil else { return }
         let items = selectedLocalItems
-        guard !items.isEmpty else { return }
-        uploadConflictBatchPolicy = nil
-        reservedUploadPaths.removeAll()
+        guard !items.isEmpty, let batch = makeUploadBatch() else { return }
         for item in items {
-            let destination = joinRemote(remotePath, item.name)
-            upload(item: item, remotePath: destination, refreshWhenDone: item.id == items.last?.id)
+            upload(item: item, remotePath: joinRemote(batch.remoteRoot, item.name), batch: batch)
         }
     }
 
@@ -3207,19 +3259,18 @@ final class AppModel: ObservableObject {
         panel.canChooseDirectories = true
         panel.canChooseFiles = true
         panel.allowsMultipleSelection = true
-        if panel.runModal() == .OK {
-            uploadConflictBatchPolicy = nil
-            reservedUploadPaths.removeAll()
+        if panel.runModal() == .OK, let batch = makeUploadBatch() {
             for url in panel.urls {
                 let item = localFileItem(for: url)
-                upload(item: item, remotePath: joinRemote(remotePath, url.lastPathComponent), refreshWhenDone: url == panel.urls.last)
+                upload(item: item, remotePath: joinRemote(batch.remoteRoot, url.lastPathComponent), batch: batch)
             }
         }
     }
 
-    func uploadEditedRemoteFile(_ session: RemoteEditSession) {
-        guard let connection = selectedConnection else { return }
-        let credential = credentialForCurrentTab().clone()
+    func uploadEditedRemoteFile(_ session: RemoteEditSession, batch explicitBatch: UploadBatchContext? = nil) {
+        guard let batch = explicitBatch ?? makeUploadBatch() else { return }
+        let connection = batch.connection
+        let credential = batch.credential
         let transferID = enqueue(
             direction: .upload,
             source: session.localPath,
@@ -3227,11 +3278,15 @@ final class AppModel: ObservableObject {
             retryDescriptor: .uploadEdited(remotePath: session.remotePath, localPath: session.localPath)
         )
         guard let control = transferControls[transferID] else { return }
-        setRemoteEditState(session.id, .uploading)
+        registerUpload(transferID, batch: batch)
+        setRemoteEditState(session.id, .uploading, tabID: batch.tabID)
         runBusy("Uploading edited file", transferID: transferID) {
-            let warning = try await self.transferLimiter.withPermit {
+            let warning = try await self.transferLimiter.withPermit(control: control) {
                 guard !control.isCancelled else { throw AppError.commandFailed("Transfer cancelled.") }
-                await MainActor.run { self.markTransfer(transferID, .running, "") }
+                await MainActor.run {
+                    batch.changed(session.remotePath)
+                    self.markTransfer(transferID, .running, "")
+                }
                 return try await self.sftp.upload(
                     connection: connection,
                     credential: credential,
@@ -3243,16 +3298,22 @@ final class AppModel: ObservableObject {
             }
             await MainActor.run {
                 self.markTransfer(transferID, .done, warning ?? "Uploaded edited file")
-                self.remoteEditSessions.removeAll { $0.id == session.id }
+                if self.selectedTabID == batch.tabID {
+                    self.remoteEditSessions.removeAll { $0.id == session.id }
+                    self.syncCurrentTab()
+                } else if let index = self.tabs.firstIndex(where: { $0.id == batch.tabID }) {
+                    self.tabs[index].remoteEditSessions.removeAll { $0.id == session.id }
+                }
                 self.cleanupEditSessions([session])
                 self.invalidateRemoteCacheForChangedItem(connectionID: connection.id, path: session.remotePath)
-                self.recordHistory(kind: .remoteEdit, result: .success, localPath: session.localPath, remotePath: session.remotePath, message: warning ?? "Uploaded edited file")
-                self.syncCurrentTab()
-                self.refreshRemote()
+                self.recordHistory(kind: .remoteEdit, result: .success, localPath: session.localPath, remotePath: session.remotePath, message: warning ?? "Uploaded edited file", serverName: connection.name)
+
             }
         } onFailure: { error in
-            self.setRemoteEditState(session.id, .failed)
-            self.recordHistory(kind: .remoteEdit, result: .failed, localPath: session.localPath, remotePath: session.remotePath, message: error.localizedDescription)
+            self.setRemoteEditState(session.id, .failed, tabID: batch.tabID)
+            self.recordHistory(kind: .remoteEdit, result: .failed, localPath: session.localPath, remotePath: session.remotePath, message: error.localizedDescription, serverName: connection.name)
+        } onFinish: {
+            self.finishUpload(transferID, batch: batch)
         }
     }
 
@@ -3275,6 +3336,7 @@ final class AppModel: ObservableObject {
         transfers.removeAll { completedIDs.contains($0.id) }
         for id in completedIDs {
             transferControls.removeValue(forKey: id)
+            uploadOrigins.removeValue(forKey: id)
         }
         status = "Completed transfers cleared"
     }
@@ -3291,170 +3353,175 @@ final class AppModel: ObservableObject {
         syncCurrentTab()
     }
 
-    private func upload(item: FileItem, remotePath: String, refreshWhenDone: Bool) {
+    private func upload(item: FileItem, remotePath: String, batch: UploadBatchContext) {
         if item.isDirectory {
-            uploadFolder(item: item, remotePath: remotePath, refreshWhenDone: refreshWhenDone)
+            uploadFolder(item: item, remotePath: remotePath, batch: batch)
         } else {
-            upload(localPath: item.path, remotePath: remotePath, refreshWhenDone: refreshWhenDone)
+            upload(localPath: item.path, remotePath: remotePath, batch: batch)
         }
     }
 
-    private func upload(localPath: String, remotePath: String, refreshWhenDone: Bool) {
-        guard let connection = selectedConnection else { return }
-        let credential = credentialForCurrentTab().clone()
-        let transferID = enqueue(
-            direction: .upload,
-            source: localPath,
-            destination: remotePath,
-            retryDescriptor: .uploadFile(localPath: localPath, remotePath: remotePath)
-        )
+    private func upload(localPath: String, remotePath: String, batch: UploadBatchContext) {
+        let connection = batch.connection
+        let credential = batch.credential
+        let transferID = enqueue(direction: .upload, source: localPath, destination: remotePath,
+                                 retryDescriptor: .uploadFile(localPath: localPath, remotePath: remotePath))
         guard let control = transferControls[transferID] else { return }
+        registerUpload(transferID, batch: batch)
         runBusy("Uploading", transferID: transferID) {
-            let resolution = try await self.resolveUploadConflict(
-                connection: connection,
-                credential: credential,
-                remotePath: remotePath
-            )
+            let resolution = try await batch.planningLimiter.withPermit(control: control) {
+                try await self.resolveUploadConflict(connection: connection, credential: credential,
+                                                     batch: batch, remotePath: remotePath)
+            }
             guard case let .upload(destination, policy) = resolution else {
-                await MainActor.run {
-                    self.markTransfer(transferID, .cancelled, "Skipped")
-                    if refreshWhenDone {
-                        self.refreshRemote()
-                    }
-                }
+                await MainActor.run { self.markTransfer(transferID, .cancelled, "Skipped") }
                 return
             }
-            let warning = try await self.transferLimiter.withPermit {
-                guard !control.isCancelled else { throw AppError.commandFailed("Transfer cancelled.") }
+            let warning = try await self.transferLimiter.withPermit(control: control) {
                 await MainActor.run {
+                    batch.changed(destination)
                     self.updateTransferDestination(transferID, destination)
                     self.markTransfer(transferID, .running, "")
                 }
-                return try await self.sftp.upload(connection: connection, credential: credential, localPath: localPath, remotePath: destination, policy: policy, control: control)
+                return try await self.sftp.upload(connection: connection, credential: credential,
+                    localPath: localPath, remotePath: destination, policy: policy, control: control)
             }
             await MainActor.run {
                 self.markTransfer(transferID, .done, warning ?? "Uploaded")
-                if let warning { self.status = warning }
-                self.invalidateRemoteCacheForChangedItem(connectionID: connection.id, path: destination)
-                self.recordHistory(kind: .upload, result: .success, localPath: localPath, remotePath: destination, message: warning ?? "Uploaded")
-                if refreshWhenDone {
-                    self.refreshRemote()
-                }
+                self.recordHistory(kind: .upload, result: .success, localPath: localPath, remotePath: destination,
+                                   message: warning ?? "Uploaded", serverName: connection.name)
             }
         } onFailure: { error in
-            self.recordHistory(kind: .upload, result: .failed, localPath: localPath, remotePath: remotePath, message: error.localizedDescription)
+            self.recordHistory(kind: .upload, result: control.isCancelled ? .cancelled : .failed,
+                               localPath: localPath, remotePath: remotePath, message: error.localizedDescription,
+                               serverName: connection.name)
+        } onFinish: {
+            self.finishUpload(transferID, batch: batch)
         }
     }
 
-    private func uploadFolder(item: FileItem, remotePath: String, refreshWhenDone: Bool) {
-        guard let connection = selectedConnection else { return }
-        let credential = credentialForCurrentTab().clone()
-        let transferID = enqueue(
-            direction: .upload,
-            source: item.path,
-            destination: remotePath,
-            retryDescriptor: .uploadFolder(localPath: item.path, remotePath: remotePath)
-        )
+    private func uploadFolder(item: FileItem, remotePath: String, batch: UploadBatchContext) {
+        let connection = batch.connection
+        let credential = batch.credential
+        let transferID = enqueue(direction: .upload, source: item.path, destination: remotePath,
+                                 retryDescriptor: .uploadFolder(localPath: item.path, remotePath: remotePath))
         guard let control = transferControls[transferID] else { return }
+        registerUpload(transferID, batch: batch)
         runBusy("Uploading folder", transferID: transferID) {
-            let summary = try await self.transferLimiter.withPermit {
-                guard !control.isCancelled else { throw AppError.commandFailed("Transfer cancelled.") }
-                await MainActor.run { self.markTransfer(transferID, .running, "Preparing folder") }
-                return try await self.uploadLocalFolder(
-                    connection: connection,
-                    credential: credential,
-                    localURL: URL(fileURLWithPath: item.path, isDirectory: true),
-                    remotePath: remotePath,
-                    control: control,
-                    transferID: transferID
-                )
+            // Bound retained scans/plans across multiple selected folders. This
+            // coordinator does not hold a network-transfer permit.
+            let summary = try await self.folderUploadLimiter.withPermit(control: control) {
+                await MainActor.run { self.markTransfer(transferID, .running, "Scanning folder") }
+                let scan = try await Task.detached(priority: .utility) {
+                    try LocalUploadScan.collect(root: URL(fileURLWithPath: item.path), control: control)
+                }.value
+                let plan = try await batch.planningLimiter.withPermit(control: control) {
+                    try await self.prepareFolderUpload(scan: scan, remotePath: remotePath, batch: batch,
+                                                       control: control, transferID: transferID)
+                }
+                // The folder itself holds no transfer permit. Each worker leases one.
+                return try await self.performFolderUpload(plan: plan, connection: connection,
+                    credential: credential, control: control, transferID: transferID)
             }
             await MainActor.run {
-                let fileText = "\(summary.uploadedFiles) file\(summary.uploadedFiles == 1 ? "" : "s")"
-                let skippedText = summary.skippedItems > 0 ? ", skipped \(summary.skippedItems)" : ""
-                self.markTransfer(transferID, .done, "Uploaded \(fileText)\(skippedText)")
-                self.invalidateRemoteCacheForChangedItem(connectionID: connection.id, path: remotePath, wasDirectory: true)
-                self.recordHistory(kind: .upload, result: .success, localPath: item.path, remotePath: remotePath, message: "Uploaded \(fileText)\(skippedText)")
-                if refreshWhenDone {
-                    self.refreshRemote()
-                }
+                self.markTransfer(transferID, .done, summary)
+                self.recordHistory(kind: .upload, result: .success, localPath: item.path,
+                                   remotePath: remotePath, message: summary, serverName: connection.name)
             }
         } onFailure: { error in
-            self.recordHistory(kind: .upload, result: .failed, localPath: item.path, remotePath: remotePath, message: error.localizedDescription)
+            self.recordHistory(kind: .upload, result: control.isCancelled ? .cancelled : .failed,
+                localPath: item.path, remotePath: remotePath, message: error.localizedDescription,
+                serverName: connection.name)
+        } onFinish: {
+            self.finishUpload(transferID, batch: batch)
         }
     }
 
-    private func uploadLocalFolder(
-        connection: SavedConnection,
-        credential: SensitiveCredential,
-        localURL: URL,
-        remotePath: String,
-        control: TransferControl,
-        transferID: UUID
-    ) async throws -> FolderUploadSummary {
-        guard !control.isCancelled else { throw AppError.commandFailed("Transfer cancelled.") }
-        guard let uploadRemotePath = try await resolveUploadFolderConflict(
-            connection: connection,
-            credential: credential,
-            remotePath: remotePath
-        ) else {
-            return FolderUploadSummary(uploadedFiles: 0, skippedItems: 1)
-        }
-        await MainActor.run {
-            self.markTransfer(transferID, .running, "Creating \(localURL.lastPathComponent)")
-        }
-
-        let keys: Set<URLResourceKey> = [.isDirectoryKey, .isRegularFileKey, .isSymbolicLinkKey]
-        let children = try FileManager.default.contentsOfDirectory(
-            at: localURL,
-            includingPropertiesForKeys: Array(keys),
-            options: [.skipsHiddenFiles]
-        )
-
-        var summary = FolderUploadSummary()
-        for childURL in children {
-            guard !control.isCancelled else { throw AppError.commandFailed("Transfer cancelled.") }
-            let values = try childURL.resourceValues(forKeys: keys)
-            let childRemotePath = joinRemote(uploadRemotePath, childURL.lastPathComponent)
-
-            if values.isDirectory == true {
-                let childSummary = try await uploadLocalFolder(
-                    connection: connection,
-                    credential: credential,
-                    localURL: childURL,
-                    remotePath: childRemotePath,
-                    control: control,
-                    transferID: transferID
-                )
-                summary.uploadedFiles += childSummary.uploadedFiles
-                summary.skippedItems += childSummary.skippedItems
-            } else if values.isRegularFile == true {
-                await MainActor.run {
-                    self.markTransfer(transferID, .running, "Uploading \(childURL.lastPathComponent)")
-                }
-                let resolution = try await resolveUploadConflict(
-                    connection: connection,
-                    credential: credential,
-                    remotePath: childRemotePath
-                )
-                guard case let .upload(destination, policy) = resolution else {
-                    summary.skippedItems += 1
-                    continue
-                }
-                _ = try await sftp.upload(
-                    connection: connection,
-                    credential: credential,
-                    localPath: childURL.path,
-                    remotePath: destination,
-                    policy: policy,
-                    control: control
-                )
-                summary.uploadedFiles += 1
+    private func prepareFolderUpload(scan: LocalUploadScan, remotePath: String, batch: UploadBatchContext,
+                                     control: TransferControl, transferID: UUID) async throws -> FolderUploadPlan {
+        var plan = FolderUploadPlan(skippedItems: scan.skippedItems)
+        var directories: [String: String] = [:]
+        let warningStart = batch.warnings.count
+        for entry in scan.entries {
+            try Task.checkCancellation()
+            guard !control.isCancelled else { throw CancellationError() }
+            let destination: String
+            if entry.relativePath.isEmpty {
+                destination = remotePath
             } else {
-                summary.skippedItems += 1
+                let parent = (entry.relativePath as NSString).deletingLastPathComponent
+                guard let parentDestination = directories[parent] else { plan.skippedItems += 1; continue }
+                destination = joinRemote(parentDestination, entry.url.lastPathComponent)
+            }
+            if entry.isDirectory {
+                markTransfer(transferID, .running, "Preparing \(entry.url.lastPathComponent)")
+                if let resolved = try await resolveUploadFolderConflict(connection: batch.connection,
+                    credential: batch.credential, batch: batch, remotePath: destination) {
+                    directories[entry.relativePath] = resolved
+                    if entry.relativePath.isEmpty { updateTransferDestination(transferID, resolved) }
+                } else { plan.skippedItems += 1 }
+            } else {
+                let resolution = try await resolveUploadConflict(connection: batch.connection,
+                    credential: batch.credential, batch: batch, remotePath: destination)
+                if case let .upload(path, policy) = resolution {
+                    plan.files.append(PlannedUploadFile(localPath: entry.url.path, remotePath: path,
+                                                        size: entry.size, policy: policy))
+                    batch.changed(path)
+                } else { plan.skippedItems += 1 }
             }
         }
-        return summary
+        plan.warnings = Array(batch.warnings.dropFirst(warningStart))
+        return plan
+    }
+
+    private func performFolderUpload(plan: FolderUploadPlan, connection: SavedConnection,
+                                     credential: SensitiveCredential, control: TransferControl,
+                                     transferID: UUID) async throws -> String {
+        let progress = UploadProgress(total: try plan.totalBytes)
+        let workerControl = TransferControl(parent: control) { _, _ in }
+        let failure = UploadFailure()
+        let fileCount = plan.files.count
+        updateTransferProgress(transferID, transferred: 0, total: progress.total)
+        let publishProgress: @Sendable (String, UInt64, Bool, Bool) -> Void = { path, bytes, completed, warning in
+            guard progress.update(path, bytes: bytes, completed: completed, warning: warning) != nil else { return }
+            Task { @MainActor in
+                guard let job = self.transfers.first(where: { $0.id == transferID }), job.state == .running else { return }
+                let snapshot = progress.snapshot
+                self.updateTransferProgress(transferID, transferred: snapshot.transferred, total: progress.total)
+                self.markTransfer(transferID, .running, "Uploaded \(snapshot.completed)/\(fileCount) files")
+            }
+        }
+        do {
+            try await UploadWorkers.run(files: plan.files, limiter: transferLimiter, control: workerControl, failure: failure) { files in
+                // This pool belongs exclusively to one worker and is closed before its permit is released.
+                let client = SFTPClient()
+                do {
+                    for file in files {
+                        try Task.checkCancellation()
+                        guard !workerControl.isCancelled else { throw CancellationError() }
+                        let childControl = TransferControl(parent: workerControl) { bytes, _ in
+                            publishProgress(file.remotePath, min(bytes, file.size), false, false)
+                        }
+                        let warning = try await client.uploadUsingSession(connection: connection,
+                            credential: credential, file: file, control: childControl)
+                        publishProgress(file.remotePath, file.size, true, warning != nil)
+                    }
+                    await client.closeAllPooledSessions()
+                } catch {
+                    failure.record(error)
+                    workerControl.cancel()
+                    await client.closeAllPooledSessions()
+                    throw error
+                }
+            }
+        } catch {
+            let snapshot = progress.snapshot
+            updateTransferProgress(transferID, transferred: snapshot.transferred, total: progress.total)
+            throw AppError.commandFailed("Uploaded \(snapshot.completed)/\(fileCount) files; skipped \(plan.skippedItems); permission warnings \(snapshot.warnings + plan.warnings.count). \(error.localizedDescription)")
+        }
+        let snapshot = progress.snapshot
+        updateTransferProgress(transferID, transferred: snapshot.transferred, total: progress.total)
+        return "Uploaded \(snapshot.completed) files; skipped \(plan.skippedItems); permission warnings \(snapshot.warnings + plan.warnings.count)"
     }
 
     private func localFileItem(for url: URL) -> FileItem {
@@ -3841,9 +3908,10 @@ final class AppModel: ObservableObject {
     private func resolveUploadConflict(
         connection: SavedConnection,
         credential: SensitiveCredential,
+        batch: UploadBatchContext,
         remotePath: String
     ) async throws -> UploadConflictResolution {
-        let remotePathIsReserved = reservedUploadPaths.contains(remotePath)
+        let remotePathIsReserved = batch.reservedPaths.contains(remotePath)
         let remotePathExists: Bool
         if remotePathIsReserved {
             remotePathExists = true
@@ -3851,25 +3919,29 @@ final class AppModel: ObservableObject {
             remotePathExists = try await remoteEntry(at: remotePath, connection: connection, credential: credential) != nil
         }
         guard remotePathExists else {
-            reservedUploadPaths.insert(remotePath)
+            batch.reservedPaths.insert(remotePath)
             return .upload(path: remotePath, policy: .createNew)
         }
 
-        if let uploadConflictBatchPolicy {
-            return try await uploadResolution(for: uploadConflictBatchPolicy, remotePath: remotePath, connection: connection, credential: credential)
+        if let uploadConflictBatchPolicy = batch.policy {
+            return try await uploadResolution(for: uploadConflictBatchPolicy, remotePath: remotePath, connection: connection, credential: credential, batch: batch)
         }
 
         let promptResult = promptUploadConflict(remotePath: remotePath)
         if let batchPolicy = promptResult.applyToAllPolicy {
-            uploadConflictBatchPolicy = batchPolicy
+            batch.policy = batchPolicy
         }
 
         switch promptResult.choice {
         case .replace:
+            guard !batch.reservedPaths.contains(remotePath) else {
+                throw AppError.commandFailed("This destination is already scheduled in this upload. Choose Keep Both or Skip.")
+            }
+            batch.reservedPaths.insert(remotePath)
             return .upload(path: remotePath, policy: .replace)
         case .keepBoth:
-            let destination = try await availableRemoteUploadPath(for: remotePath, connection: connection, credential: credential)
-            reservedUploadPaths.insert(destination)
+            let destination = try await availableRemoteUploadPath(for: remotePath, connection: connection, credential: credential, batch: batch)
+            batch.reservedPaths.insert(destination)
             return .upload(path: destination, policy: .createNew)
         case .skip:
             return .skip
@@ -3878,44 +3950,53 @@ final class AppModel: ObservableObject {
         }
     }
 
+    private func createUploadDirectory(_ path: String, batch: UploadBatchContext) async throws {
+        batch.changed(path, isDirectory: true)
+        if let warning = try await sftp.makeDirectory(connection: batch.connection, credential: batch.credential, path: path) {
+            batch.warnings.append(warning)
+        }
+        batch.reservedPaths.insert(path)
+        batch.reservedDirectories.insert(path)
+    }
+
     private func resolveUploadFolderConflict(
         connection: SavedConnection,
         credential: SensitiveCredential,
+        batch: UploadBatchContext,
         remotePath: String
     ) async throws -> String? {
         let existingEntry: FileItem?
-        if reservedUploadPaths.contains(remotePath) {
-            existingEntry = FileItem(name: URL(fileURLWithPath: remotePath).lastPathComponent, path: remotePath, isDirectory: true)
+        if batch.reservedPaths.contains(remotePath) {
+            existingEntry = FileItem(name: URL(fileURLWithPath: remotePath).lastPathComponent, path: remotePath, isDirectory: batch.reservedDirectories.contains(remotePath))
         } else {
             existingEntry = try await remoteEntry(at: remotePath, connection: connection, credential: credential)
         }
 
         guard let existingEntry else {
-            _ = try await sftp.makeDirectory(connection: connection, credential: credential, path: remotePath)
-            reservedUploadPaths.insert(remotePath)
+            try await createUploadDirectory(remotePath, batch: batch)
             return remotePath
         }
 
-        if let uploadConflictBatchPolicy {
+        if let uploadConflictBatchPolicy = batch.policy {
             return try await folderUploadResolution(
                 for: uploadConflictBatchPolicy,
                 existingEntry: existingEntry,
                 remotePath: remotePath,
                 connection: connection,
-                credential: credential
+                credential: credential,
+                batch: batch
             )
         }
 
         guard existingEntry.isDirectory else {
             let promptResult = promptFolderUploadBlockedByFile(remotePath: remotePath)
             if let batchPolicy = promptResult.applyToAllPolicy {
-                uploadConflictBatchPolicy = batchPolicy
+                batch.policy = batchPolicy
             }
             switch promptResult.choice {
             case .keepBoth:
-                let destination = try await availableRemoteUploadPath(for: remotePath, connection: connection, credential: credential)
-                _ = try await sftp.makeDirectory(connection: connection, credential: credential, path: destination)
-                reservedUploadPaths.insert(destination)
+                let destination = try await availableRemoteUploadPath(for: remotePath, connection: connection, credential: credential, batch: batch)
+                try await createUploadDirectory(destination, batch: batch)
                 return destination
             case .skip:
                 return nil
@@ -3931,7 +4012,7 @@ final class AppModel: ObservableObject {
             primaryActionTitle: "Merge"
         )
         if let batchPolicy = promptResult.applyToAllPolicy {
-            uploadConflictBatchPolicy = batchPolicy
+            batch.policy = batchPolicy
         }
 
         switch promptResult.choice {
@@ -3941,9 +4022,8 @@ final class AppModel: ObservableObject {
             }
             return remotePath
         case .keepBoth:
-            let destination = try await availableRemoteUploadPath(for: remotePath, connection: connection, credential: credential)
-            _ = try await sftp.makeDirectory(connection: connection, credential: credential, path: destination)
-            reservedUploadPaths.insert(destination)
+            let destination = try await availableRemoteUploadPath(for: remotePath, connection: connection, credential: credential, batch: batch)
+            try await createUploadDirectory(destination, batch: batch)
             return destination
         case .skip:
             return nil
@@ -3957,7 +4037,8 @@ final class AppModel: ObservableObject {
         existingEntry: FileItem,
         remotePath: String,
         connection: SavedConnection,
-        credential: SensitiveCredential
+        credential: SensitiveCredential,
+        batch: UploadBatchContext
     ) async throws -> String? {
         switch policy {
         case .replace:
@@ -3966,9 +4047,8 @@ final class AppModel: ObservableObject {
             }
             return remotePath
         case .keepBoth:
-            let destination = try await availableRemoteUploadPath(for: remotePath, connection: connection, credential: credential)
-            _ = try await sftp.makeDirectory(connection: connection, credential: credential, path: destination)
-            reservedUploadPaths.insert(destination)
+            let destination = try await availableRemoteUploadPath(for: remotePath, connection: connection, credential: credential, batch: batch)
+            try await createUploadDirectory(destination, batch: batch)
             return destination
         case .skip:
             return nil
@@ -3979,14 +4059,19 @@ final class AppModel: ObservableObject {
         for policy: UploadConflictBatchPolicy,
         remotePath: String,
         connection: SavedConnection,
-        credential: SensitiveCredential
+        credential: SensitiveCredential,
+        batch: UploadBatchContext
     ) async throws -> UploadConflictResolution {
         switch policy {
         case .replace:
+            guard !batch.reservedPaths.contains(remotePath) else {
+                throw AppError.commandFailed("This destination is already scheduled in this upload. Choose Keep Both or Skip.")
+            }
+            batch.reservedPaths.insert(remotePath)
             return .upload(path: remotePath, policy: .replace)
         case .keepBoth:
-            let destination = try await availableRemoteUploadPath(for: remotePath, connection: connection, credential: credential)
-            reservedUploadPaths.insert(destination)
+            let destination = try await availableRemoteUploadPath(for: remotePath, connection: connection, credential: credential, batch: batch)
+            batch.reservedPaths.insert(destination)
             return .upload(path: destination, policy: .createNew)
         case .skip:
             return .skip
@@ -4118,7 +4203,8 @@ final class AppModel: ObservableObject {
     private func availableRemoteUploadPath(
         for path: String,
         connection: SavedConnection,
-        credential: SensitiveCredential
+        credential: SensitiveCredential,
+        batch: UploadBatchContext
     ) async throws -> String {
         guard let parent = remoteParentPath(path) else { return path }
         let name = URL(fileURLWithPath: path).lastPathComponent
@@ -4129,7 +4215,7 @@ final class AppModel: ObservableObject {
         while true {
             let candidateName = fileExtension.isEmpty ? "\(baseName) \(index)" : "\(baseName) \(index).\(fileExtension)"
             let candidate = joinRemote(parent, candidateName)
-            if !reservedUploadPaths.contains(candidate),
+            if !batch.reservedPaths.contains(candidate),
                try await remoteEntry(at: candidate, connection: connection, credential: credential) == nil {
                 return candidate
             }
@@ -4689,7 +4775,14 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private func setRemoteEditState(_ id: RemoteEditSession.ID, _ state: RemoteEditState) {
+    private func setRemoteEditState(_ id: RemoteEditSession.ID, _ state: RemoteEditState, tabID: UUID? = nil) {
+        if let tabID, tabID != selectedTabID {
+            if let tab = tabs.firstIndex(where: { $0.id == tabID }),
+               let edit = tabs[tab].remoteEditSessions.firstIndex(where: { $0.id == id }) {
+                tabs[tab].remoteEditSessions[edit].state = state
+            }
+            return
+        }
         guard let index = remoteEditSessions.firstIndex(where: { $0.id == id }) else { return }
         remoteEditSessions[index].state = state
         syncCurrentTab()
@@ -4740,7 +4833,8 @@ final class AppModel: ObservableObject {
         _ label: String,
         transferID: UUID? = nil,
         operation: @escaping @Sendable () async throws -> Void,
-        onFailure: (@MainActor (Error) -> Void)? = nil
+        onFailure: (@MainActor (Error) -> Void)? = nil,
+        onFinish: (@MainActor () -> Void)? = nil
     ) {
         activeOperationCount += 1
         isBusy = true
@@ -4755,11 +4849,13 @@ final class AppModel: ObservableObject {
                     markTransfer(
                         transferID,
                         wasCancelled ? .cancelled : .failed,
-                        wasCancelled ? "Cancelled" : error.localizedDescription
+                        wasCancelled && (error is CancellationError || transfers.first(where: { $0.id == transferID })?.direction != .upload)
+                            ? "Cancelled" : error.localizedDescription
                     )
                 }
                 status = error.localizedDescription
             }
+            onFinish?()
             activeOperationCount = max(0, activeOperationCount - 1)
             isBusy = activeOperationCount > 0
         }
@@ -4858,9 +4954,23 @@ final class AppModel: ObservableObject {
             status = "This transfer cannot be retried."
             return
         }
+        let uploadBatch: UploadBatchContext?
+        switch retryDescriptor {
+        case .uploadFile, .uploadFolder, .uploadEdited:
+            guard let origin = uploadOrigins[job.id],
+                  let tabID = origin.tabID,
+                  tabs.contains(where: { $0.id == tabID && $0.connectionID == origin.connection.id }),
+                  let credential = tabCredentials[tabID] else {
+                status = "Reconnect the original upload tab before retrying."
+                return
+            }
+            uploadBatch = UploadBatchContext(connection: origin.connection, credential: credential.clone(),
+                                             tabID: tabID, remoteRoot: origin.root)
+        default: uploadBatch = nil
+        }
         switch retryDescriptor {
         case .uploadFile(let localPath, let remotePath):
-            upload(localPath: localPath, remotePath: remotePath, refreshWhenDone: true)
+            upload(localPath: localPath, remotePath: remotePath, batch: uploadBatch!)
         case .downloadFile(let remotePath, let localPath):
             download(remotePath: remotePath, localPath: localPath, refreshWhenDone: true)
         case .editDownload(let remotePath, let localPath):
@@ -4886,10 +4996,12 @@ final class AppModel: ObservableObject {
                 remoteModified: job.remoteModified
             ))
         case .uploadEdited(let remotePath, let localPath):
-            if let session = remoteEditSessions.first(where: { $0.remotePath == remotePath && $0.localPath == localPath }) {
-                uploadEditedRemoteFile(session)
+            let sessions = selectedTabID == uploadBatch!.tabID ? remoteEditSessions
+                : tabs.first(where: { $0.id == uploadBatch!.tabID })?.remoteEditSessions ?? []
+            if let session = sessions.first(where: { $0.remotePath == remotePath && $0.localPath == localPath }) {
+                uploadEditedRemoteFile(session, batch: uploadBatch!)
             } else {
-                upload(localPath: localPath, remotePath: remotePath, refreshWhenDone: true)
+                upload(localPath: localPath, remotePath: remotePath, batch: uploadBatch!)
             }
         case .downloadFolder(let remotePath, let localPath):
             downloadFolder(
@@ -4902,7 +5014,7 @@ final class AppModel: ObservableObject {
             uploadFolder(
                 item: localFileItem(for: URL(fileURLWithPath: localPath, isDirectory: true)),
                 remotePath: remotePath,
-                refreshWhenDone: true
+                batch: uploadBatch!
             )
         }
     }
@@ -5053,6 +5165,9 @@ final class AppModel: ObservableObject {
         for control in transferControls.values { control.cancel() }
         remoteEditMonitorTask?.cancel()
         remoteEditMonitorTask = nil
+        for task in uploadRefreshTasks.values { task.cancel() }
+        uploadRefreshTasks.removeAll()
+        pendingUploadRefreshPaths.removeAll()
         for session in terminalSessions.values { session.terminate() }
         terminalSessions.removeAll()
         for task in terminalOutputFlushTasks.values { task.cancel() }
@@ -5193,12 +5308,13 @@ final class AppModel: ObservableObject {
         localPath: String? = nil,
         remotePath: String? = nil,
         backupPath: String? = nil,
-        message: String
+        message: String,
+        serverName: String? = nil
     ) {
         let entry = OperationHistoryEntry(
             kind: kind,
             result: result,
-            serverName: selectedConnection?.name,
+            serverName: serverName ?? selectedConnection?.name,
             localPath: localPath,
             remotePath: remotePath,
             backupPath: backupPath,
@@ -5382,6 +5498,10 @@ final class AppModel: ObservableObject {
     }
 
     private func invalidateRemoteCache(connectionID: UUID, path: String) {
+        // A pre-upload listing must not repopulate the cache after invalidation.
+        for tab in tabs where tab.connectionID == connectionID && tab.remotePath == path {
+            remoteRefreshRequests.removeValue(forKey: tab.id)
+        }
         remoteDirectoryCache.removeValue(forKey: remoteCacheKey(connectionID: connectionID, path: path))
     }
 
