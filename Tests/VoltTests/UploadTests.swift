@@ -4,6 +4,82 @@ import Testing
 
 @Suite(.timeLimit(.minutes(1)))
 struct UploadTests {
+    @Test func remoteEditSurvivesRepeatedUploadsAndAtomicSaves() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let file = root.appendingPathComponent("edit.txt")
+        let baseline = root.appendingPathComponent("original")
+        try Data("initial".utf8).write(to: file)
+        try Data("initial".utf8).write(to: baseline)
+        var session = RemoteEditSession(remotePath: "/edit.txt", localPath: file.path,
+                                        originalSnapshotPath: baseline.path, fileName: "edit.txt")
+        let id = session.id
+        try Data("first save".utf8).write(to: file, options: .atomic)
+        let first = try RemoteEditUploadSnapshot(localPath: file.path)
+        defer { first.remove() }
+        // The editor replaces the local file while the first upload is in flight.
+        try Data("second save".utf8).write(to: file, options: .atomic)
+        session.state = .uploading
+        try session.didUpload(first)
+        #expect(session.id == id)
+        #expect(session.state == .modified)
+        #expect(session.lastPromptedChangeSignature == nil)
+        #expect(try String(contentsOf: baseline, encoding: .utf8) == "first save")
+        #expect(try String(contentsOf: file, encoding: .utf8) == "second save")
+        let second = try RemoteEditUploadSnapshot(localPath: file.path)
+        defer { second.remove() }
+        try session.didUpload(second)
+        #expect(session.state == .uploaded)
+        #expect(session.id == id)
+        #expect(try String(contentsOf: baseline, encoding: .utf8) == "second save")
+        second.remove()
+        #expect(FileManager.default.fileExists(atPath: file.path))
+        #expect(FileManager.default.fileExists(atPath: baseline.path))
+    }
+
+    @Test func remoteEditFailedUploadPreservesBaselineAndWorkingFile() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let file = root.appendingPathComponent("edit.txt")
+        let baseline = root.appendingPathComponent("original")
+        try Data("saved".utf8).write(to: file)
+        try Data("server".utf8).write(to: baseline)
+        let snapshot = try RemoteEditUploadSnapshot(localPath: file.path)
+        // Failure never promotes the upload snapshot to the diff baseline.
+        snapshot.remove()
+        #expect(try String(contentsOf: baseline, encoding: .utf8) == "server")
+        #expect(try String(contentsOf: file, encoding: .utf8) == "saved")
+        let retry = try RemoteEditUploadSnapshot(localPath: file.path)
+        defer { retry.remove() }
+        #expect(retry.matches(localPath: file.path))
+    }
+
+    @Test func remoteEditSaveMonitoringDebouncesAndResumesAfterUpload() {
+        let date = Date(timeIntervalSince1970: 100)
+        var session = RemoteEditSession(remotePath: "/file", localPath: "/tmp/file", fileName: "file")
+        let observation1 = session.observeSave(size: 10, modifiedAt: date, now: date)
+        #expect(!observation1)
+        let observation2 = session.observeSave(size: 10, modifiedAt: date, now: date.addingTimeInterval(0.7))
+        #expect(!observation2)
+        let observation3 = session.observeSave(size: 10, modifiedAt: date, now: date.addingTimeInterval(1.4))
+        #expect(observation3)
+        #expect(session.state == .modified) // also updated in Manual mode
+        let observation4 = session.observeSave(size: 10, modifiedAt: date, now: date.addingTimeInterval(3))
+        #expect(!observation4) // Later
+        session.state = .uploading
+        let observation5 = session.observeSave(size: 20, modifiedAt: date, now: date.addingTimeInterval(4))
+        #expect(!observation5)
+        #expect(session.state == .uploading)
+        session.state = .modified
+        session.lastPromptedChangeSignature = nil
+        let observation6 = session.observeSave(size: 20, modifiedAt: date, now: date.addingTimeInterval(5))
+        #expect(!observation6)
+        let observation7 = session.observeSave(size: 20, modifiedAt: date, now: date.addingTimeInterval(7))
+        #expect(observation7)
+    }
+
     @Test @MainActor func batchCompletesOnlyOnceAfterEveryOutcome() {
         let batch = UploadBatchContext(connection: SavedConnection(), credential: SensitiveCredential(),
                                        tabID: UUID(), remoteRoot: "/uploads")

@@ -1962,6 +1962,7 @@ final class AppModel: ObservableObject {
     }
 
     init() {
+        VoltAppDelegate.models.add(self)
         selectedTabID = tabs.first?.id
         refreshLocal()
         syncCurrentTab()
@@ -3269,6 +3270,17 @@ final class AppModel: ObservableObject {
 
     func uploadEditedRemoteFile(_ session: RemoteEditSession, batch explicitBatch: UploadBatchContext? = nil) {
         guard let batch = explicitBatch ?? makeUploadBatch() else { return }
+        let sessions = batch.tabID == selectedTabID ? remoteEditSessions
+            : tabs.first(where: { $0.id == batch.tabID })?.remoteEditSessions ?? []
+        guard let current = sessions.first(where: { $0.id == session.id }), current.state != .uploading else { return }
+        let snapshot: RemoteEditUploadSnapshot
+        do {
+            snapshot = try RemoteEditUploadSnapshot(localPath: current.localPath)
+        } catch {
+            setRemoteEditState(session.id, .failed, tabID: batch.tabID)
+            status = error.localizedDescription
+            return
+        }
         let connection = batch.connection
         let credential = batch.credential
         let transferID = enqueue(
@@ -3277,7 +3289,7 @@ final class AppModel: ObservableObject {
             destination: session.remotePath,
             retryDescriptor: .uploadEdited(remotePath: session.remotePath, localPath: session.localPath)
         )
-        guard let control = transferControls[transferID] else { return }
+        guard let control = transferControls[transferID] else { snapshot.remove(); return }
         registerUpload(transferID, batch: batch)
         setRemoteEditState(session.id, .uploading, tabID: batch.tabID)
         runBusy("Uploading edited file", transferID: transferID) {
@@ -3290,7 +3302,7 @@ final class AppModel: ObservableObject {
                 return try await self.sftp.upload(
                     connection: connection,
                     credential: credential,
-                    localPath: session.localPath,
+                    localPath: snapshot.url.path,
                     remotePath: session.remotePath,
                     policy: .replace,
                     control: control
@@ -3298,13 +3310,7 @@ final class AppModel: ObservableObject {
             }
             await MainActor.run {
                 self.markTransfer(transferID, .done, warning ?? "Uploaded edited file")
-                if self.selectedTabID == batch.tabID {
-                    self.remoteEditSessions.removeAll { $0.id == session.id }
-                    self.syncCurrentTab()
-                } else if let index = self.tabs.firstIndex(where: { $0.id == batch.tabID }) {
-                    self.tabs[index].remoteEditSessions.removeAll { $0.id == session.id }
-                }
-                self.cleanupEditSessions([session])
+                self.updateRemoteEditAfterUpload(session.id, tabID: batch.tabID, snapshot: snapshot)
                 self.invalidateRemoteCacheForChangedItem(connectionID: connection.id, path: session.remotePath)
                 self.recordHistory(kind: .remoteEdit, result: .success, localPath: session.localPath, remotePath: session.remotePath, message: warning ?? "Uploaded edited file", serverName: connection.name)
 
@@ -3313,18 +3319,13 @@ final class AppModel: ObservableObject {
             self.setRemoteEditState(session.id, .failed, tabID: batch.tabID)
             self.recordHistory(kind: .remoteEdit, result: .failed, localPath: session.localPath, remotePath: session.remotePath, message: error.localizedDescription, serverName: connection.name)
         } onFinish: {
+            snapshot.remove()
             self.finishUpload(transferID, batch: batch)
         }
     }
 
     func discardRemoteEditSession(_ session: RemoteEditSession) {
-        let alert = NSAlert()
-        alert.messageText = "Discard changes to \"\(session.fileName)\"?"
-        alert.informativeText = "The local temporary copy will be permanently deleted."
-        alert.alertStyle = .warning
-        alert.addButton(withTitle: "Discard")
-        alert.addButton(withTitle: "Cancel")
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        guard confirmDiscardEditSessions([session], action: "end this edit") else { return }
         remoteEditSessions.removeAll { $0.id == session.id }
         cleanupEditSessions([session])
         syncCurrentTab()
@@ -4647,6 +4648,7 @@ final class AppModel: ObservableObject {
                     lastObservedSize: observed.size,
                     lastObservedModifiedAt: observed.modifiedAt
                 ), at: 0)
+                self.syncCurrentTab()
                 self.markTransfer(transferID, .done, "Opened for edit")
                 self.showsTransfers = true
                 self.transferPanelTab = .remoteEdits
@@ -4731,34 +4733,17 @@ final class AppModel: ObservableObject {
     }
 
     private func inspectRemoteEditFiles() {
-        guard selectedConnection?.remoteEditUploadMode == .askAfterSave else { return }
         guard !remoteEditSessions.isEmpty else { return }
 
         for session in remoteEditSessions {
+            guard session.state != .uploading else { continue }
             guard let observed = optionalLocalEditFileObservation(at: session.localPath) else { continue }
-            let signature = "\(observed.size):\(observed.modifiedAt?.timeIntervalSince1970 ?? 0)"
             guard let index = remoteEditSessions.firstIndex(where: { $0.id == session.id }) else { continue }
-            let previousSignature = "\(remoteEditSessions[index].lastObservedSize):\(remoteEditSessions[index].lastObservedModifiedAt?.timeIntervalSince1970 ?? 0)"
-
-            if signature != previousSignature {
-                if remoteEditSessions[index].pendingChangeSignature == signature,
-                   let detectedAt = remoteEditSessions[index].pendingChangeDetectedAt,
-                   Date().timeIntervalSince(detectedAt) >= 1.0,
-                   remoteEditSessions[index].lastPromptedChangeSignature != signature {
-                    remoteEditSessions[index].state = .modified
-                    remoteEditSessions[index].lastObservedSize = observed.size
-                    remoteEditSessions[index].lastObservedModifiedAt = observed.modifiedAt
-                    remoteEditSessions[index].lastPromptedChangeSignature = signature
-                    remoteEditSessions[index].pendingChangeSignature = nil
-                    remoteEditSessions[index].pendingChangeDetectedAt = nil
-                    let updatedSession = remoteEditSessions[index]
-                    syncCurrentTab()
-                    promptForRemoteEditUpload(updatedSession)
-                } else if remoteEditSessions[index].pendingChangeSignature != signature {
-                    remoteEditSessions[index].pendingChangeSignature = signature
-                    remoteEditSessions[index].pendingChangeDetectedAt = Date()
-                    syncCurrentTab()
-                }
+            let shouldPrompt = remoteEditSessions[index].observeSave(size: observed.size, modifiedAt: observed.modifiedAt)
+            let updatedSession = remoteEditSessions[index]
+            if updatedSession != session { syncCurrentTab() }
+            if shouldPrompt && selectedConnection?.remoteEditUploadMode == .askAfterSave {
+                promptForRemoteEditUpload(updatedSession)
             }
         }
     }
@@ -4772,6 +4757,33 @@ final class AppModel: ObservableObject {
         alert.addButton(withTitle: "Later")
         if alert.runModal() == .alertFirstButtonReturn {
             uploadEditedRemoteFile(session)
+        }
+    }
+
+    private func updateRemoteEditAfterUpload(_ id: UUID, tabID: UUID?, snapshot: RemoteEditUploadSnapshot) {
+        func update(_ session: inout RemoteEditSession) {
+            do {
+                let observed = localEditFileObservation(at: session.localPath)
+                try session.didUpload(snapshot)
+                session.lastObservedSize = observed.size
+                session.lastObservedModifiedAt = observed.modifiedAt
+            } catch {
+                session.state = .failed
+                status = "Uploaded, but could not update the edit baseline: \(error.localizedDescription)"
+            }
+        }
+        if tabID == selectedTabID {
+            if let index = remoteEditSessions.firstIndex(where: { $0.id == id }) {
+                var updated = remoteEditSessions[index]
+                update(&updated)
+                remoteEditSessions[index] = updated
+                syncCurrentTab()
+            }
+        } else if let tab = tabs.firstIndex(where: { $0.id == tabID }),
+                  let edit = tabs[tab].remoteEditSessions.firstIndex(where: { $0.id == id }) {
+            var updated = tabs[tab].remoteEditSessions[edit]
+            update(&updated)
+            tabs[tab].remoteEditSessions[edit] = updated
         }
     }
 
@@ -4808,11 +4820,20 @@ final class AppModel: ObservableObject {
 
     private func confirmDiscardEditSessions(_ sessions: [RemoteEditSession], action: String) -> Bool {
         guard !sessions.isEmpty else { return true }
+        let ids = Set(sessions.map(\.id))
+        let live = remoteEditSessions + tabs.flatMap(\.remoteEditSessions)
+        guard !live.contains(where: { ids.contains($0.id) && $0.state == .uploading }) else {
+            let alert = NSAlert()
+            alert.messageText = "Upload in progress"
+            alert.informativeText = "Wait for the edit upload to finish before you \(action)."
+            alert.runModal()
+            return false
+        }
         let alert = NSAlert()
-        alert.messageText = sessions.count == 1 ? "Discard the open remote edit?" : "Discard \(sessions.count) open remote edits?"
+        alert.messageText = sessions.count == 1 ? "End the open remote edit?" : "End \(sessions.count) open remote edits?"
         alert.informativeText = "To \(action), Volt must delete the local temporary copies. Upload any changes you want to keep first."
         alert.alertStyle = .warning
-        alert.addButton(withTitle: "Discard & Continue")
+        alert.addButton(withTitle: "End Edit & Continue")
         alert.addButton(withTitle: "Cancel")
         return alert.runModal() == .alertFirstButtonReturn
     }
@@ -5157,6 +5178,11 @@ final class AppModel: ObservableObject {
         flushTerminalOutput(for: tabID)
         terminalSessions.removeValue(forKey: tabID)?.terminate()
         setTerminalStatus(.idle, tabID: tabID)
+    }
+
+    func confirmTermination() -> Bool {
+        syncCurrentTab()
+        return confirmDiscardEditSessions(tabs.flatMap(\.remoteEditSessions), action: "quit Volt")
     }
 
     func prepareForTermination() {
@@ -8213,7 +8239,17 @@ struct VoltApp: App {
     }
 }
 
+@MainActor
 final class VoltAppDelegate: NSObject, NSApplicationDelegate {
+    static let models = NSHashTable<AppModel>.weakObjects()
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        for model in Self.models.allObjects {
+            if !model.confirmTermination() { return .terminateCancel }
+        }
+        return .terminateNow
+    }
+
     func applicationWillTerminate(_ notification: Notification) {
         AppPaths.cleanupEditFiles(olderThan: 0)
     }

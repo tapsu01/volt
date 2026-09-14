@@ -351,9 +351,10 @@ struct TransferQueueView: View {
                         model.uploadEditedRemoteFile(session)
                     }
                     .disabled(session.state == .uploading)
-                    Button("Discard") {
+                    Button("End Edit") {
                         model.discardRemoteEditSession(session)
                     }
+                    .disabled(session.state == .uploading)
                 }
             }
             .width(290)
@@ -780,9 +781,10 @@ struct TransferQueueView: View {
                 model.uploadEditedRemoteFile(session)
             }
             .disabled(session.state == .uploading)
-            Button("Discard") {
+            Button("End Edit") {
                 model.discardRemoteEditSession(session)
             }
+            .disabled(session.state == .uploading)
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 6)
