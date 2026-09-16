@@ -15,7 +15,7 @@ private func decodeCError(_ buffer: [CChar]) -> String {
 }
 
 private enum WorkspaceFileOpener {
-    static func open(_ fileURL: URL, with appURL: URL?, onError: @escaping @Sendable @MainActor (String) -> Void) {
+    static func open(_ fileURL: URL, with appURL: URL?, onSuccess: @escaping @Sendable @MainActor () -> Void, onError: @escaping @Sendable @MainActor (String) -> Void) {
         if let appURL {
             let configuration = NSWorkspace.OpenConfiguration()
             NSWorkspace.shared.open([fileURL], withApplicationAt: appURL, configuration: configuration) { _, error in
@@ -24,10 +24,16 @@ private enum WorkspaceFileOpener {
                     Task { @MainActor in
                         onError(message)
                     }
+                } else {
+                    Task { @MainActor in onSuccess() }
                 }
             }
         } else {
-            NSWorkspace.shared.open(fileURL)
+            if NSWorkspace.shared.open(fileURL) {
+                Task { @MainActor in onSuccess() }
+            } else {
+                Task { @MainActor in onError("Could not open \(fileURL.lastPathComponent).") }
+            }
         }
     }
 }
@@ -1878,6 +1884,7 @@ final class SFTPClient: @unchecked Sendable {
 
 @MainActor
 final class AppModel: ObservableObject {
+    private let fileApplications = FileApplicationPreferences()
     @Published var connections: [SavedConnection] = []
     @Published var tabs: [BrowserTab] = [BrowserTab()]
     @Published var selectedTabID: BrowserTab.ID?
@@ -3150,7 +3157,7 @@ final class AppModel: ObservableObject {
 
     func openLocal(_ item: FileItem) {
         guard item.isDirectory else {
-            NSWorkspace.shared.open(URL(fileURLWithPath: item.path))
+            openFile(URL(fileURLWithPath: item.path), with: nil)
             return
         }
         localPath = item.path
@@ -4568,8 +4575,8 @@ final class AppModel: ObservableObject {
     func openLocalSelectedWithApp() {
         guard let item = selectedLocal, !item.isDirectory else { return }
         let fileURL = URL(fileURLWithPath: item.path)
-        guard let appURL = chooseApplication(for: fileURL) else { return }
-        openFile(fileURL, with: appURL)
+        guard let choice = chooseApplication(for: fileURL) else { return }
+        openFile(fileURL, with: choice.url, remember: choice.remember)
     }
 
     func editRemoteSelected() {
@@ -4579,11 +4586,11 @@ final class AppModel: ObservableObject {
     func openRemoteSelectedWithApp() {
         guard let item = selectedRemote, !item.isDirectory else { return }
         let previewURL = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(item.name)
-        guard let appURL = chooseApplication(for: previewURL) else { return }
-        editRemoteSelected(withApp: appURL)
+        guard let choice = chooseApplication(for: previewURL) else { return }
+        editRemoteSelected(withApp: choice.url, remember: choice.remember)
     }
 
-    private func editRemoteSelected(withApp appURL: URL?) {
+    private func editRemoteSelected(withApp appURL: URL?, remember: Bool = false) {
         guard let item = selectedRemote, !item.isDirectory else { return }
         let directory: URL
         do {
@@ -4611,10 +4618,10 @@ final class AppModel: ObservableObject {
             remoteSize: item.size,
             remoteModified: item.modified
         )
-        downloadForEdit(remoteItem: item, localURL: localURL, appURL: appURL, transferID: transferID)
+        downloadForEdit(remoteItem: item, localURL: localURL, appURL: appURL, transferID: transferID, remember: remember)
     }
 
-    private func downloadForEdit(remoteItem: FileItem, localURL: URL, appURL: URL?, transferID: UUID) {
+    private func downloadForEdit(remoteItem: FileItem, localURL: URL, appURL: URL?, transferID: UUID, remember: Bool = false) {
         guard let connection = selectedConnection else {
             try? FileManager.default.removeItem(at: localURL.deletingLastPathComponent())
             return
@@ -4653,15 +4660,49 @@ final class AppModel: ObservableObject {
                 self.showsTransfers = true
                 self.transferPanelTab = .remoteEdits
                 self.status = "Editing \(remoteItem.name). Save in editor, then click Upload Edited."
-                self.openFile(localURL, with: appURL)
+                self.openFile(localURL, with: appURL, remember: remember)
             }
         }
     }
 
-    private func openFile(_ fileURL: URL, with appURL: URL?) {
-        WorkspaceFileOpener.open(fileURL, with: appURL) { [weak self] message in
-            self?.status = message
+    private func openFile(_ fileURL: URL, with appURL: URL?, remember: Bool = false) {
+        let resolved = fileApplications.resolve(
+            for: fileURL, explicitApplication: appURL,
+            findBundle: { NSWorkspace.shared.urlForApplication(withBundleIdentifier: $0) },
+            isAvailable: { FileManager.default.fileExists(atPath: $0.path) }
+        )
+        let applicationURL: URL?
+        switch resolved {
+        case .systemDefault:
+            applicationURL = nil
+        case .application(let url):
+            applicationURL = url
+        case .missingApplication:
+            guard let choice = chooseApplication(
+                for: fileURL, message: "The saved application is no longer available. Choose another application."
+            ) else { return }
+            openFile(fileURL, with: choice.url, remember: choice.remember)
+            return
         }
+        WorkspaceFileOpener.open(fileURL, with: applicationURL, onSuccess: { [weak self] in
+            guard let self, let appURL, remember else { return }
+            self.objectWillChange.send()
+            self.fileApplications.recordSuccessfulOpen(ApplicationChoice(url: appURL, remember: true), for: fileURL)
+        }, onError: { [weak self] message in
+            self?.status = message
+        })
+    }
+
+    func defaultApplicationExtension(for item: FileItem) -> String? {
+        let url = URL(fileURLWithPath: item.path)
+        guard !item.isDirectory, fileApplications.hasDefault(for: url) else { return nil }
+        return FileApplicationPreferences.fileExtension(for: url)
+    }
+
+    func resetDefaultApplication(for item: FileItem) {
+        objectWillChange.send()
+        fileApplications.reset(for: URL(fileURLWithPath: item.path))
+        status = "Default application reset for \(item.name)."
     }
 
     func showRemoteEditDiff(_ session: RemoteEditSession) {
@@ -4838,7 +4879,7 @@ final class AppModel: ObservableObject {
         return alert.runModal() == .alertFirstButtonReturn
     }
 
-    private func chooseApplication(for fileURL: URL) -> URL? {
+    private func chooseApplication(for fileURL: URL, message: String? = nil) -> ApplicationChoice? {
         let panel = NSOpenPanel()
         panel.title = "Open With"
         panel.prompt = "Open"
@@ -4847,7 +4888,20 @@ final class AppModel: ObservableObject {
         panel.canChooseDirectories = false
         panel.allowsMultipleSelection = false
         panel.allowedContentTypes = [.applicationBundle, .unixExecutable]
-        return panel.runModal() == .OK ? panel.url : nil
+        if let message { panel.message = message }
+        let suffix = FileApplicationPreferences.fileExtension(for: fileURL)
+        let checkbox = NSButton(
+            checkboxWithTitle: suffix.map { "Always use this application for .\($0) files in Volt" }
+                ?? "Always use this application (requires a file extension)",
+            target: nil, action: nil
+        )
+        checkbox.state = .off
+        checkbox.isEnabled = suffix != nil
+        checkbox.sizeToFit()
+        panel.accessoryView = checkbox
+        panel.isAccessoryViewDisclosed = true
+        guard panel.runModal() == .OK, let url = panel.url else { return nil }
+        return ApplicationChoice(url: url, remember: checkbox.isEnabled && checkbox.state == .on)
     }
 
     private func runBusy(
@@ -6852,6 +6906,12 @@ struct BrowserSplitView: View {
                 .disabled(model.selectedLocalItems.count != 1 || model.selectedLocal?.isDirectory != false)
             Button("Open With...", action: model.openLocalSelectedWithApp)
                 .disabled(model.selectedLocalItems.count != 1 || model.selectedLocal?.isDirectory != false)
+            if model.selectedLocalItems.count == 1, let item = model.selectedLocal,
+               let suffix = model.defaultApplicationExtension(for: item) {
+                Button("Reset Default Application for .\(suffix)") {
+                    model.resetDefaultApplication(for: item)
+                }
+            }
             Divider()
             Button("Rename", action: model.renameLocalSelected)
                 .disabled(model.selectedLocalItems.count != 1)
@@ -6923,6 +6983,12 @@ struct BrowserSplitView: View {
                 .disabled(model.selectedRemoteItems.count != 1 || model.selectedRemote?.isDirectory != false)
             Button("Open With...", action: model.openRemoteSelectedWithApp)
                 .disabled(model.selectedRemoteItems.count != 1 || model.selectedRemote?.isDirectory != false)
+            if model.selectedRemoteItems.count == 1, let item = model.selectedRemote,
+               let suffix = model.defaultApplicationExtension(for: item) {
+                Button("Reset Default Application for .\(suffix)") {
+                    model.resetDefaultApplication(for: item)
+                }
+            }
             Divider()
             Button("Rename", action: model.renameRemoteSelected)
                 .disabled(model.selectedRemoteItems.count != 1)
@@ -7057,6 +7123,11 @@ struct BrowserSplitView: View {
                         model.openLocalSelectedWithApp()
                     }
                     .disabled(item.isDirectory)
+                    if let suffix = model.defaultApplicationExtension(for: item) {
+                        Button("Reset Default Application for .\(suffix)") {
+                            model.resetDefaultApplication(for: item)
+                        }
+                    }
                     Button("Copy Path") {
                         model.selectedLocalIDs = [item.id]
                         model.copyLocalPath()
@@ -7155,6 +7226,11 @@ struct BrowserSplitView: View {
                         model.openRemoteSelectedWithApp()
                     }
                     .disabled(item.isDirectory)
+                    if let suffix = model.defaultApplicationExtension(for: item) {
+                        Button("Reset Default Application for .\(suffix)") {
+                            model.resetDefaultApplication(for: item)
+                        }
+                    }
                     Button("Copy Path") {
                         model.selectedRemoteIDs = [item.id]
                         model.copyRemotePath()
