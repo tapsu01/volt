@@ -241,6 +241,28 @@ installations:
 ./Scripts/test-upload.sh
 ```
 
+This suite also checks persistent error banners, batch grouping, cancellation,
+originating-tab context, and remote-edit failure retention. Optional native
+banner snapshots (320 and 760 points, collapsed and expanded):
+
+```bash
+VOLT_ERROR_SNAPSHOT_DIR=/tmp/volt-error-snapshots ./Scripts/test-upload.sh
+```
+
+Check real authentication and permission errors against an isolated localhost
+SSH server (requires Homebrew libssh2 and macOS sshd; no saved connections used):
+
+```bash
+python3 Scripts/test-error-integration.py
+```
+
+Runtime errors appear in a persistent banner under the toolbar. **Details** shows
+copyable server/path/error information; **Dismiss** advances to the next notice.
+Upload failures in the same batch are grouped. Success and refresh do not clear
+errors, and explicit cancellation does not create a notice. Unknown upload
+publish outcomes remain visible for inspection, even after cancellation.
+
+
 The legacy XCTest suites require full Xcode and emit explicit build warnings
 when unavailable. The upload suite covers batch completion, tab/connection
 scope, worker limits, cancellation, traversal limits, and a 10,000-file scan.

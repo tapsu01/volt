@@ -1,3 +1,4 @@
+#include "SFTPError.h"
 #include "VoltSSH.h"
 #include "UploadPublish.h"
 
@@ -59,6 +60,18 @@ static void set_session_error(LIBSSH2_SESSION *session, char *error, size_t erro
         }
     } else {
         set_error(error, error_len, fallback);
+    }
+}
+
+/* Capture this before close/unlink: cleanup can overwrite the server status. */
+static void set_sftp_error(VoltSession *session, char *error, size_t error_len, const char *operation) {
+    if (libssh2_session_last_errno(session->session) == LIBSSH2_ERROR_SFTP_PROTOCOL) {
+        unsigned long status = libssh2_sftp_last_error(session->sftp);
+        char technical[512];
+        set_session_error(session->session, technical, sizeof(technical), operation);
+        volt_format_sftp_error(error, error_len, operation, status, technical);
+    } else {
+        set_session_error(session->session, error, error_len, operation);
     }
 }
 
@@ -647,7 +660,7 @@ static int volt_sftp_list_with_session(VoltSession *session, const char *remote_
 
     LIBSSH2_SFTP_HANDLE *dir = libssh2_sftp_opendir(session->sftp, remote_path);
     if (!dir) {
-        set_session_error(session->session, error, error_len, "Could not open remote directory.");
+        set_sftp_error(session, error, error_len, "Could not open remote directory.");
         return -1;
     }
 
@@ -720,9 +733,9 @@ static int volt_sftp_list_with_session(VoltSession *session, const char *remote_
         } else if (rc == 0) {
             break;
         } else {
+            set_sftp_error(session, error, error_len, "Could not read remote directory.");
             free_sftp_items(list, used);
             libssh2_sftp_closedir(dir);
-            set_error(error, error_len, "Could not read remote directory.");
             return -1;
         }
     }
@@ -749,20 +762,27 @@ int volt_sftp_list(const char *host, int port, const char *username, const char 
     return result;
 }
 
+typedef struct {
+    VoltSession *session;
+    char message[1024];
+} UploadPublishContext;
+
 static int upload_rename(void *context, const char *temporary_path, const char *destination, int overwrite) {
-    VoltSession *session = context;
+    UploadPublishContext *publish = context;
+    VoltSession *session = publish->session;
     int result = overwrite
         ? libssh2_sftp_posix_rename(session->sftp, temporary_path, destination)
         : libssh2_sftp_rename_ex(session->sftp, temporary_path, (unsigned int)strlen(temporary_path),
                                 destination, (unsigned int)strlen(destination), 0);
     if (result == 0) return VOLT_UPLOAD_PUBLISHED;
+    set_sftp_error(session, publish->message, sizeof(publish->message), "Could not publish upload.");
     if (result == LIBSSH2_ERROR_SFTP_PROTOCOL || result == LIBSSH2_ERROR_METHOD_NOT_SUPPORTED)
         return VOLT_UPLOAD_REJECTED;
     return VOLT_UPLOAD_UNCERTAIN;
 }
 
 static void upload_cleanup(void *context, const char *temporary_path) {
-    VoltSession *session = context;
+    VoltSession *session = ((UploadPublishContext *)context)->session;
     libssh2_sftp_unlink(session->sftp, temporary_path);
 }
 
@@ -802,7 +822,7 @@ static int upload_file_with_session(VoltSession *session, const char *local_path
     );
     if (!file) {
         fclose(input);
-        set_session_error(session->session, error, error_len, "Could not create temporary remote upload file.");
+        set_sftp_error(session, error, error_len, "Could not create temporary remote upload file.");
         return -1;
     }
     char buffer[VOLT_SFTP_TRANSFER_BUFFER_SIZE];
@@ -820,10 +840,10 @@ static int upload_file_with_session(VoltSession *session, const char *local_path
             }
             ssize_t written = libssh2_sftp_write(file, ptr, left);
             if (written <= 0) {
+                set_sftp_error(session, error, error_len, "SFTP write failed.");
                 libssh2_sftp_close(file);
                 libssh2_sftp_unlink(session->sftp, temp_path);
                 fclose(input);
-                set_session_error(session->session, error, error_len, "SFTP write failed.");
                 return -1;
             }
             ptr += written;
@@ -853,8 +873,8 @@ static int upload_file_with_session(VoltSession *session, const char *local_path
     int close_result = libssh2_sftp_close(file);
     fclose(input);
     if (close_result != 0) {
+        set_sftp_error(session, error, error_len, "Could not finalize temporary remote upload file.");
         libssh2_sftp_unlink(session->sftp, temp_path);
-        set_session_error(session->session, error, error_len, "Could not finalize temporary remote upload file.");
         return -1;
     }
 
@@ -863,13 +883,14 @@ static int upload_file_with_session(VoltSession *session, const char *local_path
         set_error(error, error_len, "Transfer cancelled before publish.");
         return -1;
     }
-    int publish_result = volt_upload_publish(session, temp_path, remote_path, overwrite,
+    UploadPublishContext publish = { .session = session, .message = {0} };
+    int publish_result = volt_upload_publish(&publish, temp_path, remote_path, overwrite,
                                              upload_rename, upload_cleanup);
     if (publish_result != VOLT_UPLOAD_PUBLISHED) {
         if (publish_result == VOLT_UPLOAD_UNCERTAIN) {
-            snprintf(error, error_len, "Upload publish outcome is unknown. Inspect destination and temporary file %s before retrying.", temp_path);
+            snprintf(error, error_len, "Upload publish outcome is unknown. Inspect destination and temporary file %s before retrying. %s", temp_path, publish.message);
         } else {
-            set_error(error, error_len, overwrite
+            if (error && error_len) snprintf(error, error_len, "%s %s", publish.message, overwrite
                 ? "Server rejected safe replacement. The existing file was not removed."
                 : "Server rejected upload publish. The destination may already exist.");
         }
@@ -905,7 +926,7 @@ int volt_sftp_upload(const char *host, int port, const char *username, const cha
 static int download_file_with_session(VoltSession *session, const char *remote_path, const char *local_path, int overwrite, VoltSFTPProgressCallback progress, void *progress_context, char *error, size_t error_len) {
     LIBSSH2_SFTP_HANDLE *file = libssh2_sftp_open(session->sftp, remote_path, LIBSSH2_FXF_READ, 0);
     if (!file) {
-        set_session_error(session->session, error, error_len, "Could not open remote file for reading.");
+        set_sftp_error(session, error, error_len, "Could not open remote file for reading.");
         return -1;
     }
     LIBSSH2_SFTP_ATTRIBUTES remote_attrs;
@@ -959,10 +980,10 @@ static int download_file_with_session(VoltSession *session, const char *remote_p
         }
         else if (n == 0) break;
         else {
+            set_sftp_error(session, error, error_len, "SFTP read failed.");
             fclose(output);
             unlink(temp_path);
             libssh2_sftp_close(file);
-            set_session_error(session->session, error, error_len, "SFTP read failed.");
             return -1;
         }
     }
@@ -1001,7 +1022,7 @@ static int download_file_resume_with_session(VoltSession *session, const char *r
 
     LIBSSH2_SFTP_HANDLE *file = libssh2_sftp_open(session->sftp, remote_path, LIBSSH2_FXF_READ, 0);
     if (!file) {
-        set_session_error(session->session, error, error_len, "Could not open remote file for reading.");
+        set_sftp_error(session, error, error_len, "Could not open remote file for reading.");
         return -1;
     }
 
@@ -1089,9 +1110,9 @@ static int download_file_resume_with_session(VoltSession *session, const char *r
         } else if (n == 0) {
             break;
         } else {
+            set_sftp_error(session, error, error_len, "SFTP read failed.");
             close(output_fd);
             libssh2_sftp_close(file);
-            set_session_error(session->session, error, error_len, "SFTP read failed.");
             return -1;
         }
     }
@@ -1222,7 +1243,7 @@ static void *parallel_download_worker_main(void *context) {
 
     LIBSSH2_SFTP_HANDLE *file = libssh2_sftp_open(session.sftp, shared->remote_path, LIBSSH2_FXF_READ, 0);
     if (!file) {
-        set_session_error(session.session, worker->error, sizeof(worker->error), "Could not open remote file for reading.");
+        set_sftp_error(&session, worker->error, sizeof(worker->error), "Could not open remote file for reading.");
         parallel_download_cancel(shared);
         close_parallel_worker_session(&session, NULL);
         return NULL;
@@ -1260,7 +1281,7 @@ static void *parallel_download_worker_main(void *context) {
             close_parallel_worker_session(&session, file);
             return NULL;
         } else {
-            set_session_error(session.session, worker->error, sizeof(worker->error), "SFTP read failed.");
+            set_sftp_error(&session, worker->error, sizeof(worker->error), "SFTP read failed.");
             parallel_download_cancel(shared);
             close_parallel_worker_session(&session, file);
             return NULL;
@@ -1279,7 +1300,7 @@ int volt_sftp_download_parallel(const char *host, int port, const char *username
 
     LIBSSH2_SFTP_HANDLE *file = libssh2_sftp_open(session.sftp, remote_path, LIBSSH2_FXF_READ, 0);
     if (!file) {
-        set_session_error(session.session, error, error_len, "Could not open remote file for reading.");
+        set_sftp_error(&session, error, error_len, "Could not open remote file for reading.");
         close_session(&session);
         return -1;
     }
@@ -1480,7 +1501,7 @@ const char *volt_sftp_download_result_error(const VoltSFTPDownloadResult *result
 static int volt_sftp_mkdir_with_session(VoltSession *session, const char *remote_path, uint32_t mode, char *error, size_t error_len) {
     mode_t safe_mode = (mode_t)(mode & 0777U);
     int rc = libssh2_sftp_mkdir(session->sftp, remote_path, safe_mode);
-    if (rc != 0) set_session_error(session->session, error, error_len, "Could not create remote directory.");
+    if (rc != 0) set_sftp_error(session, error, error_len, "Could not create remote directory.");
     int permission_result = 0;
     if (rc == 0) {
         LIBSSH2_SFTP_ATTRIBUTES attrs;
@@ -1517,7 +1538,7 @@ static int volt_sftp_create_empty_file_with_session(VoltSession *session, const 
     mode_t safe_mode = (mode_t)(mode & 0777U);
     LIBSSH2_SFTP_HANDLE *file = libssh2_sftp_open(session->sftp, remote_path, LIBSSH2_FXF_WRITE | LIBSSH2_FXF_CREAT | LIBSSH2_FXF_TRUNC, safe_mode);
     if (!file) {
-        set_session_error(session->session, error, error_len, "Could not create remote file.");
+        set_sftp_error(session, error, error_len, "Could not create remote file.");
         return -1;
     }
     LIBSSH2_SFTP_ATTRIBUTES attrs;
@@ -1551,7 +1572,7 @@ int volt_sftp_create_empty_file(const char *host, int port, const char *username
 
 static int volt_sftp_rename_with_session(VoltSession *session, const char *from_path, const char *to_path, char *error, size_t error_len) {
     int rc = libssh2_sftp_rename(session->sftp, from_path, to_path);
-    if (rc != 0) set_session_error(session->session, error, error_len, "Could not rename remote item.");
+    if (rc != 0) set_sftp_error(session, error, error_len, "Could not rename remote item.");
     return rc == 0 ? 0 : -1;
 }
 
@@ -1573,7 +1594,7 @@ int volt_sftp_rename(const char *host, int port, const char *username, const cha
 
 static int volt_sftp_remove_with_session(VoltSession *session, const char *remote_path, int is_directory, char *error, size_t error_len) {
     int rc = is_directory ? libssh2_sftp_rmdir(session->sftp, remote_path) : libssh2_sftp_unlink(session->sftp, remote_path);
-    if (rc != 0) set_session_error(session->session, error, error_len, "Could not remove remote item.");
+    if (rc != 0) set_sftp_error(session, error, error_len, "Could not remove remote item.");
     return rc == 0 ? 0 : -1;
 }
 

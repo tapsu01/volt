@@ -14,6 +14,10 @@ static int fake_stat(LIBSSH2_SFTP_HANDLE *, LIBSSH2_SFTP_ATTRIBUTES *, int);
 static int fake_rename(LIBSSH2_SFTP *, const char *, unsigned int, const char *, unsigned int, long);
 static int fake_posix_rename(LIBSSH2_SFTP *, const char *, size_t, const char *, size_t);
 static int fake_unlink(LIBSSH2_SFTP *, const char *, unsigned int);
+static int fake_last_errno(LIBSSH2_SESSION *session);
+static unsigned long fake_sftp_last_error(LIBSSH2_SFTP *sftp);
+#define libssh2_session_last_errno fake_last_errno
+#define libssh2_sftp_last_error fake_sftp_last_error
 #define libssh2_sftp_open_ex fake_open
 #define libssh2_sftp_write fake_write
 #define libssh2_sftp_close_handle fake_close
@@ -27,6 +31,15 @@ static char temporary[4096], staged[128], destination[128];
 static int rename_reply, rename_calls, cleanup_calls, posix_calls;
 static int permission_reply, fail_write, fail_close, cancel_before_publish;
 static int progress_calls, file_closed;
+static int fake_last_errno(LIBSSH2_SESSION *session) {
+    (void)session;
+    return (rename_reply == LIBSSH2_ERROR_SFTP_PROTOCOL || fail_write || fail_close) ? LIBSSH2_ERROR_SFTP_PROTOCOL : rename_reply;
+}
+static unsigned long fake_sftp_last_error(LIBSSH2_SFTP *sftp) {
+    (void)sftp;
+    // Cleanup overwrites the server status; the caller must capture it first.
+    return cleanup_calls ? LIBSSH2_FX_OK : LIBSSH2_FX_PERMISSION_DENIED;
+}
 
 static void reset(void) {
     temporary[0] = staged[0] = '\0';
@@ -118,6 +131,7 @@ int main(void) {
                                   progress, NULL, error, sizeof(error)) < 0);
         assert(strcmp(destination, "old contents") == 0);
         assert(rename_calls == 1 && cleanup_calls == 1);
+        if (rejections[i] == LIBSSH2_ERROR_SFTP_PROTOCOL) assert(strstr(error, "Permission denied"));
         assert(strstr(error, "not removed"));
     }
     reset(); rename_reply = LIBSSH2_ERROR_SOCKET_RECV;

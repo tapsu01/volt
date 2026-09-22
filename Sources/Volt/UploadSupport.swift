@@ -7,6 +7,7 @@ enum UploadConflictBatchPolicy {
 /// State is confined to the main actor, including conflict prompts and path reservations.
 @MainActor
 final class UploadBatchContext {
+    let id = UUID()
     let connection: SavedConnection
     let credential: SensitiveCredential
     let tabID: UUID?

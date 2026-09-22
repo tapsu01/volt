@@ -1915,6 +1915,9 @@ final class AppModel: ObservableObject {
     @Published var terminalOutput = ""
     @Published var terminalStatus: TerminalStatus = .idle
     @Published var status = "Ready"
+    @Published var errorNotices = ErrorNoticeQueue()
+    private var uploadErrorBatches: [UUID: UUID] = [:]
+    private var transferErrorContexts: [UUID: OperationErrorContext] = [:]
     @Published var isBusy = false
     @Published var isConnected = false
     @Published var showsConnectionEditor = false
@@ -1968,9 +1971,10 @@ final class AppModel: ObservableObject {
         transfers.contains { $0.state == .done || $0.state == .failed || $0.state == .cancelled }
     }
 
-    init() {
-        VoltAppDelegate.models.add(self)
+    init(startServices: Bool = true) {
         selectedTabID = tabs.first?.id
+        guard startServices else { return }
+        VoltAppDelegate.models.add(self)
         refreshLocal()
         syncCurrentTab()
         loadStartupStorage()
@@ -2024,14 +2028,25 @@ final class AppModel: ObservableObject {
     }
 
     func calculateSize(for item: FileItem, isLocal: Bool) async {
+        var failureContext = errorContext()
+        if isLocal {
+            failureContext.localPath = item.path
+            failureContext.remotePath = nil
+            failureContext.server = nil
+        } else {
+            failureContext.remotePath = item.path
+        }
         if isLocal {
             let runner = CommandRunner()
             let executable = "/usr/bin/du"
             let args = ["-sk", item.path]
-            if let result = try? await runner.run(executable, arguments: args, stdin: "", environment: [:]),
-               result.status == 0,
-               let sizeStr = result.stdout.split(separator: "\t").first,
-               let sizeKB = Int64(sizeStr) {
+            do {
+                let result = try await runner.run(executable, arguments: args, stdin: "", environment: [:])
+                guard result.status == 0,
+                      let sizeStr = result.stdout.split(separator: "\t").first,
+                      let sizeKB = Int64(sizeStr), sizeKB <= Int64.max / 1024 else {
+                    throw AppError.commandFailed(result.stderr.isEmpty ? "Could not calculate file size." : result.stderr)
+                }
                 let sizeBytes = sizeKB * 1024
                 await MainActor.run {
                     if let index = self.localItems.firstIndex(where: { $0.id == item.id }) {
@@ -2039,6 +2054,8 @@ final class AppModel: ObservableObject {
                         self.syncCurrentTab()
                     }
                 }
+            } catch {
+                reportError(error, operation: "Calculating size", context: failureContext)
             }
         } else {
             guard let connection = selectedConnection else { return }
@@ -2058,6 +2075,7 @@ final class AppModel: ObservableObject {
                 }
             } catch {
                 status = error.localizedDescription
+                reportError(error, operation: "Calculating size", context: failureContext)
             }
         }
     }
@@ -2361,6 +2379,7 @@ final class AppModel: ObservableObject {
         guard !isSelectingConnection else { return }
         if let validationError = validate(connection) {
             status = validationError
+            reportError(AppError.commandFailed(validationError), operation: "Connection settings")
             return
         }
         selectOrCreateTab(for: connection)
@@ -2423,6 +2442,7 @@ final class AppModel: ObservableObject {
     func saveDraft() {
         if let validationError = validate(connectionDraft) {
             status = validationError
+            reportError(AppError.commandFailed(validationError), operation: "Connection settings")
             return
         }
         let previousConnection = connections.first { $0.id == connectionDraft.id }
@@ -2451,6 +2471,7 @@ final class AppModel: ObservableObject {
     func connectDraft(password: String) {
         if let validationError = validate(connectionDraft) {
             status = validationError
+            reportError(AppError.commandFailed(validationError), operation: "Connection settings")
             return
         }
         remotePath = connectionDraft.remotePath.isEmpty ? "/" : connectionDraft.remotePath
@@ -2581,6 +2602,7 @@ final class AppModel: ObservableObject {
             name: logDownloadFileName(for: bookmark)
         ) else {
             status = "Refused unsafe log filename."
+            reportError(AppError.commandFailed(status), operation: "File operation")
             return
         }
         download(remotePath: bookmark.path, localPath: destination.path, refreshWhenDone: true)
@@ -2604,6 +2626,7 @@ final class AppModel: ObservableObject {
             destination = directory.appendingPathComponent(logDownloadFileName(for: bookmark))
         } catch {
             status = error.localizedDescription
+            reportError(error, operation: "Open log bookmark")
             return
         }
         let transferID = enqueue(direction: .download, source: bookmark.path, destination: destination.path)
@@ -2636,6 +2659,7 @@ final class AppModel: ObservableObject {
         guard let bookmark = chooseLogBookmark(title: "Live Tail Log Bookmark") else { return }
         if usesPasswordSFTP(connection: connection) {
             status = "Live tail requires SSH key or ssh-agent authentication."
+            reportError(AppError.commandFailed(status), operation: "Starting live tail")
             return
         }
         let command = "tail -n 200 -f \(Self.shellQuoted(bookmark.path))"
@@ -2650,10 +2674,12 @@ final class AppModel: ObservableObject {
         let command = shortcut.command.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !command.isEmpty else {
             status = "Command shortcut is empty."
+            reportError(AppError.commandFailed(status), operation: "Running command")
             return
         }
         if usesPasswordSFTP(connection: connection) {
             status = "Command shortcuts require SSH key or ssh-agent authentication."
+            reportError(AppError.commandFailed(status), operation: "Running command")
             recordHistory(kind: .command, result: .failed, remotePath: command, message: status)
             return
         }
@@ -2709,6 +2735,7 @@ final class AppModel: ObservableObject {
         showsSyncPreview = true
         syncPreviewStatus = "Scanning local files"
         status = "Building sync preview"
+        let failureContext = errorContext()
         syncPreviewTask = Task {
             do {
                 let localScanTask = Task.detached(priority: .userInitiated) {
@@ -2751,6 +2778,7 @@ final class AppModel: ObservableObject {
                     self.isBuildingSyncPlan = false
                     self.syncPreviewStatus = error.localizedDescription
                     self.status = error.localizedDescription
+                    self.reportError(error, operation: "Sync preview", context: failureContext, cancelled: Task.isCancelled)
                     self.recordHistory(kind: .sync, result: .failed, localPath: localRoot, remotePath: remoteRoot, message: error.localizedDescription)
                     self.syncPreviewTask = nil
                 }
@@ -2853,6 +2881,7 @@ final class AppModel: ObservableObject {
         remoteSearchStatus = "Searching \(searchRoot)"
         status = "Searching remote files"
 
+        let failureContext = errorContext()
         remoteSearchTask = Task {
             do {
                 let results: [RemoteSearchResult]
@@ -2894,6 +2923,7 @@ final class AppModel: ObservableObject {
                     self.isSearchingRemote = false
                     self.remoteSearchStatus = error.localizedDescription
                     self.status = error.localizedDescription
+                    self.reportError(error, operation: "Remote search", context: failureContext, cancelled: Task.isCancelled)
                     self.recordHistory(kind: .search, result: .failed, remotePath: searchRoot, message: error.localizedDescription)
                     self.remoteSearchTask = nil
                 }
@@ -2930,6 +2960,7 @@ final class AppModel: ObservableObject {
         guard !result.isDirectory else { return }
         guard let destination = safeLocalDestination(base: URL(fileURLWithPath: localPath), name: result.name) else {
             status = "Refused unsafe remote filename."
+            reportError(AppError.commandFailed(status), operation: "File operation")
             return
         }
         download(remotePath: result.path, localPath: destination.path, refreshWhenDone: true)
@@ -2940,6 +2971,7 @@ final class AppModel: ObservableObject {
         guard !result.isDirectory else { return }
         if usesPasswordSFTP(connection: connection) {
             status = "Live tail requires SSH key or ssh-agent authentication."
+            reportError(AppError.commandFailed(status), operation: "Starting live tail")
             return
         }
         startTerminal(remoteCommand: "tail -n 200 -f \(Self.shellQuoted(result.path))", intro: "Tailing \(result.path)")
@@ -3025,6 +3057,7 @@ final class AppModel: ObservableObject {
 
     func refreshLocal() {
         let path = localPath
+        let failureContext = errorContext()
         let includeOwnerGroupPermissions = Self.needsLocalOwnerGroupPermissions(for: localBrowserPreferences)
         Task {
             do {
@@ -3041,6 +3074,7 @@ final class AppModel: ObservableObject {
             } catch {
                 guard self.localPath == path else { return }
                 self.status = error.localizedDescription
+                self.reportError(error, operation: "Loading local folder", context: failureContext)
             }
         }
     }
@@ -3051,6 +3085,7 @@ final class AppModel: ObservableObject {
         var isDirectory: ObjCBool = false
         guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory), isDirectory.boolValue else {
             status = "Local path is not a folder: \(localPath)"
+            reportError(AppError.commandFailed(status), operation: "File operation")
             return
         }
         localPath = url.path
@@ -3075,6 +3110,7 @@ final class AppModel: ObservableObject {
         guard let connection = selectedConnection else { status = "Choose a connection"; return }
         if let validationError = validate(connection) {
             status = validationError
+            reportError(AppError.commandFailed(validationError), operation: "Connection settings")
             return
         }
         let path = remotePath
@@ -3090,7 +3126,8 @@ final class AppModel: ObservableObject {
             } catch {
                 if self.isAuthenticationFailure(error) {
                     await MainActor.run {
-                        if let operationTabID {
+                        if let operationTabID, self.remoteRefreshRequests[operationTabID] == requestID,
+                           self.tabs.contains(where: { $0.id == operationTabID && $0.connectionID == connection.id }) {
                             self.tabCredentials.removeValue(forKey: operationTabID)?.clear()
                         }
                     }
@@ -3124,16 +3161,27 @@ final class AppModel: ObservableObject {
             }
         }
 
+        let failureContext = errorContext()
+        let reportFailure: @MainActor (Error) -> Void = { error in
+            guard let operationTabID,
+                  let tab = self.tabs.first(where: { $0.id == operationTabID }),
+                  tab.connectionID == connection.id, tab.remotePath == path,
+                  self.remoteRefreshRequests[operationTabID] == requestID else { return }
+            self.remoteRefreshRequests.removeValue(forKey: operationTabID)
+            if self.selectedTabID == operationTabID { self.status = error.localizedDescription }
+            self.reportError(error, operation: tab.isConnected ? "Loading remote folder" : "Connecting to SSH",
+                             context: failureContext, eventID: requestID)
+        }
         switch mode {
         case .foreground:
-            runBusy("Loading remote folder", operation: operation)
+            runBusy("Loading remote folder", reportsFailure: false, operation: operation, onFailure: reportFailure)
         case .background:
             Task {
                 do {
                     try await operation()
                 } catch {
                     await MainActor.run {
-                        self.status = error.localizedDescription
+                        reportFailure(error)
                     }
                 }
             }
@@ -3229,7 +3277,10 @@ final class AppModel: ObservableObject {
 
     private func registerUpload(_ id: UUID, batch: UploadBatchContext) {
         batch.register(id)
+        uploadErrorBatches[id] = batch.id
         uploadOrigins[id] = (batch.connection, batch.tabID, batch.remoteRoot)
+        transferErrorContexts.removeValue(forKey: id)
+        transferErrorContexts[id] = errorContext(transferID: id)
     }
 
     private func finishUpload(_ id: UUID, batch: UploadBatchContext) {
@@ -3286,6 +3337,9 @@ final class AppModel: ObservableObject {
         } catch {
             setRemoteEditState(session.id, .failed, tabID: batch.tabID)
             status = error.localizedDescription
+            reportError(error, operation: "Preparing edit upload", context: OperationErrorContext(
+                tabID: batch.tabID, server: "\(batch.connection.name) (\(batch.connection.host):\(batch.connection.port))",
+                localPath: session.localPath, remotePath: session.remotePath, batchID: batch.id))
             return
         }
         let connection = batch.connection
@@ -3345,6 +3399,8 @@ final class AppModel: ObservableObject {
         for id in completedIDs {
             transferControls.removeValue(forKey: id)
             uploadOrigins.removeValue(forKey: id)
+            uploadErrorBatches.removeValue(forKey: id)
+            transferErrorContexts.removeValue(forKey: id)
         }
         status = "Completed transfers cleared"
     }
@@ -3510,9 +3566,14 @@ final class AppModel: ObservableObject {
                         let childControl = TransferControl(parent: workerControl) { bytes, _ in
                             publishProgress(file.remotePath, min(bytes, file.size), false, false)
                         }
-                        let warning = try await client.uploadUsingSession(connection: connection,
-                            credential: credential, file: file, control: childControl)
-                        publishProgress(file.remotePath, file.size, true, warning != nil)
+                        do {
+                            let warning = try await client.uploadUsingSession(connection: connection,
+                                credential: credential, file: file, control: childControl)
+                            publishProgress(file.remotePath, file.size, true, warning != nil)
+                        } catch {
+                            if ErrorNoticeQueue.isCancellation(error) { throw error }
+                            throw AppError.commandFailed("Upload \(file.localPath) to \(file.remotePath): \(error.localizedDescription)")
+                        }
                     }
                     await client.closeAllPooledSessions()
                 } catch {
@@ -3557,6 +3618,7 @@ final class AppModel: ObservableObject {
         for item in items {
             guard let destination = safeLocalDestination(base: URL(fileURLWithPath: localPath), name: item.name) else {
                 status = "Refused unsafe remote filename."
+                reportError(AppError.commandFailed(status), operation: "File operation")
                 continue
             }
             download(item: item, localPath: destination.path, refreshWhenDone: item.id == items.last?.id)
@@ -3574,6 +3636,7 @@ final class AppModel: ObservableObject {
             for item in items {
                 guard let destination = safeLocalDestination(base: folder, name: item.name) else {
                     status = "Refused unsafe remote filename."
+                    reportError(AppError.commandFailed(status), operation: "File operation")
                     continue
                 }
                 download(item: item, localPath: destination.path, refreshWhenDone: false)
@@ -3780,6 +3843,9 @@ final class AppModel: ObservableObject {
         parentControl: TransferControl,
         transferID: UUID
     ) async throws -> FolderDownloadSummary {
+        var capturedContext = errorContext(transferID: transferID)
+        capturedContext.batchID = transferID
+        let failureContext = capturedContext
         for directory in plan.directories {
             try FileManager.default.createDirectory(
                 at: URL(fileURLWithPath: directory, isDirectory: true),
@@ -3829,6 +3895,10 @@ final class AppModel: ObservableObject {
                     guard !parentControl.isCancelled else { throw error }
                     await MainActor.run {
                         self.markTransfer(transferID, .running, "Skipped \(file.name): \(error.localizedDescription)")
+                        var context = failureContext
+                        context.localPath = file.localPath
+                        context.remotePath = file.remotePath
+                        self.reportError(error, operation: "Downloading file", context: context)
                     }
                     return false
                 }
@@ -3904,6 +3974,11 @@ final class AppModel: ObservableObject {
                         let message = result.errorMessage ?? "Download failed."
                         await MainActor.run {
                             self.markTransfer(transferID, .running, "Skipped \(file.name): \(message)")
+                            var context = failureContext
+                            context.localPath = file.localPath
+                            context.remotePath = file.remotePath
+                            self.reportError(AppError.commandFailed(message), operation: "Downloading file", context: context,
+                                             cancelled: parentControl.isCancelled)
                         }
                     }
                 }
@@ -4309,6 +4384,7 @@ final class AppModel: ObservableObject {
             refreshLocal()
         } catch {
             status = error.localizedDescription
+            reportError(error, operation: "Creating local folder")
         }
     }
 
@@ -4322,6 +4398,7 @@ final class AppModel: ObservableObject {
             NSWorkspace.shared.open(url)
         } catch {
             status = error.localizedDescription
+            reportError(error, operation: "Creating local file")
         }
     }
 
@@ -4331,7 +4408,7 @@ final class AppModel: ObservableObject {
         guard !name.isEmpty else { return }
         let path = joinRemote(remotePath, name)
         let credential = credentialForCurrentTab().clone()
-        runBusy("Creating folder") {
+        runBusy("Creating folder", affectedRemotePath: path) {
             let warning = try await self.sftp.makeDirectory(connection: connection, credential: credential, path: path)
             await MainActor.run {
                 self.invalidateRemoteCacheForChangedItem(connectionID: connection.id, path: path, wasDirectory: true)
@@ -4346,7 +4423,7 @@ final class AppModel: ObservableObject {
         guard !name.isEmpty else { return }
         let path = joinRemote(remotePath, name)
         let credential = credentialForCurrentTab().clone()
-        runBusy("Creating file") {
+        runBusy("Creating file", affectedRemotePath: path) {
             let warning = try await self.sftp.createFile(connection: connection, credential: credential, remotePath: path)
             await MainActor.run {
                 self.invalidateRemoteCacheForChangedItem(connectionID: connection.id, path: path)
@@ -4382,6 +4459,7 @@ final class AppModel: ObservableObject {
             refreshLocal()
         } catch {
             status = error.localizedDescription
+            reportError(error, operation: "Duplicating local file")
         }
     }
 
@@ -4397,6 +4475,7 @@ final class AppModel: ObservableObject {
             refreshLocal()
         } catch {
             status = error.localizedDescription
+            reportError(error, operation: "Moving local file")
         }
     }
 
@@ -4430,7 +4509,7 @@ final class AppModel: ObservableObject {
         let newName = item.name + " copy"
         let newPath = joinRemote(remotePath, newName)
         let credential = credentialForCurrentTab().clone()
-        runBusy("Duplicating remote item") {
+        runBusy("Duplicating remote item", affectedRemotePath: item.path) {
             // Using cp -r over SSH
             let runner = CommandRunner()
             let executable = "/usr/bin/ssh"
@@ -4457,7 +4536,10 @@ final class AppModel: ObservableObject {
             let quotedDst = "'" + newPath.replacingOccurrences(of: "'", with: "'\\''") + "'"
             args.append("cp -r \(quotedSrc) \(quotedDst)")
 
-            _ = try await runner.run(executable, arguments: args, stdin: "")
+            let result = try await runner.run(executable, arguments: args, stdin: "")
+            guard result.status == 0 else {
+                throw AppError.commandFailed(result.stderr.isEmpty ? "Remote copy failed (exit \(result.status))." : result.stderr)
+            }
             
             await MainActor.run {
                 self.invalidateRemoteCacheForChangedItem(connectionID: connection.id, path: newPath, wasDirectory: item.isDirectory)
@@ -4473,7 +4555,7 @@ final class AppModel: ObservableObject {
         
         let newPath = joinRemote(remotePath, newName)
         let credential = credentialForCurrentTab().clone()
-        runBusy("Moving remote item") {
+        runBusy("Moving remote item", affectedRemotePath: item.path) {
             try await self.sftp.rename(connection: connection, credential: credential, from: item.path, to: newPath)
             await MainActor.run {
                 self.selectedRemoteIDs.removeAll()
@@ -4499,6 +4581,7 @@ final class AppModel: ObservableObject {
             refreshLocal()
         } catch {
             status = error.localizedDescription
+            reportError(error, operation: "Deleting local file")
         }
     }
 
@@ -4512,7 +4595,7 @@ final class AppModel: ObservableObject {
         alert.addButton(withTitle: "Cancel")
         guard alert.runModal() == .alertFirstButtonReturn else { return }
         let credential = credentialForCurrentTab().clone()
-        runBusy("Deleting remote item") {
+        runBusy("Deleting remote item", affectedRemotePath: item.path) {
             try await self.sftp.remove(connection: connection, credential: credential, path: item.path, isDirectory: item.isDirectory)
             await MainActor.run {
                 self.selectedRemoteIDs.removeAll()
@@ -4547,6 +4630,7 @@ final class AppModel: ObservableObject {
             refreshLocal()
         } catch {
             status = error.localizedDescription
+            reportError(error, operation: "Renaming local file")
         }
     }
 
@@ -4556,7 +4640,7 @@ final class AppModel: ObservableObject {
         guard !newName.isEmpty, newName != item.name else { return }
         let destination = remoteParentPath(item.path).map { joinRemote($0, newName) } ?? joinRemote(remotePath, newName)
         let credential = credentialForCurrentTab().clone()
-        runBusy("Renaming remote item") {
+        runBusy("Renaming remote item", affectedRemotePath: item.path) {
             try await self.sftp.rename(connection: connection, credential: credential, from: item.path, to: destination)
             await MainActor.run {
                 self.selectedRemoteIDs.removeAll()
@@ -4603,11 +4687,13 @@ final class AppModel: ObservableObject {
             try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
         } catch {
             status = error.localizedDescription
+            reportError(error, operation: "Opening remote edit")
             return
         }
         guard let localURL = safeLocalDestination(base: directory, name: item.name) else {
             try? FileManager.default.removeItem(at: directory)
             status = "Refused unsafe remote filename."
+            reportError(AppError.commandFailed(status), operation: "File operation")
             return
         }
         let transferID = enqueue(
@@ -4642,9 +4728,9 @@ final class AppModel: ObservableObject {
                 try? FileManager.default.removeItem(at: localURL.deletingLastPathComponent())
                 throw error
             }
-            await MainActor.run {
+            try await MainActor.run {
                 let snapshotURL = localURL.deletingLastPathComponent().appendingPathComponent(".original-\(remoteItem.name)")
-                try? FileManager.default.copyItem(at: localURL, to: snapshotURL)
+                try FileManager.default.copyItem(at: localURL, to: snapshotURL)
                 let observed = self.localEditFileObservation(at: localURL.path)
                 self.remoteEditSessions.insert(RemoteEditSession(
                     remotePath: remoteItem.path,
@@ -4684,12 +4770,15 @@ final class AppModel: ObservableObject {
             openFile(fileURL, with: choice.url, remember: choice.remember)
             return
         }
+        var failureContext = errorContext()
+        failureContext.localPath = fileURL.path
         WorkspaceFileOpener.open(fileURL, with: applicationURL, onSuccess: { [weak self] in
             guard let self, let appURL, remember else { return }
             self.objectWillChange.send()
             self.fileApplications.recordSuccessfulOpen(ApplicationChoice(url: appURL, remember: true), for: fileURL)
         }, onError: { [weak self] message in
             self?.status = message
+            self?.reportError(AppError.commandFailed(message), operation: "Opening file", context: failureContext)
         })
     }
 
@@ -4711,9 +4800,11 @@ final class AppModel: ObservableObject {
               FileManager.default.fileExists(atPath: originalPath),
               FileManager.default.fileExists(atPath: session.localPath) else {
             status = "Diff is unavailable for this edit session."
+            reportError(AppError.commandFailed(status), operation: "File operation")
             return
         }
         status = "Preparing diff"
+        let failureContext = errorContext()
         Task {
             do {
                 let result = try await CommandRunner().run(
@@ -4739,6 +4830,7 @@ final class AppModel: ObservableObject {
                 status = "Diff ready"
             } catch {
                 status = error.localizedDescription
+                reportError(error, operation: "Preparing diff", context: failureContext)
             }
         }
     }
@@ -4802,6 +4894,8 @@ final class AppModel: ObservableObject {
     }
 
     private func updateRemoteEditAfterUpload(_ id: UUID, tabID: UUID?, snapshot: RemoteEditUploadSnapshot) {
+        let sourceTab = tabs.first { $0.id == tabID }
+        let sourceConnection = connections.first { $0.id == sourceTab?.connectionID }
         func update(_ session: inout RemoteEditSession) {
             do {
                 let observed = localEditFileObservation(at: session.localPath)
@@ -4811,6 +4905,9 @@ final class AppModel: ObservableObject {
             } catch {
                 session.state = .failed
                 status = "Uploaded, but could not update the edit baseline: \(error.localizedDescription)"
+                reportError(AppError.commandFailed(status), operation: "Updating edit baseline", context: OperationErrorContext(
+                    tabID: tabID, server: sourceConnection.map { "\($0.name) (\($0.host):\($0.port))" },
+                    localPath: session.localPath, remotePath: session.remotePath))
             }
         }
         if tabID == selectedTabID {
@@ -4904,13 +5001,37 @@ final class AppModel: ObservableObject {
         return ApplicationChoice(url: url, remember: checkbox.isEnabled && checkbox.state == .on)
     }
 
+    private func errorContext(transferID: UUID? = nil) -> OperationErrorContext {
+        if let transferID, let captured = transferErrorContexts[transferID] { return captured }
+        let origin = transferID.flatMap { uploadOrigins[$0] }
+        let connection = origin?.connection ?? selectedConnection
+        let job = transferID.flatMap { id in transfers.first { $0.id == id } }
+        return OperationErrorContext(
+            tabID: origin?.tabID ?? selectedTabID,
+            server: connection.map { "\($0.name) (\($0.host):\($0.port))" },
+            localPath: job.map { $0.direction == .upload ? $0.source : $0.destination } ?? localPath,
+            remotePath: job.map { $0.direction == .upload ? $0.destination : $0.source } ?? remotePath,
+            transferID: transferID, batchID: transferID.flatMap { uploadErrorBatches[$0] })
+    }
+
+    func reportError(_ error: Error, operation: String, context: OperationErrorContext? = nil,
+                             eventID: UUID = UUID(), cancelled: Bool = false) {
+        let context = context ?? errorContext()
+        if let tabID = context.tabID, !tabs.contains(where: { $0.id == tabID }) { return }
+        errorNotices.report(error, operation: operation, context: context, eventID: eventID, cancelled: cancelled)
+    }
+
     private func runBusy(
         _ label: String,
         transferID: UUID? = nil,
+        reportsFailure: Bool = true,
+        affectedRemotePath: String? = nil,
         operation: @escaping @Sendable () async throws -> Void,
         onFailure: (@MainActor (Error) -> Void)? = nil,
         onFinish: (@MainActor () -> Void)? = nil
     ) {
+        var failureContext = errorContext(transferID: transferID)
+        if let affectedRemotePath { failureContext.remotePath = affectedRemotePath }
         activeOperationCount += 1
         isBusy = true
         status = label
@@ -4918,9 +5039,17 @@ final class AppModel: ObservableObject {
             do {
                 try await operation()
             } catch {
+                let wasCancelled = ErrorNoticeQueue.isCancellation(error) || transferID.flatMap { transferControls[$0]?.isCancelled } == true
                 onFailure?(error)
+                if reportsFailure {
+                    if let job = transfers.first(where: { $0.id == transferID }) {
+                        failureContext.localPath = job.direction == .upload ? job.source : job.destination
+                        failureContext.remotePath = job.direction == .upload ? job.destination : job.source
+                    }
+                    reportError(error, operation: label, context: failureContext,
+                                eventID: transferID ?? UUID(), cancelled: wasCancelled)
+                }
                 if let transferID {
-                    let wasCancelled = transferControls[transferID]?.isCancelled == true
                     markTransfer(
                         transferID,
                         wasCancelled ? .cancelled : .failed,
@@ -4928,7 +5057,7 @@ final class AppModel: ObservableObject {
                             ? "Cancelled" : error.localizedDescription
                     )
                 }
-                status = error.localizedDescription
+                if reportsFailure { status = error.localizedDescription }
             }
             onFinish?()
             activeOperationCount = max(0, activeOperationCount - 1)
@@ -4961,6 +5090,7 @@ final class AppModel: ObservableObject {
         }
         transferControls[job.id] = control
         transfers.insert(job, at: 0)
+        transferErrorContexts[job.id] = errorContext(transferID: job.id)
         showsTransfers = true
         noteRecentActivity()
         return job.id
@@ -5027,6 +5157,7 @@ final class AppModel: ObservableObject {
         guard job.state == .failed || job.state == .cancelled else { return }
         guard let retryDescriptor = job.retryDescriptor else {
             status = "This transfer cannot be retried."
+            reportError(AppError.commandFailed(status), operation: "File operation")
             return
         }
         let uploadBatch: UploadBatchContext?
@@ -5037,6 +5168,7 @@ final class AppModel: ObservableObject {
                   tabs.contains(where: { $0.id == tabID && $0.connectionID == origin.connection.id }),
                   let credential = tabCredentials[tabID] else {
                 status = "Reconnect the original upload tab before retrying."
+                reportError(AppError.commandFailed(status), operation: "File operation")
                 return
             }
             uploadBatch = UploadBatchContext(connection: origin.connection, credential: credential.clone(),
@@ -5122,6 +5254,7 @@ final class AppModel: ObservableObject {
         showTerminal()
 
         let tabID = selectedTabID
+        let failureContext = errorContext()
         Task {
             do {
                 let probe = try await verifiedHostKeyProbe(for: connection)
@@ -5142,7 +5275,7 @@ final class AppModel: ObservableObject {
                     },
                     onExit: { [weak self] code in
                         Task { @MainActor [weak self] in
-                            self?.terminalDidExit(tabID: tabID, code: code)
+                            self?.terminalDidExit(tabID: tabID, code: code, context: failureContext)
                         }
                     }
                 )
@@ -5155,6 +5288,7 @@ final class AppModel: ObservableObject {
                     self.appendTerminalOutput("Terminal failed: \(error.localizedDescription)\n", tabID: tabID)
                     self.setTerminalStatus(.failed, tabID: tabID)
                     self.status = error.localizedDescription
+                    self.reportError(error, operation: "Starting terminal", context: failureContext)
                 }
             }
         }
@@ -5221,8 +5355,12 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private func terminalDidExit(tabID: BrowserTab.ID, code: Int32) {
-        terminalSessions.removeValue(forKey: tabID)
+    private func terminalDidExit(tabID: BrowserTab.ID, code: Int32, context: OperationErrorContext) {
+        let wasRunning = terminalSessions.removeValue(forKey: tabID) != nil
+        if wasRunning && code != 0 {
+            reportError(AppError.commandFailed("SSH exited with status \(code). See Terminal for server output."),
+                        operation: "Terminal session", context: context)
+        }
         appendTerminalOutput("\nSSH session exited with status \(code).\n", tabID: tabID)
         setTerminalStatus(.exited, tabID: tabID)
     }
@@ -5793,22 +5931,27 @@ struct ContentView: View {
             model.connectAfterConnectionEditorDismissed()
         }) {
             ConnectionEditor(model: model)
+                .safeAreaInset(edge: .top, spacing: 0) { ErrorBanner(model: model) }
                 .padding(4)
                 .frame(width: 820)
                 .presentationSizing(.fitted)
         }
         .sheet(isPresented: $model.showsPasswordPrompt) {
             PasswordPromptView(model: model)
+                .safeAreaInset(edge: .top, spacing: 0) { ErrorBanner(model: model) }
         }
         .sheet(isPresented: $model.showsHostKeyPrompt) {
             HostKeyVerificationView(model: model)
+                .safeAreaInset(edge: .top, spacing: 0) { ErrorBanner(model: model) }
         }
         .sheet(isPresented: $model.showsSyncPreview) {
             SyncPreviewView(model: model)
+                .safeAreaInset(edge: .top, spacing: 0) { ErrorBanner(model: model) }
                 .frame(width: 860, height: 560)
         }
         .sheet(isPresented: $model.showsRemoteSearch) {
             RemoteSearchView(model: model)
+                .safeAreaInset(edge: .top, spacing: 0) { ErrorBanner(model: model) }
                 .frame(width: 820, height: 540)
         }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)) { _ in
@@ -5851,6 +5994,8 @@ private struct MainLayoutView: View {
                     appAppearance: $appAppearance
                 )
 
+                ErrorBanner(model: model)
+
                 ZStack(alignment: .trailing) {
                     HStack(spacing: 0) {
                         mainContent
@@ -5887,6 +6032,7 @@ private struct MainLayoutView: View {
         }
         .sheet(isPresented: inspectorSheetBinding) {
             InspectorView(model: model)
+                .safeAreaInset(edge: .top, spacing: 0) { ErrorBanner(model: model) }
                 .frame(width: layout.inspectorWidth, height: 560)
         }
         .animation(.easeInOut(duration: 0.16), value: layout.inspectorMode)
