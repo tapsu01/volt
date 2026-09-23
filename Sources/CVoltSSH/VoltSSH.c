@@ -5,6 +5,7 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <libssh2.h>
 #include <libssh2_sftp.h>
 #include <netdb.h>
@@ -758,6 +759,146 @@ int volt_sftp_list(const char *host, int port, const char *username, const char 
     VoltSession session;
     if (open_session(host, port, username, password, private_key_path, known_hosts_path, &session, error, error_len) != 0) return -1;
     int result = volt_sftp_list_with_session(&session, remote_path, max_items, items, count, skipped_unsafe_count, truncated, error, error_len);
+    close_session(&session);
+    return result;
+}
+
+// Keep only one remote directory open at a time. Pending paths live in a temporary
+// file so a broad tree cannot grow an in-memory directory queue without bound.
+static int size_queue_append(FILE *queue, off_t *end, const char *path) {
+    size_t length = strlen(path);
+    if (length == 0 || length >= 4096 || fseeko(queue, *end, SEEK_SET) != 0) return -1;
+    uint32_t stored_length = (uint32_t)length;
+    if (fwrite(&stored_length, sizeof(stored_length), 1, queue) != 1 ||
+        fwrite(path, 1, length, queue) != length) return -1;
+    *end += (off_t)sizeof(stored_length) + (off_t)length;
+    return 0;
+}
+
+static int size_queue_next(FILE *queue, off_t *position, char path[4096]) {
+    if (fseeko(queue, *position, SEEK_SET) != 0) return -1;
+    uint32_t length = 0;
+    if (fread(&length, sizeof(length), 1, queue) != 1 || length == 0 || length >= 4096 ||
+        fread(path, 1, length, queue) != length) return -1;
+    path[length] = '\0';
+    *position += (off_t)sizeof(length) + (off_t)length;
+    return 0;
+}
+
+static int calculate_size_with_session(VoltSession *session, const char *remote_path, int64_t *size,
+                                       VoltSFTPSizeProgressCallback progress, void *context,
+                                       char *error, size_t error_len) {
+    if (!remote_path || !size || strlen(remote_path) == 0 || strlen(remote_path) >= 4096) {
+        set_error(error, error_len, "Invalid remote size request or path exceeds Volt's safety limit.");
+        return -1;
+    }
+    FILE *queue = tmpfile();
+    if (!queue) {
+        set_error(error, error_len, "Could not create temporary remote size queue.");
+        return -1;
+    }
+    LIBSSH2_SFTP_HANDLE *dir = NULL;
+    off_t read_position = 0, write_position = 0;
+    uint64_t directories = 0, entries = 0;
+    int64_t total = 0;
+    int result = -1;
+    char current[4096], name[1024];
+    if (size_queue_append(queue, &write_position, remote_path) != 0) {
+        set_error(error, error_len, "Could not write temporary remote size queue.");
+        goto cleanup;
+    }
+    while (read_position < write_position) {
+        if (progress && progress(directories, entries, total, context) != 0) {
+            set_error(error, error_len, "Remote size calculation cancelled.");
+            goto cleanup;
+        }
+        if (size_queue_next(queue, &read_position, current) != 0) {
+            set_error(error, error_len, "Could not read temporary remote size queue.");
+            goto cleanup;
+        }
+        dir = libssh2_sftp_opendir(session->sftp, current);
+        if (!dir) {
+            set_sftp_error(session, error, error_len, "Could not open remote directory for size calculation.");
+            goto cleanup;
+        }
+        if (directories == UINT64_MAX) {
+            set_error(error, error_len, "Remote size directory count exceeded the supported range.");
+            goto cleanup;
+        }
+        directories++;
+        while (1) {
+            if (progress && progress(directories, entries, total, context) != 0) {
+                set_error(error, error_len, "Remote size calculation cancelled.");
+                goto cleanup;
+            }
+            LIBSSH2_SFTP_ATTRIBUTES attrs;
+            memset(&attrs, 0, sizeof(attrs));
+            int rc = libssh2_sftp_readdir_ex(dir, name, sizeof(name) - 1, NULL, 0, &attrs);
+            if (rc == 0) break;
+            if (rc < 0) {
+                set_sftp_error(session, error, error_len, "Could not read remote directory for size calculation.");
+                goto cleanup;
+            }
+            if (!volt_is_safe_entry_name(name, (size_t)rc)) {
+                set_error(error, error_len, "Remote size calculation found an unsafe entry name.");
+                goto cleanup;
+            }
+            name[rc] = '\0';
+            if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) continue;
+            if (entries == UINT64_MAX) {
+                set_error(error, error_len, "Remote size item count exceeded the supported range.");
+                goto cleanup;
+            }
+            entries++;
+            if (!(attrs.flags & LIBSSH2_SFTP_ATTR_PERMISSIONS)) {
+                set_error(error, error_len, "Remote size calculation found an item without file type metadata.");
+                goto cleanup;
+            }
+            if (LIBSSH2_SFTP_S_ISDIR(attrs.permissions)) {
+                char child[4096];
+                if (join_path(current, name, child, sizeof(child)) != 0) {
+                    set_error(error, error_len, "Remote path exceeds Volt's safety limit.");
+                    goto cleanup;
+                }
+                if (size_queue_append(queue, &write_position, child) != 0) {
+                    set_error(error, error_len, "Could not write temporary remote size queue.");
+                    goto cleanup;
+                }
+            } else if (LIBSSH2_SFTP_S_ISREG(attrs.permissions)) {
+                if (!(attrs.flags & LIBSSH2_SFTP_ATTR_SIZE)) {
+                    set_error(error, error_len, "Remote size calculation found a file without size metadata.");
+                    goto cleanup;
+                }
+                if (attrs.filesize > INT64_MAX || (int64_t)attrs.filesize > INT64_MAX - total) {
+                    set_error(error, error_len, "Remote size calculation exceeded the supported size range.");
+                    goto cleanup;
+                }
+                total += (int64_t)attrs.filesize;
+            }
+            // Symlinks and special files are deliberately not followed or counted.
+        }
+        libssh2_sftp_closedir(dir);
+        dir = NULL;
+    }
+    if (progress && progress(directories, entries, total, context) != 0) {
+        set_error(error, error_len, "Remote size calculation cancelled.");
+        goto cleanup;
+    }
+    *size = total;
+    result = 0;
+cleanup:
+    if (dir) libssh2_sftp_closedir(dir);
+    fclose(queue);
+    return result;
+}
+
+int volt_sftp_calculate_size(const char *host, int port, const char *username, const char *password,
+                             const char *private_key_path, const char *known_hosts_path,
+                             const char *remote_path, int64_t *size, VoltSFTPSizeProgressCallback progress,
+                             void *progress_context, char *error, size_t error_len) {
+    VoltSession session;
+    if (open_session(host, port, username, password, private_key_path, known_hosts_path, &session, error, error_len) != 0) return -1;
+    int result = calculate_size_with_session(&session, remote_path, size, progress, progress_context, error, error_len);
     close_session(&session);
     return result;
 }

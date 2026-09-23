@@ -21,6 +21,7 @@ typedef struct VoltSFTPItem {
 
 typedef int (*VoltSFTPProgressCallback)(uint64_t transferred, uint64_t total, void *context);
 typedef int (*VoltSFTPBatchProgressCallback)(int index, uint64_t transferred, uint64_t total, void *context);
+typedef int (*VoltSFTPSizeProgressCallback)(uint64_t directories, uint64_t entries, int64_t bytes, void *context);
 
 typedef struct VoltSFTPDownloadRequest {
     const char *remote_path;
@@ -61,6 +62,7 @@ int volt_sftp_rename_on(VoltSessionHandle *handle, const char *from_path, const 
 int volt_sftp_remove_on(VoltSessionHandle *handle, const char *remote_path, int is_directory, char *error, size_t error_len);
 
 int volt_sftp_list(const char *host, int port, const char *username, const char *password, const char *private_key_path, const char *known_hosts_path, const char *remote_path, int max_items, VoltSFTPItem **items, int *count, int *skipped_unsafe_count, int *truncated, char *error, size_t error_len);
+int volt_sftp_calculate_size(const char *host, int port, const char *username, const char *password, const char *private_key_path, const char *known_hosts_path, const char *remote_path, int64_t *size, VoltSFTPSizeProgressCallback progress, void *progress_context, char *error, size_t error_len);
 int volt_sftp_upload(const char *host, int port, const char *username, const char *password, const char *private_key_path, const char *known_hosts_path, const char *local_path, const char *remote_path, uint32_t mode, int overwrite, VoltSFTPProgressCallback progress, void *progress_context, char *error, size_t error_len);
 int volt_sftp_download(const char *host, int port, const char *username, const char *password, const char *private_key_path, const char *known_hosts_path, const char *remote_path, const char *local_path, int overwrite, VoltSFTPProgressCallback progress, void *progress_context, char *error, size_t error_len);
 int volt_sftp_download_resume(const char *host, int port, const char *username, const char *password, const char *private_key_path, const char *known_hosts_path, const char *remote_path, const char *partial_path, const char *local_path, int overwrite, int64_t expected_size, int64_t expected_modified, VoltSFTPProgressCallback progress, void *progress_context, char *error, size_t error_len);

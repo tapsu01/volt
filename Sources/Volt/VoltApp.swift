@@ -1204,6 +1204,61 @@ private func transferProgressCallback(
     return control.report(transferred: transferred, total: total) ? 1 : 0
 }
 
+final class RemoteSizeScanControl: @unchecked Sendable {
+    private let lock = NSLock()
+    private var cancelled = false
+    private var lastUpdate = Date.distantPast
+    private let onProgress: @Sendable (UInt64, UInt64, Int64) -> Void
+
+    init(onProgress: @escaping @Sendable (UInt64, UInt64, Int64) -> Void) {
+        self.onProgress = onProgress
+    }
+
+    func cancel() {
+        lock.lock()
+        cancelled = true
+        lock.unlock()
+    }
+
+    var isCancelled: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return cancelled
+    }
+
+    func report(directories: UInt64, entries: UInt64, bytes: Int64) -> Bool {
+        lock.lock()
+        let cancelled = self.cancelled
+        let now = Date()
+        let shouldPublish = now.timeIntervalSince(lastUpdate) >= 0.2
+        if shouldPublish { lastUpdate = now }
+        lock.unlock()
+        if shouldPublish && !cancelled { onProgress(directories, entries, bytes) }
+        return cancelled
+    }
+}
+
+private func remoteSizeProgressCallback(
+    _ directories: UInt64,
+    _ entries: UInt64,
+    _ bytes: Int64,
+    _ context: UnsafeMutableRawPointer?
+) -> Int32 {
+    guard let context else { return 0 }
+    let control = Unmanaged<RemoteSizeScanControl>.fromOpaque(context).takeUnretainedValue()
+    return control.report(directories: directories, entries: entries, bytes: bytes) ? 1 : 0
+}
+
+struct RemoteSizeProgress: Equatable {
+    let id: UUID
+    let tabID: BrowserTab.ID
+    let connectionID: UUID
+    let path: String
+    var directories: UInt64 = 0
+    var entries: UInt64 = 0
+    var bytes: Int64 = 0
+}
+
 final class BatchTransferControl: @unchecked Sendable {
     private let lock = NSLock()
     private weak var parent: TransferControl?
@@ -1555,6 +1610,29 @@ final class SFTPClient: @unchecked Sendable {
         }.value
     }
 
+    func calculateRemoteSize(connection: SavedConnection, credential: SensitiveCredential, path: String,
+                             control: RemoteSizeScanControl) async throws -> Int64 {
+        try await withTaskCancellationHandler {
+            try await Task.detached(priority: .userInitiated) {
+                let context = Unmanaged.passRetained(control).toOpaque()
+                defer { Unmanaged<RemoteSizeScanControl>.fromOpaque(context).release() }
+                var size: Int64 = 0
+                _ = try self.call(connection: connection, credential: credential) {
+                    host, port, username, password, keyPath, knownHosts, error, errorLength in
+                    path.withCString { remotePath in
+                        volt_sftp_calculate_size(host, port, username, password, keyPath, knownHosts,
+                                                 remotePath, &size, remoteSizeProgressCallback, context,
+                                                 error, errorLength)
+                    }
+                }
+                if control.isCancelled { throw CancellationError() }
+                return size
+            }.value
+        } onCancel: {
+            control.cancel()
+        }
+    }
+
     func upload(connection: SavedConnection, credential: SensitiveCredential, localPath: String, remotePath: String, policy: UploadPublishPolicy, control: TransferControl) async throws -> String? {
         try await Task.detached {
             let context = Unmanaged.passRetained(control).toOpaque()
@@ -1888,7 +1966,13 @@ final class AppModel: ObservableObject {
     @Published var connections: [SavedConnection] = []
     @Published var tabs: [BrowserTab] = [BrowserTab()]
     @Published var selectedTabID: BrowserTab.ID?
-    @Published var selectedConnectionID: UUID?
+    @Published var selectedConnectionID: UUID? {
+        didSet {
+            if let scan = remoteSizeProgress, selectedConnectionID != scan.connectionID {
+                cancelRemoteSizeCalculation(showStatus: false)
+            }
+        }
+    }
     @Published var connectionDraft = SavedConnection()
 
     @Published var localPath = FileManager.default.homeDirectoryForCurrentUser.path
@@ -1896,7 +1980,13 @@ final class AppModel: ObservableObject {
     @Published var localItems: [FileItem] = []
     @Published var remoteItems: [FileItem] = []
     @Published var selectedLocalIDs: Set<FileItem.ID> = []
-    @Published var selectedRemoteIDs: Set<FileItem.ID> = []
+    @Published var selectedRemoteIDs: Set<FileItem.ID> = [] {
+        didSet {
+            if remoteSizeProgress != nil, oldValue != selectedRemoteIDs {
+                cancelRemoteSizeCalculation(showStatus: false)
+            }
+        }
+    }
     @Published var localBrowserPreferences = FileBrowserPreferences.load(key: "Volt.LocalBrowserPreferences") {
         didSet {
             let oldNeedsMetadata = Self.needsLocalOwnerGroupPermissions(for: oldValue)
@@ -1940,6 +2030,7 @@ final class AppModel: ObservableObject {
     @Published var remoteSearchResults: [RemoteSearchResult] = []
     @Published var isSearchingRemote = false
     @Published var remoteSearchStatus = ""
+    @Published var remoteSizeProgress: RemoteSizeProgress?
     private var hostKeyConfirmationContinuation: CheckedContinuation<Bool, Never>?
     private var tabCredentials: [BrowserTab.ID: SensitiveCredential] = [:]
     private var terminalSessions: [BrowserTab.ID: SSHTerminalSession] = [:]
@@ -1951,6 +2042,8 @@ final class AppModel: ObservableObject {
     private var pendingConnectAfterEditorDismiss: (tabID: BrowserTab.ID, connectionID: UUID)?
     private var syncPreviewTask: Task<Void, Never>?
     private var remoteSearchTask: Task<Void, Never>?
+    private var remoteSizeTask: Task<Void, Never>?
+    private var remoteSizeControl: RemoteSizeScanControl?
 
     private let sftp = SFTPClient()
     private let transferLimiter = TransferLimiter(limit: TransferTuning.maxConcurrentTransfers)
@@ -2058,81 +2151,68 @@ final class AppModel: ObservableObject {
                 reportError(error, operation: "Calculating size", context: failureContext)
             }
         } else {
-            guard let connection = selectedConnection else { return }
-            let credential = credentialForCurrentTab().clone()
+            startRemoteSizeCalculation(for: item)
+        }
+    }
 
+    func startRemoteSizeCalculation(for item: FileItem) {
+        guard item.isDirectory, selectedRemoteIDs.contains(item.id),
+              let connection = selectedConnection, let tabID = selectedTabID else { return }
+        cancelRemoteSizeCalculation(showStatus: false)
+        let request = RemoteSizeProgress(id: UUID(), tabID: tabID, connectionID: connection.id, path: item.path)
+        let credential = credentialForCurrentTab().clone()
+        var failureContext = errorContext()
+        failureContext.remotePath = item.path
+        let control = RemoteSizeScanControl { [weak self] directories, entries, bytes in
+            Task { @MainActor [weak self] in
+                guard let self, var progress = self.remoteSizeProgress,
+                      progress.id == request.id else { return }
+                progress.directories = directories
+                progress.entries = entries
+                progress.bytes = bytes
+                self.remoteSizeProgress = progress
+            }
+        }
+        remoteSizeControl = control
+        remoteSizeProgress = request
+        remoteSizeTask = Task {
             do {
-                let sizeBytes = try await remoteRecursiveSize(
-                    connection: connection,
-                    credential: credential,
-                    item: item
-                )
-                await MainActor.run {
-                    if let index = self.remoteItems.firstIndex(where: { $0.id == item.id }) {
-                        self.remoteItems[index].size = sizeBytes
-                        self.syncCurrentTab()
-                    }
-                }
+                let size = try await sftp.calculateRemoteSize(connection: connection, credential: credential,
+                                                               path: item.path, control: control)
+                try Task.checkCancellation()
+                guard remoteSizeProgress?.id == request.id else { return }
+                remoteSizeTask = nil
+                remoteSizeControl = nil
+                remoteSizeProgress = nil
+                guard selectedTabID == tabID, selectedConnectionID == connection.id,
+                      selectedRemoteIDs.contains(item.id),
+                      let index = remoteItems.firstIndex(where: { $0.id == item.id }) else { return }
+                remoteItems[index].size = size
+                syncCurrentTab()
+            } catch is CancellationError {
+                guard remoteSizeProgress?.id == request.id else { return }
+                remoteSizeTask = nil
+                remoteSizeControl = nil
+                remoteSizeProgress = nil
             } catch {
+                guard remoteSizeProgress?.id == request.id else { return }
+                remoteSizeTask = nil
+                remoteSizeControl = nil
+                remoteSizeProgress = nil
                 status = error.localizedDescription
                 reportError(error, operation: "Calculating size", context: failureContext)
             }
         }
     }
 
-    private func remoteRecursiveSize(
-        connection: SavedConnection,
-        credential: SensitiveCredential,
-        item: FileItem
-    ) async throws -> Int64 {
-        if !item.isDirectory {
-            return item.size ?? 0
-        }
-        let state = TraversalState(scope: "Remote size calculation")
-        return try await remoteRecursiveSize(
-            connection: connection,
-            credential: credential,
-            path: item.path,
-            state: state,
-            depth: 0
-        )
-    }
-
-    private func remoteRecursiveSize(
-        connection: SavedConnection,
-        credential: SensitiveCredential,
-        path: String,
-        state: TraversalState,
-        depth: Int
-    ) async throws -> Int64 {
-        try state.visitDirectory(depth: depth)
-        let result = try await sftp.list(connection: connection, credential: credential, path: path)
-        try requireCompleteListing(result, path: path, operation: "Remote size calculation")
-        try state.visitEntries(result.items.count)
-        var total: Int64 = 0
-        for child in result.items {
-            try Task.checkCancellation()
-            let childSize: Int64
-            if child.isDirectory {
-                childSize = try await remoteRecursiveSize(
-                    connection: connection,
-                    credential: credential,
-                    path: child.path,
-                    state: state,
-                    depth: depth + 1
-                )
-            } else if child.isRegularFile {
-                childSize = child.size ?? 0
-            } else {
-                continue
-            }
-            let (nextTotal, overflow) = total.addingReportingOverflow(childSize)
-            guard !overflow else {
-                throw AppError.commandFailed("Remote size calculation exceeded the supported size range.")
-            }
-            total = nextTotal
-        }
-        return total
+    func cancelRemoteSizeCalculation(showStatus: Bool = true) {
+        guard remoteSizeProgress != nil else { return }
+        remoteSizeControl?.cancel()
+        remoteSizeTask?.cancel()
+        remoteSizeTask = nil
+        remoteSizeControl = nil
+        remoteSizeProgress = nil
+        if showStatus { status = "Remote size calculation cancelled" }
     }
 
     nonisolated static func collectLocalSyncEntries(
@@ -2305,6 +2385,7 @@ final class AppModel: ObservableObject {
             guard confirmDiscardEditSessions(tab.remoteEditSessions, action: "close this tab") else { return }
             cleanupEditSessions(tab.remoteEditSessions)
         }
+        if remoteSizeProgress?.tabID == id { cancelRemoteSizeCalculation(showStatus: false) }
         stopTerminal(for: id)
         tabCredentials.removeValue(forKey: id)?.clear()
         let index = tabs.firstIndex { $0.id == id } ?? 0
@@ -2347,6 +2428,7 @@ final class AppModel: ObservableObject {
         let others = tabs.filter { $0.id != id }
         guard !others.isEmpty else { return }
         guard confirmDiscardEditSessions(others.flatMap(\.remoteEditSessions), action: "close other tabs") else { return }
+        if let scan = remoteSizeProgress, scan.tabID != id { cancelRemoteSizeCalculation(showStatus: false) }
         if selectedTabID != id { selectTab(id) }
         for tab in others {
             cleanupEditSessions(tab.remoteEditSessions)
@@ -2358,6 +2440,7 @@ final class AppModel: ObservableObject {
 
     func selectTab(_ id: BrowserTab.ID) {
         guard tabs.contains(where: { $0.id == id }) else { return }
+        if selectedTabID != id { cancelRemoteSizeCalculation(showStatus: false) }
         syncCurrentTab()
         selectedTabID = id
         restoreCurrentTab()
@@ -2537,6 +2620,7 @@ final class AppModel: ObservableObject {
             .filter { targetTabIDs.contains($0.id) }
             .flatMap(\.remoteEditSessions)
         guard confirmDiscardEditSessions(sessions, action: "disconnect") else { return }
+        if remoteSizeProgress?.connectionID == targetConnectionID { cancelRemoteSizeCalculation(showStatus: false) }
 
         for tabID in targetTabIDs {
             if let index = tabs.firstIndex(where: { $0.id == tabID }) {
@@ -5378,6 +5462,7 @@ final class AppModel: ObservableObject {
     }
 
     func prepareForTermination() {
+        cancelRemoteSizeCalculation(showStatus: false)
         syncPreviewTask?.cancel()
         remoteSearchTask?.cancel()
         for control in transferControls.values { control.cancel() }
@@ -8305,7 +8390,9 @@ struct InspectorView: View {
                     
                     if let remote = model.selectedRemote {
                         InspectorSection(title: "Remote Item", item: remote, isLocal: false, onCalculateSize: {
-                            await model.calculateSize(for: remote, isLocal: false)
+                            model.startRemoteSizeCalculation(for: remote)
+                        }, remoteSizeProgress: model.remoteSizeProgress, onCancelSize: {
+                            model.cancelRemoteSizeCalculation()
                         })
                     }
                     
@@ -8327,6 +8414,8 @@ struct InspectorSection: View {
     var item: FileItem
     var isLocal: Bool
     var onCalculateSize: () async -> Void
+    var remoteSizeProgress: RemoteSizeProgress? = nil
+    var onCancelSize: (() -> Void)? = nil
     @State private var isExpanded = true
     @State private var isCalculatingSize = false
 
@@ -8380,6 +8469,17 @@ struct InspectorSection: View {
                             + Text("(\(ByteCountFormatter.string(fromByteCount: size, countStyle: .file)) on disk)")
                                 .font(.subheadline)
                                 .foregroundStyle(.secondary)
+                        } else if !isLocal, let progress = remoteSizeProgress, progress.path == item.path {
+                            VStack(alignment: .leading, spacing: 6) {
+                                HStack {
+                                    ProgressView().controlSize(.small)
+                                    Text("Calculating...").font(.subheadline).foregroundStyle(.secondary)
+                                }
+                                Text("\(progress.directories) folders, \(progress.entries) items, \(ByteCountFormatter.string(fromByteCount: progress.bytes, countStyle: .file)) scanned")
+                                    .font(.caption).foregroundStyle(.secondary)
+                                Button("Cancel") { onCancelSize?() }
+                                    .buttonStyle(.link)
+                            }
                         } else if isCalculatingSize {
                             HStack {
                                 ProgressView().controlSize(.small)
@@ -8387,10 +8487,10 @@ struct InspectorSection: View {
                             }
                         } else {
                             Button("Calculate Size") {
-                                isCalculatingSize = true
+                                if isLocal { isCalculatingSize = true }
                                 Task {
                                     await onCalculateSize()
-                                    isCalculatingSize = false
+                                    if isLocal { isCalculatingSize = false }
                                 }
                             }
                             .buttonStyle(.link)
