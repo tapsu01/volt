@@ -18,7 +18,7 @@ use in daily file-transfer workflows.
 Install the native dependencies:
 
 ```bash
-brew install libssh2 openssl@3
+brew install libssh2
 ```
 
 Build the app:

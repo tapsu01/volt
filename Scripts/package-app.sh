@@ -29,10 +29,10 @@ else
 fi
 
 LIBSSH2_PREFIX="$($BREW --prefix libssh2)"
-OPENSSL_PREFIX="$($BREW --prefix openssl@3)"
+. "$ROOT_DIR/Scripts/lib/openssl-env.sh"
 LIBSSH2_SOURCE="$LIBSSH2_PREFIX/lib/libssh2.1.dylib"
-SSL_SOURCE="$OPENSSL_PREFIX/lib/libssl.3.dylib"
-CRYPTO_SOURCE="$OPENSSL_PREFIX/lib/libcrypto.3.dylib"
+SSL_SOURCE="$OPENSSL_PREFIX/lib/$SSL_LIB_NAME"
+CRYPTO_SOURCE="$OPENSSL_PREFIX/lib/$CRYPTO_LIB_NAME"
 SWIFTPM_HOME="${VOLT_SWIFTPM_HOME:-${TMPDIR:-/tmp}/volt-swiftpm-home}"
 MODULE_CACHE="${VOLT_MODULE_CACHE:-${TMPDIR:-/tmp}/volt-clang-module-cache}"
 /bin/mkdir -p "$SWIFTPM_HOME" "$MODULE_CACHE"
@@ -63,27 +63,38 @@ BUILD_DIR="$(/usr/bin/env PATH="$PATH" VOLT_LIBSSH2_PREFIX="$VOLT_LIBSSH2_PREFIX
 /bin/mkdir -p "$MACOS_DIR" "$FRAMEWORKS_DIR" "$LICENSES_DIR"
 /bin/cp "$BUILD_DIR/Volt" "$MACOS_DIR/Volt"
 /bin/cp -L "$LIBSSH2_SOURCE" "$FRAMEWORKS_DIR/libssh2.1.dylib"
-/bin/cp -L "$SSL_SOURCE" "$FRAMEWORKS_DIR/libssl.3.dylib"
-/bin/cp -L "$CRYPTO_SOURCE" "$FRAMEWORKS_DIR/libcrypto.3.dylib"
+/bin/cp -L "$SSL_SOURCE" "$FRAMEWORKS_DIR/$SSL_LIB_NAME"
+/bin/cp -L "$CRYPTO_SOURCE" "$FRAMEWORKS_DIR/$CRYPTO_LIB_NAME"
 /bin/chmod u+w "$MACOS_DIR/Volt" "$FRAMEWORKS_DIR"/*.dylib
 
 check_architecture "$MACOS_DIR/Volt"
 check_architecture "$FRAMEWORKS_DIR/libssh2.1.dylib"
-check_architecture "$FRAMEWORKS_DIR/libssl.3.dylib"
-check_architecture "$FRAMEWORKS_DIR/libcrypto.3.dylib"
+check_architecture "$FRAMEWORKS_DIR/$SSL_LIB_NAME"
+check_architecture "$FRAMEWORKS_DIR/$CRYPTO_LIB_NAME"
 
 EXECUTABLE_LIBSSH2_PATH="$(/usr/bin/otool -L "$MACOS_DIR/Volt" | /usr/bin/awk '/libssh2\.1\.dylib/{print $1; exit}')"
-LIBSSH2_SSL_PATH="$(/usr/bin/otool -L "$FRAMEWORKS_DIR/libssh2.1.dylib" | /usr/bin/awk '/libssl\.3\.dylib/{print $1; exit}')"
-LIBSSH2_CRYPTO_PATH="$(/usr/bin/otool -L "$FRAMEWORKS_DIR/libssh2.1.dylib" | /usr/bin/awk '/libcrypto\.3\.dylib/{print $1; exit}')"
-SSL_CRYPTO_PATH="$(/usr/bin/otool -L "$FRAMEWORKS_DIR/libssl.3.dylib" | /usr/bin/awk '/libcrypto\.3\.dylib/{print $1; exit}')"
+LIBSSH2_SSL_PATH="$(/usr/bin/otool -L "$FRAMEWORKS_DIR/libssh2.1.dylib" | /usr/bin/awk '/\/libssl\.[0-9]+\.dylib/{print $1; exit}')"
+LIBSSH2_CRYPTO_PATH="$(/usr/bin/otool -L "$FRAMEWORKS_DIR/libssh2.1.dylib" | /usr/bin/awk '/\/libcrypto\.[0-9]+\.dylib/{print $1; exit}')"
+SSL_CRYPTO_PATH="$(/usr/bin/otool -L "$FRAMEWORKS_DIR/$SSL_LIB_NAME" | /usr/bin/awk '/\/libcrypto\.[0-9]+\.dylib/{print $1; exit}')"
+
+require_load_command() {
+  if [ -z "$2" ]; then
+    /usr/bin/printf 'Could not find %s load command in %s\n' "$1" "$3" >&2
+    exit 1
+  fi
+}
+require_load_command libssh2 "$EXECUTABLE_LIBSSH2_PATH" "$MACOS_DIR/Volt"
+require_load_command libssl "$LIBSSH2_SSL_PATH" "$FRAMEWORKS_DIR/libssh2.1.dylib"
+require_load_command libcrypto "$LIBSSH2_CRYPTO_PATH" "$FRAMEWORKS_DIR/libssh2.1.dylib"
+require_load_command libcrypto "$SSL_CRYPTO_PATH" "$FRAMEWORKS_DIR/$SSL_LIB_NAME"
 
 /usr/bin/install_name_tool -change "$EXECUTABLE_LIBSSH2_PATH" "@executable_path/../Frameworks/libssh2.1.dylib" "$MACOS_DIR/Volt"
 /usr/bin/install_name_tool -id "@rpath/libssh2.1.dylib" "$FRAMEWORKS_DIR/libssh2.1.dylib"
-/usr/bin/install_name_tool -change "$LIBSSH2_SSL_PATH" "@loader_path/libssl.3.dylib" "$FRAMEWORKS_DIR/libssh2.1.dylib"
-/usr/bin/install_name_tool -change "$LIBSSH2_CRYPTO_PATH" "@loader_path/libcrypto.3.dylib" "$FRAMEWORKS_DIR/libssh2.1.dylib"
-/usr/bin/install_name_tool -id "@rpath/libssl.3.dylib" "$FRAMEWORKS_DIR/libssl.3.dylib"
-/usr/bin/install_name_tool -change "$SSL_CRYPTO_PATH" "@loader_path/libcrypto.3.dylib" "$FRAMEWORKS_DIR/libssl.3.dylib"
-/usr/bin/install_name_tool -id "@rpath/libcrypto.3.dylib" "$FRAMEWORKS_DIR/libcrypto.3.dylib"
+/usr/bin/install_name_tool -change "$LIBSSH2_SSL_PATH" "@loader_path/$SSL_LIB_NAME" "$FRAMEWORKS_DIR/libssh2.1.dylib"
+/usr/bin/install_name_tool -change "$LIBSSH2_CRYPTO_PATH" "@loader_path/$CRYPTO_LIB_NAME" "$FRAMEWORKS_DIR/libssh2.1.dylib"
+/usr/bin/install_name_tool -id "@rpath/$SSL_LIB_NAME" "$FRAMEWORKS_DIR/$SSL_LIB_NAME"
+/usr/bin/install_name_tool -change "$SSL_CRYPTO_PATH" "@loader_path/$CRYPTO_LIB_NAME" "$FRAMEWORKS_DIR/$SSL_LIB_NAME"
+/usr/bin/install_name_tool -id "@rpath/$CRYPTO_LIB_NAME" "$FRAMEWORKS_DIR/$CRYPTO_LIB_NAME"
 
 /bin/cp "$ROOT_DIR/Support/Info.plist" "$CONTENTS_DIR/Info.plist"
 /bin/cp "$ROOT_DIR/Support/VoltIcon.png" "$RESOURCES_DIR/VoltIcon.png"
@@ -100,15 +111,15 @@ sign_code() {
   fi
 }
 
-sign_code "$FRAMEWORKS_DIR/libcrypto.3.dylib"
-sign_code "$FRAMEWORKS_DIR/libssl.3.dylib"
+sign_code "$FRAMEWORKS_DIR/$CRYPTO_LIB_NAME"
+sign_code "$FRAMEWORKS_DIR/$SSL_LIB_NAME"
 sign_code "$FRAMEWORKS_DIR/libssh2.1.dylib"
 
 LIBSSH2_VERSION="$($BREW list --versions libssh2 | /usr/bin/awk '{print $2; exit}')"
-OPENSSL_VERSION="$($BREW list --versions openssl@3 | /usr/bin/awk '{print $2; exit}')"
+OPENSSL_VERSION="$($BREW list --versions "$OPENSSL_FORMULA" | /usr/bin/awk '{print $2; exit}')"
 LIBSSH2_SHA="$(/usr/bin/shasum -a 256 "$FRAMEWORKS_DIR/libssh2.1.dylib" | /usr/bin/awk '{print $1}')"
-SSL_SHA="$(/usr/bin/shasum -a 256 "$FRAMEWORKS_DIR/libssl.3.dylib" | /usr/bin/awk '{print $1}')"
-CRYPTO_SHA="$(/usr/bin/shasum -a 256 "$FRAMEWORKS_DIR/libcrypto.3.dylib" | /usr/bin/awk '{print $1}')"
+SSL_SHA="$(/usr/bin/shasum -a 256 "$FRAMEWORKS_DIR/$SSL_LIB_NAME" | /usr/bin/awk '{print $1}')"
+CRYPTO_SHA="$(/usr/bin/shasum -a 256 "$FRAMEWORKS_DIR/$CRYPTO_LIB_NAME" | /usr/bin/awk '{print $1}')"
 MANIFEST_PATH="$RESOURCES_DIR/DependencyManifest.json"
 BUILD_INFO_PATH="$RESOURCES_DIR/BuildInfo.txt"
 SWIFT_VERSION="$(/usr/bin/swift --version | /usr/bin/head -n 1)"
@@ -125,8 +136,8 @@ fi
   '  "hashStage": "after-install-name-tool-and-dylib-signing",' \
   '  "dependencies": [' \
   "    {\"name\": \"libssh2\", \"version\": \"$LIBSSH2_VERSION\", \"sha256\": \"$LIBSSH2_SHA\", \"buildProvider\": \"homebrew/core\", \"source\": \"https://github.com/Homebrew/homebrew-core/blob/HEAD/Formula/lib/libssh2.rb\"}," \
-  "    {\"name\": \"libssl\", \"version\": \"$OPENSSL_VERSION\", \"sha256\": \"$SSL_SHA\", \"buildProvider\": \"homebrew/core\", \"source\": \"https://github.com/openssl/openssl\"}," \
-  "    {\"name\": \"libcrypto\", \"version\": \"$OPENSSL_VERSION\", \"sha256\": \"$CRYPTO_SHA\", \"buildProvider\": \"homebrew/core\", \"source\": \"https://github.com/openssl/openssl\"}" \
+  "    {\"name\": \"libssl\", \"file\": \"$SSL_LIB_NAME\", \"formula\": \"$OPENSSL_FORMULA\", \"version\": \"$OPENSSL_VERSION\", \"sha256\": \"$SSL_SHA\", \"buildProvider\": \"homebrew/core\", \"source\": \"https://github.com/openssl/openssl\"}," \
+  "    {\"name\": \"libcrypto\", \"file\": \"$CRYPTO_LIB_NAME\", \"formula\": \"$OPENSSL_FORMULA\", \"version\": \"$OPENSSL_VERSION\", \"sha256\": \"$CRYPTO_SHA\", \"buildProvider\": \"homebrew/core\", \"source\": \"https://github.com/openssl/openssl\"}" \
   '  ]' \
   '}' > "$MANIFEST_PATH"
 
@@ -139,6 +150,7 @@ fi
   "notarized=$([ -n "${NOTARY_PROFILE:-}" ] && /usr/bin/printf yes || /usr/bin/printf no)" \
   "libssh2.version=$LIBSSH2_VERSION" \
   "libssh2.sha256=$LIBSSH2_SHA" \
+  "openssl.formula=$OPENSSL_FORMULA" \
   "openssl.version=$OPENSSL_VERSION" \
   "libssl.sha256=$SSL_SHA" \
   "libcrypto.sha256=$CRYPTO_SHA" \

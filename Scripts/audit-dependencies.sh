@@ -11,8 +11,12 @@ else
   exit 1
 fi
 
+ROOT_DIR="$(cd "$(/usr/bin/dirname "$0")/.." && pwd)"
+LIBSSH2_PREFIX="$($BREW --prefix libssh2)"
+. "$ROOT_DIR/Scripts/lib/openssl-env.sh"
+
 set +e
-OUTDATED="$($BREW outdated --formula libssh2 openssl@3)"
+OUTDATED="$($BREW outdated --formula libssh2 "$OPENSSL_FORMULA")"
 OUTDATED_STATUS=$?
 set -e
 if [ -n "$OUTDATED" ]; then
@@ -24,5 +28,6 @@ if [ "$OUTDATED_STATUS" -ne 0 ]; then
   exit 1
 fi
 
-$BREW list --versions libssh2 openssl@3
+$BREW list --versions libssh2 "$OPENSSL_FORMULA"
+/usr/bin/printf 'libssh2 links against %s (%s, %s)\n' "$OPENSSL_FORMULA" "$SSL_LIB_NAME" "$CRYPTO_LIB_NAME"
 /usr/bin/printf 'Bundled SSH/crypto dependencies are current in Homebrew. Review upstream advisories before each release.\n'

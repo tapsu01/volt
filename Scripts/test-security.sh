@@ -13,7 +13,7 @@ else
 fi
 
 LIBSSH2_PREFIX="$($BREW --prefix libssh2)"
-OPENSSL_PREFIX="$($BREW --prefix openssl@3)"
+. "$ROOT_DIR/Scripts/lib/openssl-env.sh"
 OUTPUT="${TMPDIR:-/tmp}/volt-host-key-store-test"
 SANITIZER_FLAGS="${VOLT_TEST_SANITIZER_FLAGS:--fsanitize=address,undefined -fno-omit-frame-pointer}"
 ASAN_OPTIONS_VALUE="${ASAN_OPTIONS:-detect_leaks=0:halt_on_error=1}"
