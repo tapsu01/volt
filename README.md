@@ -101,12 +101,14 @@ completed count and refreshes affected directories after the upload batch ends.
 - macOS 15 Sequoia or later.
 - Swift 6 with Xcode 16, or matching Command Line Tools.
 - Homebrew.
-- Native-architecture Homebrew installations of `libssh2` and `openssl@3`.
+- A native-architecture Homebrew installation of `libssh2`. Homebrew pulls in the
+  OpenSSL formula that `libssh2` is linked against (currently `openssl@4`), and
+  the packaging scripts bundle exactly that OpenSSL major version.
 
 Install the required libraries:
 
 ```bash
-brew install libssh2 openssl@3
+brew install libssh2
 ```
 
 Volt currently builds for the native `arm64` or `x86_64` architecture of the

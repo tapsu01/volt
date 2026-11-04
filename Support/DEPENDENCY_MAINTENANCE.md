@@ -3,6 +3,9 @@
 Volt bundles libssh2 and OpenSSL. Before every release and at least monthly:
 
 1. Run `Scripts/audit-dependencies.sh`.
+   The scripts detect which `openssl@N` formula the Homebrew `libssh2` dylib links
+   against (`Scripts/lib/openssl-env.sh`) and bundle that version. When `libssh2`
+   bumps its revision, check `brew deps libssh2` for an OpenSSL major-version change.
 2. Review the official libssh2 and OpenSSL security advisories.
 3. Upgrade patched dependencies and run `Scripts/test-security.sh`.
 4. Rebuild with `Scripts/package-app.sh`.
