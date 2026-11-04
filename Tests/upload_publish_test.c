@@ -29,11 +29,11 @@ static unsigned long fake_sftp_last_error(LIBSSH2_SFTP *sftp);
 
 static char temporary[4096], staged[128], destination[128];
 static int rename_reply, rename_calls, cleanup_calls, posix_calls;
-static int permission_reply, fail_write, fail_close, cancel_before_publish;
+static int permission_reply, fail_write, fail_close, cancel_before_publish, fail_open;
 static int progress_calls, file_closed;
 static int fake_last_errno(LIBSSH2_SESSION *session) {
     (void)session;
-    return (rename_reply == LIBSSH2_ERROR_SFTP_PROTOCOL || fail_write || fail_close) ? LIBSSH2_ERROR_SFTP_PROTOCOL : rename_reply;
+    return (rename_reply == LIBSSH2_ERROR_SFTP_PROTOCOL || fail_write || fail_close || fail_open) ? LIBSSH2_ERROR_SFTP_PROTOCOL : rename_reply;
 }
 static unsigned long fake_sftp_last_error(LIBSSH2_SFTP *sftp) {
     (void)sftp;
@@ -45,15 +45,16 @@ static void reset(void) {
     temporary[0] = staged[0] = '\0';
     strcpy(destination, "old contents");
     rename_reply = rename_calls = cleanup_calls = posix_calls = 0;
-    permission_reply = fail_write = fail_close = cancel_before_publish = progress_calls = file_closed = 0;
+    permission_reply = fail_write = fail_close = cancel_before_publish = progress_calls = file_closed = fail_open = 0;
 }
 
 static LIBSSH2_SFTP_HANDLE *fake_open(LIBSSH2_SFTP *sftp, const char *path, unsigned int length,
                                       unsigned long flags, long mode, int type) {
     (void)sftp; (void)mode; (void)type;
     assert(length < sizeof(temporary));
-    assert(strstr(path, "/destination.volt-part-") == path);
+    assert(strstr(path, "/destination.volt-part-"));
     assert(flags & LIBSSH2_FXF_EXCL);
+    if (fail_open) return NULL; // folder refuses new files; nothing was created
     strcpy(temporary, path);
     return (LIBSSH2_SFTP_HANDLE *)&temporary;
 }
@@ -150,6 +151,17 @@ int main(void) {
     assert(volt_sftp_upload_on(&session, local, "/destination", 0600, 1,
                               progress, NULL, error, sizeof(error)) == VOLT_SFTP_PERMISSION_WARNING);
     assert(strcmp(destination, "new contents") == 0);
+
+    reset(); fail_open = 1;
+    assert(volt_sftp_upload_on(&session, local, "/site/app/destination", 0600, 1,
+                              progress, NULL, error, sizeof(error)) < 0);
+    assert(rename_calls == 0 && cleanup_calls == 0 && strcmp(destination, "old contents") == 0);
+    assert(strstr(error, "in /site/app.") && strstr(error, "Permission denied (SFTP 3)"));
+    assert(strstr(error, "write permission on that folder"));
+    reset(); fail_open = 1;
+    assert(volt_sftp_upload_on(&session, local, "/destination", 0600, 0,
+                              progress, NULL, error, sizeof(error)) < 0);
+    assert(strstr(error, "in /.") && cleanup_calls == 0);
 
     reset(); fail_write = 1;
     assert(volt_sftp_upload_on(&session, local, "/destination", 0600, 1,

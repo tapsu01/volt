@@ -73,7 +73,10 @@ configuration files.
   upload or discard.
 - Configurable permission presets for newly created or uploaded remote items.
 
-Uploads are published from a temporary file in the destination directory.
+Uploads are published from a temporary file in the destination directory, so
+the SFTP account needs write permission on that directory, not only on the file
+being replaced. If the directory refuses new files, the server answers
+Permission denied and Volt names the directory that needs write permission.
 Replacing an existing file requires the server's POSIX rename extension; Volt
 reports an error if safe replacement is rejected and never deletes the existing
 file as a fallback. If the connection is lost during publication, the outcome

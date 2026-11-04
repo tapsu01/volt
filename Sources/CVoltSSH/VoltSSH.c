@@ -927,6 +927,30 @@ static void upload_cleanup(void *context, const char *temporary_path) {
     libssh2_sftp_unlink(session->sftp, temporary_path);
 }
 
+/* The temporary upload file lives beside its destination, so a denied open is a
+ * folder permission problem even when the destination file itself is writable.
+ * Capture the server status before any other SFTP call. */
+static void set_temporary_upload_open_error(VoltSession *session, const char *remote_path, char *error, size_t error_len) {
+    if (libssh2_session_last_errno(session->session) != LIBSSH2_ERROR_SFTP_PROTOCOL
+        || libssh2_sftp_last_error(session->sftp) != LIBSSH2_FX_PERMISSION_DENIED) {
+        set_sftp_error(session, error, error_len, "Could not create temporary remote upload file.");
+        return;
+    }
+    if (!error || !error_len) return;
+    char technical[512];
+    set_session_error(session->session, technical, sizeof(technical), "");
+    const char *directory = remote_path;
+    const char *separator = strrchr(remote_path, '/');
+    int directory_length = 1;
+    if (!separator) directory = ".";
+    else if (separator != remote_path) directory_length = (int)(separator - remote_path);
+    snprintf(error, error_len,
+             "Could not create temporary remote upload file in %.*s. Permission denied (SFTP %lu). "
+             "Volt uploads through a temporary file in the destination folder, so the SFTP user needs "
+             "write permission on that folder, not only on the file. %s",
+             directory_length, directory, (unsigned long)LIBSSH2_FX_PERMISSION_DENIED, technical);
+}
+
 static int upload_file_with_session(VoltSession *session, const char *local_path, const char *remote_path, uint32_t mode, int overwrite, VoltSFTPProgressCallback progress, void *progress_context, char *error, size_t error_len) {
     if (progress && progress(0, 0, progress_context) != 0) {
         set_error(error, error_len, "Transfer cancelled.");
@@ -963,7 +987,7 @@ static int upload_file_with_session(VoltSession *session, const char *local_path
     );
     if (!file) {
         fclose(input);
-        set_sftp_error(session, error, error_len, "Could not create temporary remote upload file.");
+        set_temporary_upload_open_error(session, remote_path, error, error_len);
         return -1;
     }
     char buffer[VOLT_SFTP_TRANSFER_BUFFER_SIZE];
