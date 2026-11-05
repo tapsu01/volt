@@ -3317,8 +3317,7 @@ final class AppModel: ObservableObject {
 
     func remoteUp() {
         guard remotePath != "/" else { return }
-        let parent = URL(fileURLWithPath: remotePath).deletingLastPathComponent().path
-        remotePath = parent.isEmpty ? "/" : parent
+        remotePath = remoteParentPath(remotePath) ?? "/"
         noteRecentActivity()
         loadCurrentRemotePathUsingCache()
     }
@@ -4866,15 +4865,23 @@ final class AppModel: ObservableObject {
         })
     }
 
+    // Item có thể là entry REMOTE: không được chạm file system cục bộ. `URL(fileURLWithPath:)` không có
+    // `isDirectory:` sẽ stat() path trên máy Mac; với path dạng /home/<tên> macOS kích hoạt autofs
+    // (auto_home) mất ~100ms mỗi lần, và hàm này chạy cho từng row mỗi lần render context menu.
+    private static func pathURL(for item: FileItem) -> URL {
+        URL(fileURLWithPath: item.path, isDirectory: item.isDirectory)
+    }
+
     func defaultApplicationExtension(for item: FileItem) -> String? {
-        let url = URL(fileURLWithPath: item.path)
-        guard !item.isDirectory, fileApplications.hasDefault(for: url) else { return nil }
+        guard !item.isDirectory else { return nil }
+        let url = Self.pathURL(for: item)
+        guard fileApplications.hasDefault(for: url) else { return nil }
         return FileApplicationPreferences.fileExtension(for: url)
     }
 
     func resetDefaultApplication(for item: FileItem) {
         objectWillChange.send()
-        fileApplications.reset(for: URL(fileURLWithPath: item.path))
+        fileApplications.reset(for: Self.pathURL(for: item))
         status = "Default application reset for \(item.name)."
     }
 
@@ -5580,7 +5587,8 @@ final class AppModel: ObservableObject {
     }
 
     private func remoteParentPath(_ path: String) -> String? {
-        let parent = URL(fileURLWithPath: path).deletingLastPathComponent().path
+        // Path remote: chỉ thao tác chuỗi, không dùng URL(fileURLWithPath:) vì nó stat() file system cục bộ.
+        let parent = (path as NSString).deletingLastPathComponent
         return parent.isEmpty ? "/" : parent
     }
 

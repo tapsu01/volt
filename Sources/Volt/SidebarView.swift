@@ -112,7 +112,7 @@ struct SidebarView: View {
                         } else {
                             recentRow(title: URL(fileURLWithPath: model.localPath).lastPathComponent.isEmpty ? model.localPath : URL(fileURLWithPath: model.localPath).lastPathComponent, subtitle: model.localPath, systemImage: "folder.fill")
                             if model.isConnected {
-                                recentRow(title: model.remotePath == "/" ? "/" : URL(fileURLWithPath: model.remotePath).lastPathComponent, subtitle: model.remotePath, systemImage: "externaldrive.fill")
+                                recentRow(title: model.remotePath == "/" ? "/" : (model.remotePath as NSString).lastPathComponent, subtitle: model.remotePath, systemImage: "externaldrive.fill")
                             }
                             ForEach(Array(model.transfers.prefix(3))) { transfer in
                                 recentRow(title: URL(fileURLWithPath: transfer.destination).lastPathComponent, subtitle: transfer.direction.rawValue, systemImage: transfer.direction == .upload ? "arrow.up.doc.fill" : "arrow.down.doc.fill")
