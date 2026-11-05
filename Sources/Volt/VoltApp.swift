@@ -7661,6 +7661,7 @@ struct FilePane<ToolbarContent: View, ContextMenuContent: View, BackgroundContex
     @State private var columnResizeDraft: ColumnResizeDraft?
     @State private var visibleItems: [FileItem] = []
     @State private var visibleItemsTask: Task<Void, Never>?
+    @State private var visibleItemsGeneration = 0
     @State private var itemComputationCoordinator = FileItemComputationCoordinator()
     @State private var isEditingPath = false
     @State private var pathDraft = ""
@@ -7672,6 +7673,11 @@ struct FilePane<ToolbarContent: View, ContextMenuContent: View, BackgroundContex
     private let listMaximumNameColumnShare: CGFloat = 0.48
 
     private func recomputeVisibleItems(debounce: Bool = false) {
+        // Chỉ lần gọi mới nhất được ghi kết quả. Không hủy task ở onDisappear: SwiftUI có thể gọi
+        // onAppear của cùng một view trước onDisappear khi tháo/gắn lại pane, và nếu onDisappear hủy
+        // đúng task vừa tạo thì visibleItems không bao giờ được gán, pane trống cho tới khi items đổi.
+        visibleItemsGeneration += 1
+        let generation = visibleItemsGeneration
         visibleItemsTask?.cancel()
         let itemsSnapshot = items
         let preferencesSnapshot = preferences
@@ -7686,10 +7692,8 @@ struct FilePane<ToolbarContent: View, ContextMenuContent: View, BackgroundContex
                     preferences: preferencesSnapshot,
                     searchText: searchTextSnapshot
                 )
-                try Task.checkCancellation()
+                guard generation == visibleItemsGeneration else { return }
                 visibleItems = computedItems
-            } catch is CancellationError {
-                return
             } catch {
                 return
             }
@@ -7717,7 +7721,7 @@ struct FilePane<ToolbarContent: View, ContextMenuContent: View, BackgroundContex
         .onChange(of: preferences) { _, _ in recomputeVisibleItems() }
         .onChange(of: searchText) { _, _ in recomputeVisibleItems(debounce: true) }
         .onDisappear {
-            visibleItemsTask?.cancel()
+            // Cố ý không hủy visibleItemsTask (xem recomputeVisibleItems).
         }
     }
 
