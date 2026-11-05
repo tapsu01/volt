@@ -1,6 +1,7 @@
 import Foundation
 import AppKit
 import SwiftUI
+import VoltCore
 
 struct SidebarBrandHeader: View {
     var layout: AppLayoutContext
@@ -115,7 +116,7 @@ struct SidebarView: View {
                                 recentRow(title: model.remotePath == "/" ? "/" : (model.remotePath as NSString).lastPathComponent, subtitle: model.remotePath, systemImage: "externaldrive.fill")
                             }
                             ForEach(Array(model.transfers.prefix(3))) { transfer in
-                                recentRow(title: URL(fileURLWithPath: transfer.destination).lastPathComponent, subtitle: transfer.direction.rawValue, systemImage: transfer.direction == .upload ? "arrow.up.doc.fill" : "arrow.down.doc.fill")
+                                recentRow(title: RemotePath.lastComponent(transfer.destination), subtitle: transfer.direction.rawValue, systemImage: transfer.direction == .upload ? "arrow.up.doc.fill" : "arrow.down.doc.fill")
                             }
                         }
                     }

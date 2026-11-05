@@ -1,4 +1,5 @@
 import Foundation
+import VoltCore
 
 enum UploadConflictBatchPolicy {
     case replace, keepBoth, skip
@@ -36,7 +37,7 @@ final class UploadBatchContext {
     }
 
     func changed(_ path: String, isDirectory: Bool = false) {
-        dirtyDirectories.insert(URL(fileURLWithPath: path).deletingLastPathComponent().path)
+        dirtyDirectories.insert(RemotePath.parent(path))
         if isDirectory { dirtyDirectories.insert(path) }
     }
 }

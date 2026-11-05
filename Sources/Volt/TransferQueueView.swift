@@ -1,6 +1,7 @@
 import Foundation
 import AppKit
 import SwiftUI
+import VoltCore
 
 struct TransferQueueView: View {
     @ObservedObject var model: AppModel
@@ -728,7 +729,7 @@ struct TransferQueueView: View {
                 .foregroundStyle(job.direction == .upload ? Color.accentColor : Color.green)
                 .frame(width: 18)
             VStack(alignment: .leading, spacing: 2) {
-                Text(URL(fileURLWithPath: job.source).lastPathComponent)
+                Text(RemotePath.lastComponent(job.source))
                     .font(.caption.weight(.medium))
                     .lineLimit(1)
                 Text("\(job.direction.rawValue) · \(job.state.rawValue)")
@@ -821,7 +822,7 @@ struct TransferQueueView: View {
         HStack(spacing: 9) {
             Image(systemName: job.direction == .upload ? "square.and.arrow.up" : "square.and.arrow.down")
                 .foregroundStyle(job.direction == .upload ? Color.accentColor : Color.green)
-            Text(URL(fileURLWithPath: job.source).lastPathComponent)
+            Text(RemotePath.lastComponent(job.source))
                 .fontWeight(.medium)
                 .lineLimit(1)
                 .frame(maxWidth: 160, alignment: .leading)

@@ -2368,7 +2368,7 @@ final class AppModel: ObservableObject {
     private nonisolated static func relativePathForSync(_ path: String, root: String) -> String {
         let normalizedRoot = root.hasSuffix("/") ? String(root.dropLast()) : root
         let normalizedPath = path
-        guard normalizedPath.hasPrefix(normalizedRoot) else { return URL(fileURLWithPath: path).lastPathComponent }
+        guard normalizedPath.hasPrefix(normalizedRoot) else { return (path as NSString).lastPathComponent }
         let start = normalizedPath.index(normalizedPath.startIndex, offsetBy: normalizedRoot.count)
         return normalizedPath[start...].trimmingCharacters(in: CharacterSet(charactersIn: "/"))
     }
@@ -3115,7 +3115,7 @@ final class AppModel: ObservableObject {
                 let preview = parts.count > 2 ? String(parts[2]) : nil
                 return RemoteSearchResult(
                     path: path,
-                    name: URL(fileURLWithPath: path).lastPathComponent,
+                    name: RemotePath.lastComponent(path),
                     isDirectory: false,
                     line: lineNumber,
                     preview: preview
@@ -3863,7 +3863,7 @@ final class AppModel: ObservableObject {
         guard !control.isCancelled else { throw AppError.commandFailed("Transfer cancelled.") }
         try state.visitDirectory(depth: depth)
         await MainActor.run {
-            self.markTransfer(transferID, .running, "Listing \(URL(fileURLWithPath: remotePath).lastPathComponent)")
+            self.markTransfer(transferID, .running, "Listing \(RemotePath.lastComponent(remotePath))")
         }
 
         var plan = FolderDownloadPlan()
@@ -4133,7 +4133,7 @@ final class AppModel: ObservableObject {
     ) async throws -> String? {
         let existingEntry: FileItem?
         if batch.reservedPaths.contains(remotePath) {
-            existingEntry = FileItem(name: URL(fileURLWithPath: remotePath).lastPathComponent, path: remotePath, isDirectory: batch.reservedDirectories.contains(remotePath))
+            existingEntry = FileItem(name: RemotePath.lastComponent(remotePath), path: remotePath, isDirectory: batch.reservedDirectories.contains(remotePath))
         } else {
             existingEntry = try await remoteEntry(at: remotePath, connection: connection, credential: credential)
         }
@@ -4248,7 +4248,7 @@ final class AppModel: ObservableObject {
         remotePath: String,
         primaryActionTitle: String = "Replace"
     ) -> (choice: UploadConflictChoice, applyToAllPolicy: UploadConflictBatchPolicy?) {
-        let name = URL(fileURLWithPath: remotePath).lastPathComponent
+        let name = RemotePath.lastComponent(remotePath)
         let alert = NSAlert()
         alert.messageText = "An item named \"\(name)\" already exists on the server."
         alert.informativeText = "Choose what Volt should do before uploading."
@@ -4294,7 +4294,7 @@ final class AppModel: ObservableObject {
     }
 
     private func promptFolderUploadBlockedByFile(remotePath: String) -> (choice: UploadConflictChoice, applyToAllPolicy: UploadConflictBatchPolicy?) {
-        let name = URL(fileURLWithPath: remotePath).lastPathComponent
+        let name = RemotePath.lastComponent(remotePath)
         let alert = NSAlert()
         alert.messageText = "A file named \"\(name)\" already exists on the server."
         alert.informativeText = "A folder cannot be merged into that file. Choose a new folder name or skip it."
@@ -4340,7 +4340,7 @@ final class AppModel: ObservableObject {
         credential: SensitiveCredential
     ) async throws -> FileItem? {
         guard let parent = remoteParentPath(path) else { return nil }
-        let name = URL(fileURLWithPath: path).lastPathComponent
+        let name = RemotePath.lastComponent(path)
 
         if selectedConnectionID == connection.id && parent == remotePath {
             if let item = remoteItems.first(where: { $0.name == name }) {
@@ -4373,7 +4373,7 @@ final class AppModel: ObservableObject {
         batch: UploadBatchContext
     ) async throws -> String {
         guard let parent = remoteParentPath(path) else { return path }
-        let name = URL(fileURLWithPath: path).lastPathComponent
+        let name = RemotePath.lastComponent(path)
         let fileExtension = (name as NSString).pathExtension
         let baseName = fileExtension.isEmpty ? name : (name as NSString).deletingPathExtension
 
@@ -4752,7 +4752,7 @@ final class AppModel: ObservableObject {
 
     func openRemoteSelectedWithApp() {
         guard let item = selectedRemote, !item.isDirectory else { return }
-        let previewURL = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(item.name)
+        let previewURL = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true).appendingPathComponent(item.name, isDirectory: false)
         guard let choice = chooseApplication(for: previewURL) else { return }
         editRemoteSelected(withApp: choice.url, remember: choice.remember)
     }
@@ -5279,7 +5279,7 @@ final class AppModel: ObservableObject {
                 attributes: [.posixPermissions: 0o700]
             )
             let item = FileItem(
-                name: URL(fileURLWithPath: remotePath).lastPathComponent,
+                name: RemotePath.lastComponent(remotePath),
                 path: remotePath,
                 isDirectory: false,
                 size: job.remoteSize,
@@ -5303,7 +5303,7 @@ final class AppModel: ObservableObject {
             }
         case .downloadFolder(let remotePath, let localPath):
             downloadFolder(
-                item: FileItem(name: URL(fileURLWithPath: remotePath).lastPathComponent, path: remotePath, isDirectory: true),
+                item: FileItem(name: RemotePath.lastComponent(remotePath), path: remotePath, isDirectory: true),
                 localPath: localPath,
                 refreshWhenDone: true,
                 reuseCompletedFiles: true
@@ -5527,7 +5527,7 @@ final class AppModel: ObservableObject {
     }
 
     private func logDownloadFileName(for bookmark: RemoteLogBookmark) -> String {
-        let name = URL(fileURLWithPath: bookmark.path).lastPathComponent
+        let name = RemotePath.lastComponent(bookmark.path)
         return name.isEmpty ? "\(bookmark.name).log" : name
     }
 
@@ -5587,9 +5587,7 @@ final class AppModel: ObservableObject {
     }
 
     private func remoteParentPath(_ path: String) -> String? {
-        // Path remote: chỉ thao tác chuỗi, không dùng URL(fileURLWithPath:) vì nó stat() file system cục bộ.
-        let parent = (path as NSString).deletingLastPathComponent
-        return parent.isEmpty ? "/" : parent
+        RemotePath.parent(path)
     }
 
     private func loadConnections() {
@@ -5897,8 +5895,7 @@ final class AppModel: ObservableObject {
     }
 
     private func joinRemote(_ base: String, _ child: String) -> String {
-        if base == "/" { return "/" + child }
-        return "/" + base.trimmingCharacters(in: CharacterSet(charactersIn: "/")) + "/" + child
+        RemotePath.join(base, child)
     }
 
     // MARK: - Host Key Verification
