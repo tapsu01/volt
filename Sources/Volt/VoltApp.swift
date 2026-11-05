@@ -7582,6 +7582,9 @@ struct FilePane<ToolbarContent: View, ContextMenuContent: View, BackgroundContex
     @State private var visibleItems: [FileItem] = []
     @State private var visibleItemsTask: Task<Void, Never>?
     @State private var itemComputationCoordinator = FileItemComputationCoordinator()
+    @State private var isEditingPath = false
+    @State private var pathDraft = ""
+    @FocusState private var pathFieldFocused: Bool
 
     private let listColumnSpacing: CGFloat = 12
     private let listHorizontalInset: CGFloat = 20
@@ -7662,21 +7665,64 @@ struct FilePane<ToolbarContent: View, ContextMenuContent: View, BackgroundContex
         }
     }
 
+    // Phím tắt mở ô nhập path: hai pane cùng cửa sổ nên mỗi pane một tổ hợp riêng.
+    private var editPathShortcutKey: KeyEquivalent { isRemote ? "g" : "l" }
+    private var editPathShortcutLabel: String { isRemote ? "⇧⌘G" : "⇧⌘L" }
+
+    private func beginPathEdit() {
+        guard !isEditingPath else { return }
+        pathDraft = path
+        isEditingPath = true
+        // TextField chưa có trong cây view ngay lúc này; đợi một vòng run loop rồi mới xin focus.
+        DispatchQueue.main.async { pathFieldFocused = true }
+    }
+
+    private func commitPathEdit() {
+        guard isEditingPath else { return }
+        isEditingPath = false
+        pathFieldFocused = false
+        path = pathDraft
+        submitPath()
+    }
+
+    private func cancelPathEdit() {
+        guard isEditingPath else { return }
+        isEditingPath = false
+        pathFieldFocused = false
+    }
+
     private var pathBarContainer: some View {
         HStack(spacing: 8) {
             Image(systemName: isRemote ? "network" : "desktopcomputer")
                 .foregroundStyle(.secondary)
                 .frame(width: 18)
-            ScrollView(.horizontal, showsIndicators: false) {
-                pathBar
+            if isEditingPath {
+                TextField("Path", text: $pathDraft)
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 13, weight: .medium))
+                    .lineLimit(1)
+                    .focused($pathFieldFocused)
+                    .onSubmit(commitPathEdit)
+                    .onExitCommand(perform: cancelPathEdit)
+                    .onChange(of: pathFieldFocused) { _, focused in
+                        if !focused { cancelPathEdit() }
+                    }
+                    .frame(minWidth: 0, maxWidth: .infinity)
+            } else {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    pathBar
+                }
+                .frame(minWidth: 0, maxWidth: .infinity)
+                .clipped()
             }
-            .frame(minWidth: 0, maxWidth: .infinity)
-            .clipped()
         }
         .padding(.horizontal, 10)
         .frame(height: 36)
         .frame(minWidth: 0, maxWidth: .infinity)
         .clipped()
+        // Click vào khoảng trống của thanh path (ngoài các crumb) → chuyển sang ô nhập. Crumb là Button nên vẫn ưu tiên.
+        .contentShape(Rectangle())
+        .onTapGesture { beginPathEdit() }
         .background(
             RoundedRectangle(cornerRadius: 8)
                 .fill(VoltTheme.controlBackground)
@@ -7685,6 +7731,15 @@ struct FilePane<ToolbarContent: View, ContextMenuContent: View, BackgroundContex
             RoundedRectangle(cornerRadius: 8)
                 .stroke(VoltTheme.hairline)
         )
+        .help(isEditingPath ? "Enter to go, Esc to cancel" : "Click to type a path (\(editPathShortcutLabel))")
+        .background {
+            // Nút ẩn chỉ để gắn phím tắt.
+            Button("Edit Path", action: beginPathEdit)
+                .keyboardShortcut(editPathShortcutKey, modifiers: [.command, .shift])
+                .frame(width: 0, height: 0)
+                .opacity(0)
+                .accessibilityHidden(true)
+        }
     }
 
     private func itemCountLabel(displayedItems: [FileItem]) -> some View {
@@ -7727,10 +7782,7 @@ struct FilePane<ToolbarContent: View, ContextMenuContent: View, BackgroundContex
             }
         }
         .contextMenu {
-            TextField("Path", text: $path)
-                .textFieldStyle(.plain)
-                .onSubmit(submitPath)
-            Button("Go", action: submitPath)
+            Button("Edit Path… (\(editPathShortcutLabel))", action: beginPathEdit)
             Button("Copy Path") {
                 NSPasteboard.general.clearContents()
                 NSPasteboard.general.setString(path, forType: .string)
