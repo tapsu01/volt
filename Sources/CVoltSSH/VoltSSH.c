@@ -1771,6 +1771,27 @@ int volt_sftp_remove_on(VoltSessionHandle *handle, const char *remote_path, int 
     return volt_sftp_remove_with_session(&handle->session, remote_path, is_directory, error, error_len);
 }
 
+int volt_sftp_stat_is_directory_on(VoltSessionHandle *handle, const char *remote_path, int *is_directory, char *error, size_t error_len) {
+    if (!handle) {
+        set_error(error, error_len, "SFTP session is not open.");
+        return -1;
+    }
+    if (!remote_path || !is_directory || strlen(remote_path) == 0) {
+        set_error(error, error_len, "Invalid remote stat request.");
+        return -1;
+    }
+    *is_directory = 0;
+    LIBSSH2_SFTP_ATTRIBUTES attrs;
+    memset(&attrs, 0, sizeof(attrs));
+    // libssh2_sftp_stat đi theo symlink (SSH_FXP_STAT), khác với attrs của readdir (lstat).
+    if (libssh2_sftp_stat(handle->session.sftp, remote_path, &attrs) != 0) {
+        set_sftp_error(&handle->session, error, error_len, "Could not inspect remote item.");
+        return -1;
+    }
+    *is_directory = (attrs.flags & LIBSSH2_SFTP_ATTR_PERMISSIONS) && LIBSSH2_SFTP_S_ISDIR(attrs.permissions) ? 1 : 0;
+    return 0;
+}
+
 int volt_sftp_remove(const char *host, int port, const char *username, const char *password, const char *private_key_path, const char *known_hosts_path, const char *remote_path, int is_directory, char *error, size_t error_len) {
     VoltSession session;
     if (open_session(host, port, username, password, private_key_path, known_hosts_path, &session, error, error_len) != 0) return -1;

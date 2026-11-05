@@ -60,6 +60,8 @@ int volt_sftp_mkdir_on(VoltSessionHandle *handle, const char *remote_path, uint3
 int volt_sftp_create_empty_file_on(VoltSessionHandle *handle, const char *remote_path, uint32_t mode, char *error, size_t error_len);
 int volt_sftp_rename_on(VoltSessionHandle *handle, const char *from_path, const char *to_path, char *error, size_t error_len);
 int volt_sftp_remove_on(VoltSessionHandle *handle, const char *remote_path, int is_directory, char *error, size_t error_len);
+// stat() theo symlink (không phải lstat): cho biết đích cuối của `remote_path` có phải thư mục không.
+int volt_sftp_stat_is_directory_on(VoltSessionHandle *handle, const char *remote_path, int *is_directory, char *error, size_t error_len);
 
 int volt_sftp_list(const char *host, int port, const char *username, const char *password, const char *private_key_path, const char *known_hosts_path, const char *remote_path, int max_items, VoltSFTPItem **items, int *count, int *skipped_unsafe_count, int *truncated, char *error, size_t error_len);
 int volt_sftp_calculate_size(const char *host, int port, const char *username, const char *password, const char *private_key_path, const char *known_hosts_path, const char *remote_path, int64_t *size, VoltSFTPSizeProgressCallback progress, void *progress_context, char *error, size_t error_len);

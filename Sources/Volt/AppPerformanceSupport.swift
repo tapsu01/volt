@@ -67,7 +67,7 @@ func appendBoundedTerminalOutput(
 }
 
 private func fileItemsSortBefore(_ lhs: FileItem, _ rhs: FileItem, preferences: FileBrowserPreferences) -> Bool {
-    if preferences.foldersFirst && lhs.isDirectory != rhs.isDirectory { return lhs.isDirectory }
+    if preferences.foldersFirst && lhs.opensAsFolder != rhs.opensAsFolder { return lhs.opensAsFolder }
     let order: ComparisonResult = switch preferences.sortField {
     case .name: lhs.name.localizedStandardCompare(rhs.name)
     case .size: compareFileItemValues(lhs.size ?? -1, rhs.size ?? -1)

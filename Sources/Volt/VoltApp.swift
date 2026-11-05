@@ -199,6 +199,24 @@ struct FileItem: Identifiable, Hashable, Sendable {
         guard let permissions else { return !isDirectory }
         return (permissions & 0o170000) == 0o100000
     }
+
+    /// Entry là symlink (bit loại file từ lstat của SFTP readdir). Đích của link chưa biết cho tới khi stat.
+    var isSymlink: Bool {
+        guard let permissions else { return false }
+        return (permissions & 0o170000) == 0o120000
+    }
+
+    /// `true` sau khi stat lúc double-click xác nhận symlink trỏ tới thư mục. Chỉ dùng cho điều hướng và
+    /// hiển thị; các thao tác duyệt cây (download folder, size, search, sync) vẫn dựa vào `isDirectory`
+    /// nên không đi theo symlink.
+    var linkTargetIsDirectory = false
+
+    var opensAsFolder: Bool { isDirectory || linkTargetIsDirectory }
+
+    func iconName(folder: String, file: String) -> String {
+        if opensAsFolder { return folder }
+        return isSymlink ? "link" : file
+    }
 }
 
 private func loadLocalDirectoryItems(atPath path: String, includeOwnerGroupPermissions: Bool) throws -> [FileItem] {
@@ -1471,6 +1489,10 @@ private final class SFTPListOutput: @unchecked Sendable {
     var truncated: Int32 = 0
 }
 
+private final class SFTPStatOutput: @unchecked Sendable {
+    var isDirectory: Int32 = 0
+}
+
 final class SFTPClient: @unchecked Sendable {
     private let pool = SFTPConnectionPool()
 
@@ -1585,13 +1607,14 @@ final class SFTPClient: @unchecked Sendable {
                 let rawModified = volt_sftp_item_modified(items, Int32(index))
                 let isDirectory = volt_sftp_item_is_directory(items, Int32(index)) != 0
                 let permissions = volt_sftp_item_permissions(items, Int32(index))
+                let isSymlink = (permissions & 0o170000) == 0o120000
                 parsed.append(FileItem(
                     name: name,
                     path: itemPath,
                     isDirectory: isDirectory,
                     size: !isDirectory && rawSize >= 0 ? rawSize : nil,
                     modified: rawModified > 0 ? Date(timeIntervalSince1970: TimeInterval(rawModified)) : nil,
-                    kind: isDirectory ? "Folder" : (UTType(filenameExtension: (name as NSString).pathExtension)?.localizedDescription ?? "File"),
+                    kind: isDirectory ? "Folder" : isSymlink ? "Symbolic link" : (UTType(filenameExtension: (name as NSString).pathExtension)?.localizedDescription ?? "File"),
                     owner: String(volt_sftp_item_uid(items, Int32(index))),
                     group: String(volt_sftp_item_gid(items, Int32(index))),
                     permissions: permissions == 0 ? nil : permissions,
@@ -1823,6 +1846,19 @@ final class SFTPClient: @unchecked Sendable {
                     }
                 }
             }
+        }.value
+    }
+
+    /// stat() theo symlink: `true` nếu đích cuối của `path` là thư mục.
+    func isDirectory(connection: SavedConnection, credential: SensitiveCredential, path: String) async throws -> Bool {
+        try await Task.detached {
+            let output = SFTPStatOutput()
+            _ = try await self.callOnPooledSession(connection: connection, credential: credential) { handle, error, errorLength in
+                path.withCString { remotePath in
+                    volt_sftp_stat_is_directory_on(handle, remotePath, &output.isDirectory, error, errorLength)
+                }
+            }
+            return output.isDirectory != 0
         }.value
     }
 
@@ -3300,11 +3336,55 @@ final class AppModel: ObservableObject {
     }
 
     func openRemote(_ item: FileItem) {
-        guard item.isDirectory else { return }
-        remotePath = item.path
+        if item.opensAsFolder {
+            navigateRemote(to: item.path)
+        } else if item.isSymlink {
+            resolveRemoteLink(item)
+        }
+    }
+
+    private func navigateRemote(to path: String) {
+        remotePath = path
         selectedRemoteIDs.removeAll()
         noteRecentActivity()
         loadCurrentRemotePathUsingCache()
+    }
+
+    // Symlink chỉ được stat lúc double-click để listing không tốn thêm một vòng mạng cho mỗi link.
+    private func resolveRemoteLink(_ item: FileItem) {
+        guard let connection = selectedConnection else { status = "Choose a connection"; return }
+        let credential = credentialForCurrentTab().clone()
+        let tabID = selectedTabID
+        let listingPath = remotePath
+        runBusy("Resolving \(item.name)", affectedRemotePath: item.path, operation: {
+            try await self.verifyHostKey(for: connection)
+            let isDirectory = try await self.sftp.isDirectory(connection: connection, credential: credential, path: item.path)
+            await MainActor.run {
+                guard self.selectedTabID == tabID, self.selectedConnectionID == connection.id,
+                      self.remotePath == listingPath else { return }
+                guard isDirectory else {
+                    self.status = "\(item.name) links to a file. Use Open to view it."
+                    return
+                }
+                self.markRemoteLinkAsDirectory(item, connectionID: connection.id, listingPath: listingPath)
+                self.navigateRemote(to: item.path)
+            }
+        })
+    }
+
+    private func markRemoteLinkAsDirectory(_ item: FileItem, connectionID: UUID, listingPath: String) {
+        if let index = remoteItems.firstIndex(where: { $0.id == item.id }) {
+            remoteItems[index].linkTargetIsDirectory = true
+            syncCurrentTab()
+        }
+        if let cached = cachedRemoteListing(connectionID: connectionID, path: listingPath),
+           let index = cached.items.firstIndex(where: { $0.id == item.id }) {
+            var items = cached.items
+            items[index].linkTargetIsDirectory = true
+            storeRemoteListing(RemoteListingResult(items: items, skippedUnsafeCount: cached.skippedUnsafeCount,
+                                                   isTruncated: cached.isTruncated),
+                               connectionID: connectionID, path: listingPath)
+        }
     }
 
     func localUp() {
@@ -4569,7 +4649,7 @@ final class AppModel: ObservableObject {
     }
 
     func openInNewTabRemote() {
-        guard let item = selectedRemote, item.isDirectory else { return }
+        guard let item = selectedRemote, item.opensAsFolder else { return }
         var newTab = currentSessionTab(title: item.name)
         newTab.remotePath = item.path
         let cachedItems = selectedConnection.flatMap {
@@ -7456,12 +7536,12 @@ struct BrowserSplitView: View {
                         model.selectedRemoteIDs = [item.id]
                         model.editRemoteSelected()
                     }
-                    .disabled(item.isDirectory)
+                    .disabled(item.opensAsFolder)
                     Button("Open With...") {
                         model.selectedRemoteIDs = [item.id]
                         model.openRemoteSelectedWithApp()
                     }
-                    .disabled(item.isDirectory)
+                    .disabled(item.opensAsFolder)
                     if let suffix = model.defaultApplicationExtension(for: item) {
                         Button("Reset Default Application for .\(suffix)") {
                             model.resetDefaultApplication(for: item)
@@ -7494,7 +7574,7 @@ struct BrowserSplitView: View {
                     Button("New File") { model.makeRemoteFile() }
                         .disabled(model.selectedConnection == nil)
                     Button("Refresh") { model.refreshRemote() }
-                    if item.isDirectory {
+                    if item.opensAsFolder {
                         Divider()
                         Button("Open in New Tab") {
                             model.selectedRemoteIDs = [item.id]
@@ -7908,8 +7988,8 @@ struct FilePane<ToolbarContent: View, ContextMenuContent: View, BackgroundContex
         let visibleColumns = preferences.visibleColumns
         HStack(spacing: listColumnSpacing) {
             HStack(spacing: 9) {
-                Image(systemName: item.isDirectory ? "folder.fill" : "doc")
-                    .foregroundStyle(item.isDirectory ? Color.accentColor : Color.secondary)
+                Image(systemName: item.iconName(folder: "folder.fill", file: "doc"))
+                    .foregroundStyle(item.opensAsFolder ? Color.accentColor : Color.secondary)
                     .frame(width: 18)
                 Text(item.name)
                     .lineLimit(1)
@@ -7939,8 +8019,8 @@ struct FilePane<ToolbarContent: View, ContextMenuContent: View, BackgroundContex
             if preferences.viewMode == .thumbnails {
                 FileThumbnailView(item: item, isRemote: isRemote).frame(width: 96, height: 72)
             } else {
-                Image(systemName: item.isDirectory ? "folder.fill" : "doc.fill").resizable().scaledToFit()
-                    .foregroundStyle(item.isDirectory ? Color.accentColor : Color.secondary).frame(width: 48, height: 48)
+                Image(systemName: item.iconName(folder: "folder.fill", file: "doc.fill")).resizable().scaledToFit()
+                    .foregroundStyle(item.opensAsFolder ? Color.accentColor : Color.secondary).frame(width: 48, height: 48)
             }
             Text(item.name).font(.system(size: preferences.textSize)).lineLimit(2).multilineTextAlignment(.center)
         }
@@ -7957,9 +8037,9 @@ struct FilePane<ToolbarContent: View, ContextMenuContent: View, BackgroundContex
                 LazyVStack(spacing: 1) {
                     ForEach(displayedItems) { item in
                         HStack {
-                            Image(systemName: item.isDirectory ? "folder" : "doc")
+                            Image(systemName: item.iconName(folder: "folder", file: "doc"))
                             Text(item.name).lineLimit(1); Spacer()
-                            if item.isDirectory { Image(systemName: "chevron.right").foregroundStyle(.secondary) }
+                            if item.opensAsFolder { Image(systemName: "chevron.right").foregroundStyle(.secondary) }
                         }
                         .font(.system(size: preferences.textSize)).padding(.horizontal, 10).padding(.vertical, 7)
                         .background(isSelected(item) ? Color.accentColor : Color.clear).foregroundStyle(isSelected(item) ? Color.white : Color.primary)
@@ -8282,7 +8362,7 @@ private struct FileThumbnailView: View {
     var body: some View {
         Group {
             if let image { Image(nsImage: image).resizable().scaledToFit() }
-            else { Image(systemName: item.isDirectory ? "folder.fill" : "doc.fill").resizable().scaledToFit().foregroundStyle(item.isDirectory ? Color.accentColor : Color.secondary).padding(16) }
+            else { Image(systemName: item.iconName(folder: "folder.fill", file: "doc.fill")).resizable().scaledToFit().foregroundStyle(item.opensAsFolder ? Color.accentColor : Color.secondary).padding(16) }
         }
         .task(id: taskID) {
             image = nil

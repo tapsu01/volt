@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise full remote size scans through a temporary loopback SFTP server."""
+"""Exercise full remote size scans and symlink listing through a temporary loopback SFTP server."""
 
 import os
 from pathlib import Path
@@ -94,11 +94,64 @@ int main(int argc, char **argv) {
     return 0;
 }
 ''')
+    # Listing + stat: entry symlink phải giữ bit S_IFLNK và is_directory == 0 (lstat), còn
+    # volt_sftp_stat_is_directory_on đi theo link và trả 1 cho link -> thư mục, 0 cho file thường.
+    link_driver = root / "link_driver.c"
+    link_driver.write_text(r'''
+#include "VoltSSH.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+int main(int argc, char **argv) {
+    if (argc != 6) return 2;
+    char error[4096] = {0};
+    VoltSessionHandle *session = NULL;
+    if (volt_session_open("127.0.0.1", atoi(argv[1]), argv[2], "", argv[3], argv[4], &session, error, sizeof(error)) != 0) {
+        fprintf(stderr, "open: %s\n", error);
+        return 3;
+    }
+    VoltSFTPItem *items = NULL;
+    int count = 0, skipped = 0, truncated = 0;
+    if (volt_sftp_list_on(session, argv[5], 100000, &items, &count, &skipped, &truncated, error, sizeof(error)) != 0) {
+        fprintf(stderr, "list: %s\n", error);
+        return 4;
+    }
+    int link_type = -1, link_is_directory = -1, file_is_directory = -1, stat_link = -1, stat_file = -1;
+    char file_path[4096] = {0};
+    for (int index = 0; index < count; index++) {
+        const char *name = volt_sftp_item_name(items, index);
+        if (strcmp(name, "link") == 0) {
+            link_type = (int)(volt_sftp_item_permissions(items, index) & 0170000);
+            link_is_directory = volt_sftp_item_is_directory(items, index);
+            if (volt_sftp_stat_is_directory_on(session, volt_sftp_item_path(items, index), &stat_link, error, sizeof(error)) != 0) {
+                fprintf(stderr, "stat link: %s\n", error);
+                return 5;
+            }
+        } else if (strcmp(name, "folder-0000") == 0) {
+            snprintf(file_path, sizeof(file_path), "%s/data", volt_sftp_item_path(items, index));
+            file_is_directory = volt_sftp_item_is_directory(items, index);
+        }
+    }
+    if (file_path[0] && volt_sftp_stat_is_directory_on(session, file_path, &stat_file, error, sizeof(error)) != 0) {
+        fprintf(stderr, "stat file: %s\n", error);
+        return 6;
+    }
+    int missing = 0;
+    int missing_rc = volt_sftp_stat_is_directory_on(session, "/definitely/missing/path", &missing, error, sizeof(error));
+    printf("%o %d %d %d %d %d %s\n", link_type, link_is_directory, file_is_directory, stat_link, stat_file, missing_rc, error);
+    volt_sftp_free_items(items, count);
+    volt_session_close(session);
+    return 0;
+}
+''')
     executable = root / "driver"
+    link_executable = root / "link_driver"
     sanitizer_flags = shlex.split(os.environ.get("VOLT_SIZE_SANITIZER_FLAGS", ""))
-    subprocess.run(["clang", *sanitizer_flags, f"-I{prefix}/include", f"-I{repo}/Sources/CVoltSSH/include",
-                    str(driver), str(repo / "Sources/CVoltSSH/VoltSSH.c"), f"-L{prefix}/lib", "-lssh2",
-                    "-o", str(executable)], check=True)
+    for source, binary in ((driver, executable), (link_driver, link_executable)):
+        subprocess.run(["clang", *sanitizer_flags, f"-I{prefix}/include", f"-I{repo}/Sources/CVoltSSH/include",
+                        str(source), str(repo / "Sources/CVoltSSH/VoltSSH.c"), f"-L{prefix}/lib", "-lssh2",
+                        "-o", str(binary)], check=True)
 
     with (root / "sshd.log").open("w+") as log:
         server = subprocess.Popen(["/usr/sbin/sshd", "-D", "-e", "-f", str(root / "sshd.conf")],
@@ -126,7 +179,15 @@ int main(int argc, char **argv) {
             denied.chmod(0)
             assert "open remote directory" in scan(denied, "error").stdout
             assert not list(queue_dir.iterdir())
+            listing = subprocess.run([str(link_executable), str(port), username, str(root / "client"),
+                                      str(root / "known_hosts"), str(tree)],
+                                     capture_output=True, text=True, timeout=180, check=True)
+            link_type, link_is_directory, file_is_directory, stat_link, stat_file, missing_rc, *message = listing.stdout.split()
+            assert (link_type, link_is_directory, file_is_directory, stat_link, stat_file, missing_rc) == (
+                "120000", "0", "1", "1", "0", "-1"), listing.stdout
+            assert "Could not inspect remote item" in " ".join(message), listing.stdout
             print("Remote size: 2002 child folders, 20001 files in one folder, symlink, cancellation and errors: passed")
+            print("Remote listing: symlink keeps S_IFLNK, stat follows it to the directory, missing path fails: passed")
         finally:
             denied.chmod(0o700)
             server.terminate()
